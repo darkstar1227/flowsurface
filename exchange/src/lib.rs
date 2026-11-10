@@ -5,6 +5,7 @@ mod error;
 pub mod rate_limit;
 mod serde_util;
 pub mod signing;
+pub mod trade;
 pub mod unit;
 
 pub use adapter::{Event, proxy};
