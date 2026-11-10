@@ -29,13 +29,11 @@
 //! async fn go(c: &TradeClient, a: ApprovedOrder) { let _ = c.send_approved(a).await; }
 //! ```
 
-use super::decimal::Decimal;
 use super::request::{BinanceRequest, Exposure, Method, OkxRequest};
 use super::rules::{FreshRules, SymbolRules, TradeProduct};
 use super::types::TradeError;
 use crate::account::{AccountEnv, AccountKey, AccountProduct, AccountVenue};
 use crate::rate_limit::Priority;
-use std::cmp::Ordering;
 use std::fmt;
 
 /// A request built by one of the builders.
@@ -249,36 +247,22 @@ pub enum RiskRefusal {
     /// A cap is set but the order value could not be computed (no price known).
     NotionalUnknown,
     SingleOrderCapExceeded,
-    /// Locked by the local risk state (segment e); new entries only.
+    /// The position after this order would exceed the per-symbol cap.
+    SymbolCapExceeded,
+    /// A per-symbol cap is set but the position is unknown or stale.
+    PositionUnknown,
+    /// Equity is unknown or stale while an equity limit is set: no new entries.
+    EquityUnavailable,
+    /// Locked by the local risk state (a limit tripped); new entries only.
     Locked,
+    /// The hook belongs to another account than the order.
+    WrongAccount,
 }
 
-/// Local risk controls (segment e plugs its checks in here). Only entries are checked:
-/// reducing, closing and cancelling are always allowed (condition 72).
+/// Local risk controls (`risk::RiskSnapshot` is the implementation the app wires). Only
+/// entries are checked: reducing, closing and cancelling are always allowed (condition 72).
 pub trait RiskHook {
     fn check(&self, view: &RiskView<'_>) -> Result<(), RiskRefusal>;
-}
-
-/// The default hook: a cap on the value of one new order (PRD 3.3, condition 63). With no
-/// price to value the order, an entry is refused rather than waved through.
-#[derive(Debug, Clone, Copy)]
-pub struct SingleOrderCap {
-    pub max_notional: Decimal,
-}
-
-impl RiskHook for SingleOrderCap {
-    fn check(&self, view: &RiskView<'_>) -> Result<(), RiskRefusal> {
-        let Exposure::Adds { notional } = view.exposure else {
-            return Ok(());
-        };
-        let Some(value) = notional else {
-            return Err(RiskRefusal::NotionalUnknown);
-        };
-        match value.checked_cmp(&self.max_notional) {
-            Ok(Ordering::Greater) | Err(_) => Err(RiskRefusal::SingleOrderCapExceeded),
-            Ok(_) => Ok(()),
-        }
-    }
 }
 
 /// The user's confirmation of one order. Single use: `submit` takes it by value, so a second

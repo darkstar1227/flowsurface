@@ -7,11 +7,12 @@ use super::client::{OpenKind, TradeClient};
 use super::client_id::{ClientId, Role};
 use super::gate::{
     AutoIntent, AutoPath, ConfirmToken, GateRequest, OrderIntent, RiskHook, RiskRefusal, RiskView,
-    SendGate, SingleOrderCap, SubmitError,
+    SendGate, SubmitError,
 };
 use super::okx::{self, OkxAlgoType, OkxProtective, OkxTarget, TriggerPxType};
 use super::outcome::{Outcome, RejectKind};
 use super::request::{BinanceRequest, Exposure, OkxRequest};
+use super::risk::{EquityBasis, EquityTracker, RiskLimits};
 use super::rules::fixtures::*;
 use super::rules::{RulesTable, SymbolRules};
 use super::types::*;
@@ -28,7 +29,7 @@ use std::time::Duration;
 
 // ── Fake server ─────────────────────────────────────────────────────────
 
-type Handler = dyn Fn(&str, &str) -> (u16, String) + Send + Sync;
+type Handler = dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync;
 
 struct Fake {
     port: u16,
@@ -54,6 +55,11 @@ impl Fake {
 /// (without the query) and returns `(status, json body)`. Requests are logged as
 /// `"METHOD path"`.
 fn serve(handler: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static) -> Fake {
+    serve_q(move |m, p, _| handler(m, p))
+}
+
+/// Like [`serve`], and the handler also gets the raw query string.
+fn serve_q(handler: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static) -> Fake {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -93,8 +99,9 @@ fn serve(handler: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static) 
                 let method = parts.next().unwrap_or("").to_string();
                 let target = parts.next().unwrap_or("").to_string();
                 let path = target.split('?').next().unwrap_or("").to_string();
+                let query = target.split_once('?').map_or("", |(_, q)| q).to_string();
                 log.lock().unwrap().push(format!("{method} {path}"));
-                let (status, body) = handler(&method, &path);
+                let (status, body) = handler(&method, &path, &query);
                 let reply = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
                     body.len()
@@ -1083,9 +1090,18 @@ async fn single_order_cap_and_gate_refusals_stop_the_send() {
         .unwrap()
     };
     // 0.002 BTC at 60000 = 120 USDT
-    let cap = SingleOrderCap {
-        max_notional: d("100"),
+    let tracker = |cap: &str| {
+        EquityTracker::new(
+            c.account(),
+            EquityBasis::BinanceTotalMarginBalance,
+            RiskLimits {
+                max_order_notional: Some(d(cap)),
+                ..RiskLimits::default()
+            },
+        )
     };
+    let small = tracker("100");
+    let cap = small.snapshot(NOW);
     assert_eq!(
         c.submit(&OpenGate, &cap, ConfirmToken::user_confirmed(), mk())
             .await
@@ -1108,9 +1124,8 @@ async fn single_order_cap_and_gate_refusals_stop_the_send() {
     );
     assert_eq!(fake.all().len(), 0, "nothing was sent");
     c.test_elapsed_ms.store(0, Ordering::Relaxed);
-    let cap = SingleOrderCap {
-        max_notional: d("1000"),
-    };
+    let roomy = tracker("1000");
+    let cap = roomy.snapshot(NOW);
     assert!(
         c.submit(&OpenGate, &cap, ConfirmToken::user_confirmed(), mk())
             .await
@@ -2092,4 +2107,530 @@ async fn a_418_set_on_another_thread_does_not_stop_this_send() {
         "{:?}",
         sub.outcome
     );
+}
+
+// ── Risk control (segment e) ────────────────────────────────────────────
+
+fn tripped_tracker(account: AccountKey, basis: EquityBasis) -> EquityTracker {
+    use super::risk::{EquityObservation, EquitySource, Observed};
+    let mut t = EquityTracker::new(
+        account,
+        basis,
+        RiskLimits {
+            daily_loss_limit: Some(d("100")),
+            confirm_observations: 1,
+            ..RiskLimits::default()
+        },
+    );
+    let at = |at_ms, equity: &str| EquityObservation {
+        at_ms,
+        equity: d(equity),
+        basis,
+        // The private stream can flag transfers; a REST reading cannot, so only this source
+        // may start an automatic close.
+        source: EquitySource::PrivateStream,
+        is_transfer: false,
+    };
+    t.observe(at(NOW - 2, "1000"));
+    assert!(matches!(
+        t.observe(at(NOW - 1, "800")),
+        Observed::Tripped(_)
+    ));
+    t
+}
+
+#[tokio::test]
+async fn risk_close_cancels_everything_flattens_and_reports_after_requery() {
+    let closed = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&closed);
+    let fake = serve(move |m, p| {
+        let done = c2.load(Ordering::Relaxed) > 0;
+        match (m, p) {
+            ("GET", "/fapi/v1/openOrders") | ("GET", "/fapi/v1/openAlgoOrders") => {
+                if done {
+                    (200, "[]".to_string())
+                } else if p.ends_with("openOrders") {
+                    (200, open_order_body())
+                } else {
+                    (200, json!([{"symbol": "BTCUSDT", "algoId": 5}]).to_string())
+                }
+            }
+            ("GET", "/fapi/v3/positionRisk") => {
+                if done {
+                    (200, "[]".to_string())
+                } else {
+                    (
+                        200,
+                        json!([{"symbol": "BTCUSDT", "positionAmt": "0.002", "positionSide": "BOTH",
+                                "marginType": "cross", "leverage": "10"}])
+                        .to_string(),
+                    )
+                }
+            }
+            ("DELETE", _) => (200, json!({"code": 200, "msg": "done"}).to_string()),
+            ("POST", "/fapi/v1/order") => {
+                c2.fetch_add(1, Ordering::Relaxed);
+                gen_binance(m, p)
+            }
+            _ => (404, "{}".to_string()),
+        }
+    });
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let t = futures();
+    let mut tracker = tripped_tracker(c.account(), EquityBasis::BinanceTotalMarginBalance);
+
+    // While locked, a new entry is refused before anything is sent.
+    let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+    let r = t.lookup("BTCUSDT").unwrap();
+    let entry = OrderIntent::binance(
+        c.account(),
+        futures_limit(r, &id("eAAAA"), Action::Open(Dir::Long)),
+        &fresh,
+    )
+    .unwrap();
+    let snap = tracker.snapshot(NOW);
+    assert_eq!(
+        c.submit(&OpenGate, &snap, ConfirmToken::user_confirmed(), entry)
+            .await
+            .unwrap_err(),
+        SubmitError::Risk(RiskRefusal::Locked)
+    );
+    assert_eq!(fake.count("POST "), 0);
+
+    let super::risk::AutoCloseDecision::Run(grant) = tracker.begin_auto_close(NOW, true) else {
+        panic!("expected the automatic close to run");
+    };
+    let snap = tracker.snapshot(NOW);
+    let rep = c
+        .auto_close(&OpenGate, &snap, grant, &t, MarginMode::Cross)
+        .await;
+    assert!(rep.is_clear(), "{rep:?}");
+    assert_eq!(fake.count("DELETE /fapi/v1/allOpenOrders"), 1);
+    assert_eq!(fake.count("DELETE /fapi/v1/algoOpenOrders"), 1);
+    assert_eq!(fake.count("POST /fapi/v1/order"), 1);
+    // Orders and positions were read before the sends and once more after them.
+    assert_eq!(fake.count("GET /fapi/v1/openOrders"), 2);
+    assert_eq!(fake.count("GET /fapi/v3/positionRisk"), 2);
+}
+
+#[tokio::test]
+async fn risk_close_does_not_report_success_when_a_position_remains() {
+    let fake = serve(|m, p| match (m, p) {
+        ("GET", "/fapi/v1/openOrders") | ("GET", "/fapi/v1/openAlgoOrders") => {
+            (200, "[]".to_string())
+        }
+        // The exchange still shows the position after the close.
+        ("GET", "/fapi/v3/positionRisk") => (
+            200,
+            json!([{"symbol": "BTCUSDT", "positionAmt": "0.002", "positionSide": "BOTH",
+                    "marginType": "cross", "leverage": "10"}])
+            .to_string(),
+        ),
+        ("POST", "/fapi/v1/order") => gen_binance(m, p),
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let mut tracker = tripped_tracker(c.account(), EquityBasis::BinanceTotalMarginBalance);
+    let super::risk::AutoCloseDecision::Run(grant) = tracker.begin_auto_close(NOW, true) else {
+        panic!("expected the automatic close to run");
+    };
+    let rep = c
+        .auto_close(
+            &OpenGate,
+            &tracker.snapshot(NOW),
+            grant,
+            &futures(),
+            MarginMode::Cross,
+        )
+        .await;
+    assert!(!rep.is_clear());
+    assert_eq!(rep.remaining_positions(), Some(1));
+    assert!(!rep.reread_failed());
+}
+
+#[tokio::test]
+async fn risk_close_for_another_account_is_refused_without_a_request() {
+    let fake = serve(|_, _| (404, "{}".to_string()));
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let mut tracker = tripped_tracker(
+        AccountKey::from_bytes([200; 16]),
+        EquityBasis::BinanceTotalMarginBalance,
+    );
+    let super::risk::AutoCloseDecision::Run(grant) = tracker.begin_auto_close(NOW, true) else {
+        panic!("expected the automatic close to run");
+    };
+    let rep = c
+        .auto_close(
+            &OpenGate,
+            &tracker.snapshot(NOW),
+            grant,
+            &futures(),
+            MarginMode::Cross,
+        )
+        .await;
+    assert!(!rep.is_clear());
+    assert!(rep.reread_failed());
+    assert_eq!(fake.all().len(), 0);
+}
+
+#[tokio::test]
+async fn cancel_all_reads_every_okx_algo_type_and_lists_the_ones_it_cannot_cancel() {
+    use super::okx::OkxAlgoType;
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&cancelled);
+    let fake = serve_q(move |m, p, q| match (m, p) {
+        ("GET", "/api/v5/trade/orders-pending") | ("GET", "/api/v5/account/positions") => {
+            (200, json!({"code": "0", "data": []}).to_string())
+        }
+        ("GET", "/api/v5/trade/orders-algo-pending") => {
+            let row = |id: &str| json!({"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "algoId": id}]});
+            let body = if q.contains("ordType=conditional,oco") && c2.load(Ordering::Relaxed) == 0 {
+                json!({"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "algoId": "1001",
+                    "ordType": "conditional"}]})
+            } else if q.contains("ordType=iceberg") {
+                row("1002")
+            } else if q.contains("ordType=move_order_stop") {
+                row("1003")
+            } else {
+                json!({"code": "0", "data": []})
+            };
+            (200, body.to_string())
+        }
+        ("POST", "/api/v5/trade/cancel-algos") => {
+            c2.fetch_add(1, Ordering::Relaxed);
+            gen_okx(m, p)
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+    let t = okx_swap_table();
+    let mut tracker = tripped_tracker(c.account(), EquityBasis::OkxTotalEq);
+    let super::risk::AutoCloseDecision::Run(grant) = tracker.begin_auto_close(NOW, true) else {
+        panic!("expected the automatic close to run");
+    };
+    let rep = c
+        .auto_close(
+            &OpenGate,
+            &tracker.snapshot(NOW),
+            grant,
+            &t,
+            MarginMode::Cross,
+        )
+        .await;
+    // Only the conditional order was cancelled; iceberg and trailing stop were not tried.
+    assert_eq!(fake.count("POST /api/v5/trade/cancel-algos"), 1);
+    assert!(!rep.is_clear());
+    let mut left: Vec<_> = rep.uncancellable().iter().map(|o| o.id.clone()).collect();
+    left.sort();
+    assert_eq!(left, ["1002", "1003"]);
+    assert_eq!(rep.remaining_orders(), Some(2));
+    // Eight order types are read in seven requests (conditional and oco share one), in each
+    // of two rounds: before the cancel and in the final read.
+    assert_eq!(fake.count("GET /api/v5/trade/orders-algo-pending"), 14);
+    assert_eq!(OkxAlgoType::ALL_PENDING.len(), 8);
+    assert_eq!(
+        OkxAlgoType::PENDING_READS
+            .iter()
+            .map(|g| g.len())
+            .sum::<usize>(),
+        8
+    );
+}
+
+/// An OKX server with one open conditional order. `fail` is a substring of the query of an
+/// `orders-algo-pending` read that answers with an error.
+fn okx_one_algo_server(fail: &'static str) -> Fake {
+    serve_q(move |m, p, q| match (m, p) {
+        ("GET", "/api/v5/trade/orders-pending") => {
+            (200, json!({"code": "0", "data": []}).to_string())
+        }
+        ("GET", "/api/v5/trade/orders-algo-pending") => {
+            if !fail.is_empty() && q.contains(fail) {
+                (
+                    200,
+                    json!({"code": "50013", "msg": "busy", "data": []}).to_string(),
+                )
+            } else if q.contains("ordType=conditional,oco") {
+                (
+                    200,
+                    json!({"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "algoId": "1001",
+                        "ordType": "conditional"}]})
+                    .to_string(),
+                )
+            } else {
+                (200, json!({"code": "0", "data": []}).to_string())
+            }
+        }
+        ("POST", "/api/v5/trade/cancel-algos") => gen_okx(m, p),
+        _ => (404, "{}".to_string()),
+    })
+}
+
+#[tokio::test]
+async fn cancel_all_cancels_what_it_read_when_one_algo_type_cannot_be_read() {
+    use super::okx::OkxAlgoType;
+    crate::rate_limit::okx_reset_for_tests();
+    let fake = okx_one_algo_server("ordType=trigger");
+    let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+    let t = okx_swap_table();
+    let rep = c
+        .cancel_all(&OpenGate, &NoRisk, ConfirmToken::user_confirmed(), &t)
+        .await
+        .expect("a failed algo read does not abort");
+    // The conditional order that was read is cancelled; the failed type is listed.
+    assert_eq!(fake.count("POST /api/v5/trade/cancel-algos"), 1);
+    assert_eq!(rep.sent, 1);
+    assert_eq!(rep.unknown_algo_types, [OkxAlgoType::Trigger]);
+    // The final read fails on the same type, and the report is never clean.
+    assert!(rep.reread_failed);
+    assert!(!rep.is_clear());
+}
+
+#[tokio::test]
+async fn a_report_with_an_unread_type_is_not_clean_even_when_the_final_read_is_empty() {
+    use super::okx::OkxAlgoType;
+    crate::rate_limit::okx_reset_for_tests();
+    // The trigger read fails once (the read before the cancel) and works afterwards.
+    let seen = Arc::new(AtomicUsize::new(0));
+    let s2 = Arc::clone(&seen);
+    let fake = serve_q(move |m, p, q| match (m, p) {
+        ("GET", "/api/v5/trade/orders-pending") => {
+            (200, json!({"code": "0", "data": []}).to_string())
+        }
+        ("GET", "/api/v5/trade/orders-algo-pending") => {
+            if q.contains("ordType=trigger") && s2.fetch_add(1, Ordering::Relaxed) == 0 {
+                (
+                    200,
+                    json!({"code": "50013", "msg": "busy", "data": []}).to_string(),
+                )
+            } else {
+                (200, json!({"code": "0", "data": []}).to_string())
+            }
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+    let rep = c
+        .cancel_all(
+            &OpenGate,
+            &NoRisk,
+            ConfirmToken::user_confirmed(),
+            &okx_swap_table(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rep.unknown_algo_types, [OkxAlgoType::Trigger]);
+    assert!(!rep.reread_failed);
+    assert!(rep.remaining.is_empty());
+    assert!(!rep.is_clear());
+}
+
+#[tokio::test]
+async fn pressing_cancel_all_twice_still_cancels_the_second_time() {
+    crate::rate_limit::okx_reset_for_tests();
+    let fake = okx_one_algo_server("");
+    let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+    let t = okx_swap_table();
+    let first = c
+        .cancel_all(&OpenGate, &NoRisk, ConfirmToken::user_confirmed(), &t)
+        .await
+        .unwrap();
+    assert!(first.unknown_algo_types.is_empty());
+    // 14 algo reads went out already. The second round's reads use the budget kept for
+    // cancels (20 per 2 s), where the query cap (18) would have run out before the cancel.
+    let second = c
+        .cancel_all(&OpenGate, &NoRisk, ConfirmToken::user_confirmed(), &t)
+        .await
+        .expect("the second round is not stopped by the read budget");
+    assert_eq!(fake.count("POST /api/v5/trade/cancel-algos"), 2);
+    assert_eq!(second.sent, 1);
+    // Reads that did not fit are listed as unknown, never as clean.
+    assert!(!second.unknown_algo_types.is_empty());
+    assert!(!second.is_clear());
+}
+
+#[test]
+fn conditional_and_oco_are_one_read() {
+    use super::okx::OkxAlgoType;
+    let req =
+        super::queries::okx_pending_algos(&[OkxAlgoType::Conditional, OkxAlgoType::Oco]).unwrap();
+    assert_eq!(
+        req.path(),
+        "/api/v5/trade/orders-algo-pending?ordType=conditional,oco"
+    );
+    assert!(super::queries::okx_pending_algos(&[]).is_err());
+}
+
+// ── Equity read, and the close on OKX and in hedge mode ─────────────────
+
+#[tokio::test]
+async fn equity_is_read_from_the_documented_fields_and_never_defaults_to_zero() {
+    use super::risk::{EquityBasis, EquitySource};
+    // Binance USDⓈ-M: totalMarginBalance of /fapi/v3/account.
+    let fake = serve(|m, p| match (m, p) {
+        ("GET", "/fapi/v3/account") => (
+            200,
+            json!({"totalMarginBalance": "126.72469206", "totalWalletBalance": "1"}).to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let o = c.equity().await.unwrap();
+    assert_eq!(o.equity, d("126.72469206"));
+    assert_eq!(o.basis, EquityBasis::BinanceTotalMarginBalance);
+    assert_eq!(o.source, EquitySource::Rest);
+    assert_eq!(o.at_ms, NOW, "the client's clock, not the wall clock");
+    assert!(!o.is_transfer);
+
+    // OKX: totalEq of data[0] in account/balance.
+    let fake = serve(|m, p| match (m, p) {
+        ("GET", "/api/v5/account/balance") => (
+            200,
+            json!({"code": "0", "data": [{"totalEq": "55837.43556134779", "details": []}]})
+                .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+    let o = c.equity().await.unwrap();
+    assert_eq!(o.equity, d("55837.43556134779"));
+    assert_eq!(o.basis, EquityBasis::OkxTotalEq);
+
+    // Spot has no source and sends nothing.
+    let none = serve(|_, _| (404, "{}".to_string()));
+    let c = client(AccountVenue::Binance, AccountProduct::Spot, &none);
+    assert!(matches!(
+        c.equity().await,
+        Err(super::client::ReadError::Trade(TradeError::Unsupported))
+    ));
+    assert_eq!(none.all().len(), 0);
+}
+
+#[tokio::test]
+async fn a_malformed_equity_body_is_a_parse_error() {
+    for body in [
+        json!({}),
+        json!({"totalMarginBalance": ""}),
+        json!({"totalMarginBalance": "abc"}),
+        json!({"totalMarginBalance": 126.7}),
+        json!({"totalMarginBalance": "1e3"}),
+    ] {
+        let b = body.to_string();
+        let fake = serve(move |_, _| (200, b.clone()));
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        assert!(
+            matches!(c.equity().await, Err(super::client::ReadError::Parse)),
+            "{body}"
+        );
+    }
+    for data in [
+        json!([]),
+        json!([{}]),
+        json!([{"totalEq": ""}]),
+        json!([{"totalEq": "x"}]),
+    ] {
+        let b = json!({"code": "0", "data": data}).to_string();
+        let fake = serve(move |_, _| (200, b.clone()));
+        let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+        assert!(matches!(
+            c.equity().await,
+            Err(super::client::ReadError::Parse)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn risk_close_flattens_an_okx_position_with_close_position() {
+    let closed = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&closed);
+    let fake = serve(move |m, p| match (m, p) {
+        ("GET", "/api/v5/account/positions") => {
+            if c2.load(Ordering::Relaxed) > 0 {
+                (200, json!({"code": "0", "data": []}).to_string())
+            } else {
+                (
+                    200,
+                    json!({"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "pos": "2",
+                        "posSide": "net", "mgnMode": "cross", "lever": "10"}]})
+                    .to_string(),
+                )
+            }
+        }
+        ("GET", "/api/v5/trade/orders-pending") | ("GET", "/api/v5/trade/orders-algo-pending") => {
+            (200, json!({"code": "0", "data": []}).to_string())
+        }
+        ("POST", "/api/v5/trade/close-position") => {
+            c2.fetch_add(1, Ordering::Relaxed);
+            gen_okx(m, p)
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+    let mut tracker = tripped_tracker(c.account(), EquityBasis::OkxTotalEq);
+    let super::risk::AutoCloseDecision::Run(grant) = c.begin_auto_close(&mut tracker, true) else {
+        panic!("expected the automatic close to run");
+    };
+    let rep = c
+        .auto_close(
+            &OpenGate,
+            &c.risk_snapshot(&tracker),
+            grant,
+            &okx_swap_table(),
+            MarginMode::Cross,
+        )
+        .await;
+    assert_eq!(fake.count("POST /api/v5/trade/close-position"), 1);
+    let flatten = rep.flatten.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!((flatten.sent, flatten.failed), (1, 0));
+    assert!(rep.is_clear(), "{rep:?}");
+}
+
+#[tokio::test]
+async fn risk_close_closes_both_sides_of_a_hedge_account() {
+    let closed = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&closed);
+    let fake = serve(move |m, p| match (m, p) {
+        ("GET", "/fapi/v3/positionRisk") => {
+            if c2.load(Ordering::Relaxed) >= 2 {
+                (200, "[]".to_string())
+            } else {
+                (
+                    200,
+                    json!([
+                        {"symbol": "BTCUSDT", "positionAmt": "0.002", "positionSide": "LONG",
+                         "marginType": "cross", "leverage": "10"},
+                        {"symbol": "BTCUSDT", "positionAmt": "-0.003", "positionSide": "SHORT",
+                         "marginType": "cross", "leverage": "10"}
+                    ])
+                    .to_string(),
+                )
+            }
+        }
+        ("GET", "/fapi/v1/openOrders") | ("GET", "/fapi/v1/openAlgoOrders") => {
+            (200, "[]".to_string())
+        }
+        ("POST", "/fapi/v1/order") => {
+            c2.fetch_add(1, Ordering::Relaxed);
+            gen_binance(m, p)
+        }
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let mut tracker = tripped_tracker(c.account(), EquityBasis::BinanceTotalMarginBalance);
+    let super::risk::AutoCloseDecision::Run(grant) = c.begin_auto_close(&mut tracker, true) else {
+        panic!("expected the automatic close to run");
+    };
+    let rep = c
+        .auto_close(
+            &OpenGate,
+            &c.risk_snapshot(&tracker),
+            grant,
+            &futures(),
+            MarginMode::Cross,
+        )
+        .await;
+    assert_eq!(fake.count("POST /fapi/v1/order"), 2, "one close per side");
+    let flatten = rep.flatten.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!((flatten.sent, flatten.failed), (2, 0));
+    assert!(rep.is_clear(), "{rep:?}");
 }

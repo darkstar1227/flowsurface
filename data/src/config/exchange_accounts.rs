@@ -28,6 +28,9 @@ pub struct AccountMeta {
     pub product: AccountProduct,
     /// Position mode the user expects the exchange account to be in.
     pub position_mode: PositionMode,
+    /// Local risk limits and the automatic-close switch (off by default). Settings only; the
+    /// equity peak and lock state are never saved.
+    pub risk: super::risk::AccountRiskSettings,
 }
 
 impl AccountMeta {
@@ -50,6 +53,7 @@ impl AccountMeta {
                 AccountProduct::default()
             },
             position_mode,
+            risk: Default::default(),
         }
     }
 
@@ -258,6 +262,17 @@ pub fn delete_credentials(meta: &AccountMeta) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_account_saved_before_risk_settings_loads_with_automatic_close_off() {
+        let old = r#"{"id":"00000000-0000-0000-0000-000000000009","alias":"a","venue":"Okx","env":"Testnet"}"#;
+        let m: AccountMeta = serde_json::from_str(old).expect("old account loads");
+        assert_eq!(m.risk, crate::config::risk::AccountRiskSettings::default());
+        assert!(!m.risk.auto_close);
+        // The new field is settings only: no secret-looking content in the JSON.
+        let json = serde_json::to_string(&m).expect("json");
+        assert!(json.contains("\"auto_close\":false"));
+    }
+
     use super::*;
 
     const FAKE_KEY: &str = "fake-key-AAAA1111";

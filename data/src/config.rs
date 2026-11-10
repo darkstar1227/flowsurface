@@ -3,6 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub mod auth;
 pub mod exchange_accounts;
 pub mod network;
+pub mod risk;
+pub mod risk_log;
 pub mod sidebar;
 pub mod state;
 pub mod theme;
