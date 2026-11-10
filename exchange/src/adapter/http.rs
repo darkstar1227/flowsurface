@@ -1,6 +1,7 @@
 use crate::adapter::limiter::RateLimiter;
 use crate::adapter::{AdapterError, KlinePage};
 use crate::depth::DepthPayload;
+use crate::error::FetchError;
 use crate::{Kline, OpenInterest, Ticker, TickerInfo, TickerStats, Timeframe, Trade, UnixMs};
 
 use futures::future::BoxFuture;
@@ -90,6 +91,18 @@ impl<L: RateLimiter> HttpHub<L> {
 
         {
             let limiter = self.limiter_mut();
+            // A ban can last long; fail fast so the UI shows it instead of the worker sleeping.
+            if let Some(remaining) = limiter.ban_remaining() {
+                let msg = format!(
+                    "IP banned for another {}s, not sending: {url}",
+                    remaining.as_secs()
+                );
+                log::warn!("{msg}");
+                return Err(AdapterError::FetchError(FetchError::new(
+                    msg,
+                    "Exchange has banned this IP temporarily. Try again later.",
+                )));
+            }
             if let Some(wait_time) = limiter.prepare_request(weight) {
                 log::warn!("Rate limit hit for: {url}. Waiting for {:?}", wait_time);
                 tokio::time::sleep(wait_time).await;

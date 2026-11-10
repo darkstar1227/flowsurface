@@ -11,8 +11,8 @@ use data::config::exchange_accounts::{
     AccountMeta, StoreError, delete_credentials, load_credentials, save_credentials,
 };
 use exchange::account::{
-    AccountEnv, AccountVenue, ApiCredentials, CheckReport, PositionMode, Verdict, check_account,
-    is_usable,
+    AccountEnv, AccountProduct, AccountVenue, ApiCredentials, CheckReport, PositionMode, Verdict,
+    check_account, is_usable,
 };
 
 use iced::{
@@ -26,6 +26,11 @@ pub enum Action {
     /// The account list changed and must be persisted.
     Persist,
     Exit,
+    /// A connection test finished. `Some` records its verdict in the send gate's session;
+    /// `None` (the test could not run) voids any earlier verdict.
+    Tested(Box<AccountMeta>, Option<Box<CheckReport>>),
+    /// An account was deleted: its session verdict is void and the list must be persisted.
+    Removed(Uuid),
 }
 
 /// Text typed into a secret field. Debug is masked: with the `debug` feature iced prints
@@ -60,6 +65,7 @@ pub enum Message {
     AliasChanged(String),
     VenueSelected(AccountVenue),
     EnvSelected(AccountEnv),
+    ProductSelected(AccountProduct),
     ModeSelected(PositionMode),
     KeyChanged(Redacted),
     SecretChanged(Redacted),
@@ -79,6 +85,7 @@ struct Form {
     alias: String,
     venue: AccountVenue,
     env: AccountEnv,
+    product: AccountProduct,
     mode: PositionMode,
     key: String,
     secret: String,
@@ -91,6 +98,7 @@ impl std::fmt::Debug for Form {
             .field("alias", &self.alias)
             .field("venue", &self.venue)
             .field("env", &self.env)
+            .field("product", &self.product)
             .field("mode", &self.mode)
             .field("key", &"***")
             .field("secret", &"***")
@@ -179,6 +187,7 @@ impl ExchangeAccounts {
             Message::AliasChanged(v) => self.form.alias = v,
             Message::VenueSelected(v) => self.form.venue = v,
             Message::EnvSelected(v) => self.form.env = v,
+            Message::ProductSelected(v) => self.form.product = v,
             Message::ModeSelected(v) => self.form.mode = v,
             // The previous string (a prefix of the secret) is wiped before it is replaced.
             Message::KeyChanged(mut v) => {
@@ -225,12 +234,19 @@ impl ExchangeAccounts {
                     Err(e) => self.error = Some(format!("{e}. Credential fields were cleared.")),
                 }
             }
-            Message::Test(id) => return (self.start_test(id, signed), None),
+            Message::Test(id) => return self.start_test(id, signed),
             Message::Tested(id, outcome) => {
                 if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) {
-                    row.status = match outcome {
-                        Ok(report) => Status::Done(*report),
-                        Err(e) => Status::Failed(e),
+                    let meta = Box::new(row.meta.clone());
+                    return match outcome {
+                        Ok(report) => {
+                            row.status = Status::Done((*report).clone());
+                            (Task::none(), Some(Action::Tested(meta, Some(report))))
+                        }
+                        Err(e) => {
+                            row.status = Status::Failed(e);
+                            (Task::none(), Some(Action::Tested(meta, None)))
+                        }
                     };
                 }
             }
@@ -252,7 +268,7 @@ impl ExchangeAccounts {
                     match outcome {
                         Ok(()) => {
                             self.rows.remove(pos);
-                            return (Task::none(), Some(Action::Persist));
+                            return (Task::none(), Some(Action::Removed(id)));
                         }
                         Err(e) => {
                             self.rows[pos].deleting = false;
@@ -294,28 +310,41 @@ impl ExchangeAccounts {
             secret.to_string(),
             is_okx.then(|| passphrase.to_string()),
         );
-        let meta = AccountMeta::new(alias, self.form.venue, self.form.env, self.form.mode);
+        let meta = AccountMeta::new(
+            alias,
+            self.form.venue,
+            self.form.env,
+            self.form.product,
+            self.form.mode,
+        );
         Ok((meta, creds))
     }
 
-    fn start_test(&mut self, id: Uuid, signed: &Result<reqwest::Client, String>) -> Task<Message> {
+    fn start_test(
+        &mut self,
+        id: Uuid,
+        signed: &Result<reqwest::Client, String>,
+    ) -> (Task<Message>, Option<Action>) {
         let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) else {
-            return Task::none();
+            return (Task::none(), None);
         };
         if matches!(row.status, Status::Testing) {
-            return Task::none();
+            return (Task::none(), None);
         }
         let client = match signed {
             Ok(c) => c.clone(),
             Err(e) => {
+                // Not a result of the exchange: the status explains why, and the gate's
+                // verdict for this account is dropped by the caller.
                 row.status = Status::Failed(e.clone());
-                return Task::none();
+                let meta = Box::new(row.meta.clone());
+                return (Task::none(), Some(Action::Tested(meta, None)));
             }
         };
         row.status = Status::Testing;
         let meta = row.meta.clone();
 
-        Task::perform(
+        let task = Task::perform(
             async move {
                 let loader = {
                     let meta = meta.clone();
@@ -323,15 +352,23 @@ impl ExchangeAccounts {
                 };
                 match loader.await {
                     Ok(Ok(creds)) => Ok(Box::new(
-                        check_account(&client, meta.venue, meta.env, &creds, meta.position_mode)
-                            .await,
+                        check_account(
+                            &client,
+                            meta.venue,
+                            meta.env,
+                            meta.product,
+                            &creds,
+                            meta.position_mode,
+                        )
+                        .await,
                     )),
                     Ok(Err(e)) => Err(describe_store_error(&e)),
                     Err(_) => Err("Keychain access did not complete".to_string()),
                 }
             },
             move |outcome| Message::Tested(id, outcome),
-        )
+        );
+        (task, None)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -365,9 +402,13 @@ impl ExchangeAccounts {
 
     fn view_row<'a>(&'a self, r: &'a Row) -> Element<'a, Message> {
         let meta = &r.meta;
+        let venue_label = match meta.venue {
+            AccountVenue::Binance => format!("{} {}", meta.venue, meta.product),
+            AccountVenue::Okx => meta.venue.to_string(),
+        };
         let title = row![
             text(&meta.alias),
-            text(meta.venue.to_string()).size(style::text_size::SMALL),
+            text(venue_label).size(style::text_size::SMALL),
             env_tag(meta.env),
         ]
         .spacing(8)
@@ -449,6 +490,20 @@ impl ExchangeAccounts {
         ]
         .spacing(8);
 
+        if f.venue == AccountVenue::Binance {
+            col = col.push(
+                row![
+                    text("Product").size(style::text_size::SMALL),
+                    pick_list(
+                        AccountProduct::ALL,
+                        Some(f.product),
+                        Message::ProductSelected
+                    ),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            );
+        }
         if f.venue == AccountVenue::Okx {
             col = col.push(
                 text_input("API passphrase", &f.passphrase)
@@ -458,9 +513,15 @@ impl ExchangeAccounts {
         }
         if f.env == AccountEnv::Testnet {
             col = col.push(
-                text(match f.venue {
-                    AccountVenue::Binance => "Binance futures testnet: permissions cannot be read.",
-                    AccountVenue::Okx => "OKX demo trading (x-simulated-trading: 1).",
+                text(match (f.venue, f.product) {
+                    (AccountVenue::Binance, AccountProduct::UsdM) => {
+                        "Binance futures testnet: permissions cannot be read."
+                    }
+                    (AccountVenue::Binance, AccountProduct::Spot) => {
+                        "Binance spot testnet: permissions cannot be read. \
+                         Use a key created on the spot testnet."
+                    }
+                    (AccountVenue::Okx, _) => "OKX demo trading (x-simulated-trading: 1).",
                 })
                 .size(style::text_size::SMALL),
             );
@@ -635,5 +696,77 @@ mod tests {
         modal.form.secret = FAKE_SECRET.into();
         modal.clear_form();
         assert!(modal.form.secret.is_empty());
+    }
+
+    fn modal_with_account() -> (ExchangeAccounts, AccountMeta) {
+        let meta = AccountMeta::new(
+            "main".into(),
+            AccountVenue::Binance,
+            AccountEnv::Testnet,
+            AccountProduct::Spot,
+            PositionMode::OneWay,
+        );
+        let modal = ExchangeAccounts::new(&data::ExchangeAccounts {
+            accounts: vec![meta.clone()],
+        });
+        (modal, meta)
+    }
+
+    #[test]
+    fn test_results_are_handed_to_the_session_not_kept_in_the_modal() {
+        let (mut modal, meta) = modal_with_account();
+        let unused = Err("unused".to_string());
+        let report = CheckReport {
+            verdict: Verdict::Usable,
+            warnings: vec![],
+            actual_mode: None,
+            can_trade: Some(true),
+        };
+        let (_, action) = modal.update(
+            Message::Tested(meta.id, Ok(Box::new(report.clone()))),
+            &unused,
+        );
+        match action {
+            Some(Action::Tested(m, Some(r))) => {
+                assert_eq!(m.id, meta.id);
+                assert_eq!(*r, report);
+            }
+            _ => panic!("expected a recorded verdict"),
+        }
+        // A failed test voids the verdict.
+        let (_, action) = modal.update(Message::Tested(meta.id, Err("x".into())), &unused);
+        assert!(matches!(action, Some(Action::Tested(_, None))));
+    }
+
+    #[test]
+    fn a_test_that_cannot_start_voids_the_verdict() {
+        let (mut modal, meta) = modal_with_account();
+        // No usable signed client (for example the proxy changed): nothing was tested.
+        let (_, action) = modal.update(Message::Test(meta.id), &Err("proxy".into()));
+        assert!(matches!(action, Some(Action::Tested(_, None))));
+    }
+
+    #[test]
+    fn deleting_an_account_reports_its_id_so_the_session_can_drop_it() {
+        let (mut modal, meta) = modal_with_account();
+        let (_, action) = modal.update(Message::Deleted(meta.id, Ok(())), &Err("x".into()));
+        assert!(matches!(action, Some(Action::Removed(id)) if id == meta.id));
+        assert!(modal.rows.is_empty());
+    }
+
+    #[test]
+    fn product_is_kept_for_binance_and_ignored_for_okx() {
+        let mut modal = ExchangeAccounts::new(&data::ExchangeAccounts::default());
+        modal.form.alias = "a".into();
+        modal.form.key = "k".into();
+        modal.form.secret = "s".into();
+        modal.form.product = AccountProduct::Spot;
+        let (meta, _) = modal.prepare_save().unwrap();
+        assert_eq!(meta.product, AccountProduct::Spot);
+
+        modal.form.venue = AccountVenue::Okx;
+        modal.form.passphrase = "p".into();
+        let (meta, _) = modal.prepare_save().unwrap();
+        assert_eq!(meta.product, AccountProduct::default());
     }
 }

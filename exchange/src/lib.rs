@@ -2,7 +2,9 @@ pub mod account;
 pub mod adapter;
 pub mod depth;
 mod error;
+pub mod rate_limit;
 mod serde_util;
+pub mod signing;
 pub mod unit;
 
 pub use adapter::{Event, proxy};

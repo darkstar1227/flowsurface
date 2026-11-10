@@ -1,7 +1,7 @@
 mod client;
 mod http;
 mod hub;
-mod limiter;
+pub(crate) mod limiter;
 pub mod proxy;
 mod ws;
 

@@ -12,6 +12,11 @@ pub struct Network {
     #[serde(skip)]
     pub server_auth_token: Option<String>,
     pub trade_fetch_mode: TradeFetchMode,
+    /// The saved proxy setting could not be read (corrupt or unreadable save file). Persisted
+    /// so that a later start does not fall back to a direct connection; cleared only when the
+    /// user explicitly applies a proxy choice in the Network settings.
+    #[serde(default)]
+    pub proxy_unknown: bool,
 }
 
 impl Network {

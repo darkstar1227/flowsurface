@@ -150,6 +150,9 @@ pub struct SavedState {
     pub audio_cfg: data::AudioStream,
     pub volume_size_unit: exchange::SizeUnit,
     pub network: data::Network,
+    /// The saved state existed but could not be read, so the user's proxy setting is
+    /// unknown. Signed requests are refused in that case instead of assuming "no proxy".
+    pub proxy_unreadable: bool,
     pub exchange_accounts: data::ExchangeAccounts,
     pub cache_market_metadata: bool,
     pub antialiasing: bool,
@@ -182,6 +185,7 @@ impl Default for SavedState {
             audio_cfg: data::AudioStream::default(),
             volume_size_unit: exchange::SizeUnit::default(),
             network: data::Network::default(),
+            proxy_unreadable: false,
             exchange_accounts: data::ExchangeAccounts::default(),
             cache_market_metadata: false,
             antialiasing: true,
@@ -432,6 +436,8 @@ pub fn load_saved_state() -> SavedState {
                 proxy.set_auth(Some(auth));
             }
 
+            let proxy_unreadable = network.proxy_unknown;
+
             SavedState {
                 theme: state.selected_theme,
                 custom_theme: state.custom_theme,
@@ -443,6 +449,7 @@ pub fn load_saved_state() -> SavedState {
                 audio_cfg: state.audio_cfg,
                 volume_size_unit: state.size_in_quote_ccy,
                 network,
+                proxy_unreadable,
                 exchange_accounts: state.exchange_accounts.sanitized(),
                 cache_market_metadata: state.cache_market_metadata,
                 antialiasing: state.antialiasing,
@@ -454,7 +461,67 @@ pub fn load_saved_state() -> SavedState {
                 e
             );
 
-            SavedState::default()
+            unreadable_state(is_missing_file(e.as_ref()))
         }
+    }
+}
+
+/// The state to start with when the save file could not be loaded. Unless the file is simply
+/// missing, the proxy is unknown: remember that in the network config, which is written back
+/// on exit, so the next start is still `Broken` instead of connecting directly.
+fn unreadable_state(missing_file: bool) -> SavedState {
+    let mut state = SavedState::default();
+    if !missing_file {
+        state.proxy_unreadable = true;
+        state.network.proxy_unknown = true;
+    }
+    state
+}
+
+/// A first run has no saved state; any other read or parse failure means the user's
+/// settings (the proxy among them) are unknown.
+fn is_missing_file(e: &(dyn std::error::Error + 'static)) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_proxy_survives_a_save_and_restart() {
+        // Corrupt file -> start (Broken) -> exit writes the state -> start again.
+        let first = unreadable_state(false);
+        assert!(first.proxy_unreadable);
+        let json = serde_json::to_string(&first.network.for_persistence()).unwrap();
+        let reloaded: data::Network = serde_json::from_str(&json).unwrap();
+        // The next start derives `proxy_unreadable` from this flag.
+        assert!(reloaded.proxy_unknown);
+        assert!(reloaded.proxy.is_none());
+
+        // An old save without the field loads as known.
+        let old: data::Network = serde_json::from_str(
+            r#"{"proxy":null,"server_url":null,"trade_fetch_mode":{"type":"Off"}}"#,
+        )
+        .unwrap();
+        assert!(!old.proxy_unknown);
+
+        // A first run (missing file) is not unknown.
+        let fresh = unreadable_state(true);
+        assert!(!fresh.proxy_unreadable && !fresh.network.proxy_unknown);
+    }
+
+    #[test]
+    fn only_a_missing_file_leaves_the_proxy_setting_known() {
+        let missing: Box<dyn std::error::Error> =
+            Box::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let denied: Box<dyn std::error::Error> =
+            Box::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let parse: Box<dyn std::error::Error> =
+            Box::new(serde_json::from_str::<u8>("nope").unwrap_err());
+        assert!(is_missing_file(missing.as_ref()));
+        assert!(!is_missing_file(denied.as_ref()));
+        assert!(!is_missing_file(parse.as_ref()));
     }
 }
