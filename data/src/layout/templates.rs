@@ -57,8 +57,15 @@ impl Template {
 pub fn primary_ticker(dashboard: &Dashboard) -> Option<Ticker> {
     let mut counts = BTreeMap::<Ticker, (usize, usize)>::new();
     let mut order = 0;
-    let mut panes = vec![&dashboard.pane];
-    panes.extend(dashboard.popout.iter().map(|(pane, _)| pane));
+    // A stack: push popouts in reverse and the main pane last, so the main pane tree is
+    // visited first, then popouts in order.
+    let mut panes = dashboard
+        .popout
+        .iter()
+        .rev()
+        .map(|(pane, _)| pane)
+        .collect::<Vec<_>>();
+    panes.push(&dashboard.pane);
     while let Some(pane) = panes.pop() {
         if let Pane::Split { a, b, .. } = pane {
             panes.push(b);
@@ -340,6 +347,16 @@ mod tests {
                 split(kline("BTCUSDT"), kline("BTCUSDT")),
             )),
         );
+        assert_eq!(template.primary_ticker(), Some(ticker("BTCUSDT")));
+    }
+
+    #[test]
+    fn ties_prefer_the_main_pane_tree() {
+        let mut board = dashboard(kline("BTCUSDT"));
+        board
+            .popout
+            .push((kline("ETHUSDT"), super::super::WindowSpec::default()));
+        let template = Template::new("t", board);
         assert_eq!(template.primary_ticker(), Some(ticker("BTCUSDT")));
     }
 
