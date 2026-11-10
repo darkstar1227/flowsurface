@@ -1,6 +1,9 @@
 use crate::{
     Event, Kline, OpenInterest, PushFrequency, Ticker, TickerInfo, Timeframe, Trade, UnixMs,
-    adapter::{Exchange, KlinePage, MarketKind, StreamTicksize, limiter::DynamicRateLimiterConfig},
+    adapter::{
+        Exchange, KlinePage, MarketKind, StreamTicksize,
+        limiter::{DynamicRateLimiterConfig, binance_host_state},
+    },
     depth::DepthPayload,
     unit::{ContractSize, qty::RawQtyUnit},
 };
@@ -15,11 +18,11 @@ const SPOT_DOMAIN: &str = "https://api.binance.com";
 const LINEAR_PERP_DOMAIN: &str = "https://fapi.binance.com";
 const INVERSE_PERP_DOMAIN: &str = "https://dapi.binance.com";
 
-const SPOT_LIMIT: usize = 6000;
-const PERPS_LIMIT: usize = 2400;
-const REFILL_RATE: Duration = Duration::from_secs(60);
-const LIMITER_BUFFER_PCT: f32 = 0.03;
-const USED_WEIGHT_HEADER: &str = "x-mbx-used-weight-1m";
+pub(crate) const SPOT_LIMIT: usize = 6000;
+pub(crate) const PERPS_LIMIT: usize = 2400;
+pub(crate) const REFILL_RATE: Duration = Duration::from_secs(60);
+pub(crate) const LIMITER_BUFFER_PCT: f32 = 0.03;
+pub(crate) const USED_WEIGHT_HEADER: &str = "x-mbx-used-weight-1m";
 const THIRTY_DAYS_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 fn exchange_from_market_type(market: MarketKind) -> Exchange {
@@ -256,17 +259,23 @@ impl Worker {
     fn new(client: reqwest::Client) -> Result<Self, AdapterError> {
         let config = BinanceConfig::default();
 
+        // Each limiter draws from the per-host state that signed requests share, so public
+        // and signed traffic consume the same IP weight.
+        let limiter_for = |market: MarketKind, host: &str| {
+            let cfg = config.limiter_config_for_market(market);
+            BinanceLimiter::new_shared(cfg, binance_host_state(host, cfg))
+        };
         let spot_hub = HttpHub::with_client(
             client.clone(),
-            BinanceLimiter::new(config.limiter_config_for_market(MarketKind::Spot)),
+            limiter_for(MarketKind::Spot, "api.binance.com"),
         );
         let linear_hub = HttpHub::with_client(
             client.clone(),
-            BinanceLimiter::new(config.limiter_config_for_market(MarketKind::LinearPerps)),
+            limiter_for(MarketKind::LinearPerps, "fapi.binance.com"),
         );
         let inverse_hub = HttpHub::with_client(
             client,
-            BinanceLimiter::new(config.limiter_config_for_market(MarketKind::InversePerps)),
+            limiter_for(MarketKind::InversePerps, "dapi.binance.com"),
         );
 
         Ok(Self {

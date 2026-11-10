@@ -16,7 +16,9 @@ mod window;
 use connector::client::DataSources;
 use data::chart::kline::indicators::manifest;
 use data::config::theme::default_theme;
+use data::config::trade_gate::TradeSession;
 use data::{layout::WindowSpec, sidebar};
+use exchange::account::{AccountError, ProxyState, check_proxy_snapshot};
 use exchange::adapter::UniqueStreams;
 use layout::{LayoutId, configuration};
 use modal::dashboard_modal;
@@ -90,6 +92,10 @@ struct Flowsurface {
     network_editor: NetworkEditor,
     exchange_accounts: modal::exchange_accounts::ExchangeAccounts,
     network_config: data::Network,
+    /// The saved state could not be read, so the proxy setting is unknown (see `SavedState`).
+    proxy_unreadable: bool,
+    /// Connection-test verdicts of this run, read by the send gate. Memory only.
+    trade_session: TradeSession,
     data_sources: Arc<DataSources>,
     audio_stream: AudioStream,
     volume_size_unit: exchange::SizeUnit,
@@ -173,13 +179,26 @@ enum Message {
 impl Flowsurface {
     /// The signed-request client, unless the proxy settings changed since it was built:
     /// it must not silently keep using (or bypassing) an outdated proxy.
-    fn signed_client_for_current_proxy(&self) -> Result<reqwest::Client, String> {
-        if self.network_config.proxy != self.data_sources.signed_proxy {
-            return Err(
-                "Proxy settings changed since startup; restart Flowsurface before testing accounts"
-                    .to_string(),
-            );
+    /// The proxy setting as it is now. `Broken` when it could not be read at startup.
+    fn current_proxy_state(&self) -> ProxyState {
+        if self.proxy_unreadable {
+            ProxyState::Broken
+        } else {
+            ProxyState::from_config(self.network_config.proxy.as_ref())
         }
+    }
+
+    /// Whether the proxy snapshot of the signed client still matches the current setting.
+    /// Checked before every signed request (and, later, every private stream connect, which
+    /// must use this same snapshot).
+    fn proxy_snapshot_ok(&self) -> Result<(), AccountError> {
+        check_proxy_snapshot(&self.data_sources.signed_proxy, &self.current_proxy_state())
+    }
+
+    /// The signed-request client, unless the proxy settings changed since it was built:
+    /// it must not silently keep using (or bypassing) an outdated proxy.
+    fn signed_client_for_current_proxy(&self) -> Result<reqwest::Client, String> {
+        self.proxy_snapshot_ok().map_err(|e| e.to_string())?;
         self.data_sources.signed.clone()
     }
 
@@ -197,7 +216,10 @@ impl Flowsurface {
             window::open(config)
         };
 
-        let data_sources = Arc::new(DataSources::new(&saved_state.network));
+        let data_sources = Arc::new(DataSources::new(
+            &saved_state.network,
+            saved_state.proxy_unreadable,
+        ));
 
         let (sidebar, launch_sidebar) = screen::sidebar::Sidebar::new(
             &saved_state.sidebar,
@@ -223,6 +245,8 @@ impl Flowsurface {
             theme: ThemeState::new(saved_state.theme),
             notifications: Notifications::new(),
             network_config: saved_state.network.clone(),
+            proxy_unreadable: saved_state.proxy_unreadable,
+            trade_session: TradeSession::default(),
             network_editor: NetworkEditor::new(&saved_state.network, None),
             exchange_accounts: modal::exchange_accounts::ExchangeAccounts::new(
                 &saved_state.exchange_accounts,
@@ -743,6 +767,9 @@ impl Flowsurface {
                             data::config::auth::delete_proxy_auth(old_proxy);
                         }
                         self.network_config.proxy = proxy.clone();
+                        // An explicit choice settles the unknown proxy for the next start; this
+                        // session stays `Broken` (`proxy_unreadable`) until it is restarted.
+                        self.network_config.proxy_unknown = false;
 
                         let main_window = self.main_window.id;
                         let dashboard = self.active_dashboard_mut();
@@ -805,7 +832,20 @@ impl Flowsurface {
                     Some(modal::exchange_accounts::Action::Exit) => {
                         self.sidebar.set_menu(Some(sidebar::Menu::Settings));
                     }
-                    Some(modal::exchange_accounts::Action::Persist) => {
+                    Some(modal::exchange_accounts::Action::Tested(meta, report)) => {
+                        // The gate reads this session, never the modal's row status.
+                        match report {
+                            Some(report) => self.trade_session.record(&meta, &report),
+                            None => self.trade_session.invalidate(meta.id),
+                        }
+                    }
+                    Some(
+                        modal::exchange_accounts::Action::Persist
+                        | modal::exchange_accounts::Action::Removed(_),
+                    ) => {
+                        if let Some(modal::exchange_accounts::Action::Removed(id)) = &action {
+                            self.trade_session.invalidate(*id);
+                        }
                         let main_window = self.main_window.id;
                         let dashboard = self.active_dashboard_mut();
 

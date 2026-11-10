@@ -6,6 +6,7 @@ use exchange::{TickerInfo, Trade, UnixMs};
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch};
 use arrow_ipc::reader::StreamReader;
 
+use exchange::account::{AccountError, ProxyState};
 use exchange::adapter::{AdapterHandles, Venue};
 use exchange::proxy::Proxy;
 
@@ -17,13 +18,14 @@ pub struct DataSources {
     /// Client for signed (credential-bearing) exchange requests, or why it is unavailable.
     pub signed: Result<reqwest::Client, String>,
     /// Proxy the `signed` client was built with, to detect later changes.
-    pub signed_proxy: Option<Proxy>,
+    /// `Broken` when the user's proxy setting could not be read.
+    pub signed_proxy: ProxyState,
 }
 
 impl DataSources {
     /// Build HTTP clients, spawn exchange adapter handles, and optionally
     /// create a market-data server client from the persisted configuration.
-    pub fn new(network: &data::Network) -> Self {
+    pub fn new(network: &data::Network, proxy_unreadable: bool) -> Self {
         let proxy = network.proxy.as_ref();
 
         let exchange_http = http_client("exchange", proxy, |builder| builder);
@@ -40,7 +42,14 @@ impl DataSources {
                 .redirect(reqwest::redirect::Policy::none())
         });
 
-        let signed = signed_client(proxy);
+        let (signed, signed_proxy) = if proxy_unreadable {
+            (
+                Err(AccountError::ProxyBroken.to_string()),
+                ProxyState::Broken,
+            )
+        } else {
+            (signed_client(proxy), ProxyState::from_config(proxy))
+        };
         let server = ServerClient::from_mode(&server_http, network);
         let exchange = AdapterHandles::spawn_venues(&exchange_http, Venue::ALL, proxy);
 
@@ -49,7 +58,7 @@ impl DataSources {
             server,
             catalog_http,
             signed,
-            signed_proxy: network.proxy.clone(),
+            signed_proxy,
         }
     }
 }

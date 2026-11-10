@@ -7,6 +7,7 @@ pub mod sidebar;
 pub mod state;
 pub mod theme;
 pub mod timezone;
+pub mod trade_gate;
 
 pub const MIN_SCALE: f32 = 0.8;
 pub const MAX_SCALE: f32 = 1.5;

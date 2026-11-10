@@ -5,7 +5,7 @@
 //! per account (service `flowsurface.exchange`, account `<venue>:<uuid>`) holding a JSON
 //! payload, so deleting an account is a single atomic `delete_credential`.
 
-use exchange::account::{AccountEnv, AccountVenue, ApiCredentials, PositionMode};
+use exchange::account::{AccountEnv, AccountProduct, AccountVenue, ApiCredentials, PositionMode};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -15,7 +15,7 @@ use zeroize::{Zeroize, Zeroizing};
 const KEYCHAIN_SERVICE: &str = "flowsurface.exchange";
 const PAYLOAD_VERSION: u8 = 1;
 
-/// Non-secret account settings. Venue and environment are fixed after creation.
+/// Non-secret account settings. Venue, environment and product are fixed after creation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AccountMeta {
@@ -23,6 +23,9 @@ pub struct AccountMeta {
     pub alias: String,
     pub venue: AccountVenue,
     pub env: AccountEnv,
+    /// Binance product (spot or USDⓈ-M). Missing in accounts saved before M5, which only
+    /// supported futures, so the default is USDⓈ-M. OKX ignores it and keeps the default.
+    pub product: AccountProduct,
     /// Position mode the user expects the exchange account to be in.
     pub position_mode: PositionMode,
 }
@@ -32,6 +35,7 @@ impl AccountMeta {
         alias: String,
         venue: AccountVenue,
         env: AccountEnv,
+        product: AccountProduct,
         position_mode: PositionMode,
     ) -> Self {
         Self {
@@ -39,7 +43,22 @@ impl AccountMeta {
             alias,
             venue,
             env,
+            // One OKX key serves every product, so only Binance accounts carry one.
+            product: if venue == AccountVenue::Binance {
+                product
+            } else {
+                AccountProduct::default()
+            },
             position_mode,
+        }
+    }
+
+    /// The (venue, env, product) triple that decides which hosts the key may reach.
+    pub fn identity(&self) -> StoredIdentity {
+        StoredIdentity {
+            venue: self.venue,
+            env: self.env,
+            product: self.product,
         }
     }
 
@@ -66,6 +85,14 @@ impl ExchangeAccounts {
     }
 }
 
+/// What the Keychain item says the key belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredIdentity {
+    pub venue: AccountVenue,
+    pub env: AccountEnv,
+    pub product: AccountProduct,
+}
+
 // ── Keychain store ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +101,7 @@ pub enum StoreError {
     NoEntry,
     /// The Keychain item is not in the expected format.
     InvalidFormat,
-    /// The Keychain item's venue or environment differs from the account's.
+    /// The Keychain item's venue, environment or product differs from the account's.
     Mismatch,
     /// Keychain access failed (locked, denied, unavailable...). Display text only.
     Keychain(String),
@@ -107,6 +134,9 @@ struct Payload {
     v: u8,
     venue: AccountVenue,
     env: AccountEnv,
+    /// Missing in M4 items, which were futures-only.
+    #[serde(default)]
+    product: AccountProduct,
     key: String,
     secret: String,
     #[serde(default)]
@@ -126,6 +156,7 @@ fn encode(meta: &AccountMeta, creds: &ApiCredentials) -> Result<Zeroizing<String
         v: PAYLOAD_VERSION,
         venue: meta.venue,
         env: meta.env,
+        product: meta.product,
         key: creds.key().expose_secret().to_string(),
         secret: creds.secret().expose_secret().to_string(),
         passphrase: creds.passphrase().map(|p| p.expose_secret().to_string()),
@@ -136,18 +167,33 @@ fn encode(meta: &AccountMeta, creds: &ApiCredentials) -> Result<Zeroizing<String
 }
 
 fn decode(meta: &AccountMeta, raw: &str) -> Result<ApiCredentials, StoreError> {
+    decode_with_identity(meta, raw).map(|(creds, _)| creds)
+}
+
+fn decode_with_identity(
+    meta: &AccountMeta,
+    raw: &str,
+) -> Result<(ApiCredentials, StoredIdentity), StoreError> {
     // The serde error text can quote parts of the input, so it is dropped.
     let mut payload: Payload = serde_json::from_str(raw).map_err(|_| StoreError::InvalidFormat)?;
     if payload.v != PAYLOAD_VERSION {
         return Err(StoreError::InvalidFormat);
     }
-    if payload.venue != meta.venue || payload.env != meta.env {
+    let stored = StoredIdentity {
+        venue: payload.venue,
+        env: payload.env,
+        product: payload.product,
+    };
+    if stored != meta.identity() {
         return Err(StoreError::Mismatch);
     }
-    Ok(ApiCredentials::new(
-        std::mem::take(&mut payload.key),
-        std::mem::take(&mut payload.secret),
-        payload.passphrase.take(),
+    Ok((
+        ApiCredentials::new(
+            std::mem::take(&mut payload.key),
+            std::mem::take(&mut payload.secret),
+            payload.passphrase.take(),
+        ),
+        stored,
     ))
 }
 
@@ -193,6 +239,15 @@ pub fn load_credentials(meta: &AccountMeta) -> Result<ApiCredentials, StoreError
     decode(meta, &raw)
 }
 
+/// [`load_credentials`] plus what the Keychain item says it belongs to, for the send gate:
+/// it compares that against the saved account on every order.
+pub fn load_credentials_with_identity(
+    meta: &AccountMeta,
+) -> Result<(ApiCredentials, StoredIdentity), StoreError> {
+    let raw = read_raw(&entry(meta)?)?;
+    decode_with_identity(meta, &raw)
+}
+
 /// A missing item counts as deleted; any other error is returned.
 pub fn delete_credentials(meta: &AccountMeta) -> Result<(), StoreError> {
     match entry(meta)?.delete_credential() {
@@ -210,7 +265,13 @@ mod tests {
     const FAKE_PASS: &str = "fake-pass-CCCC3333";
 
     fn meta(venue: AccountVenue, env: AccountEnv) -> AccountMeta {
-        AccountMeta::new("main".into(), venue, env, PositionMode::Hedge)
+        AccountMeta::new(
+            "main".into(),
+            venue,
+            env,
+            AccountProduct::UsdM,
+            PositionMode::Hedge,
+        )
     }
 
     fn creds() -> ApiCredentials {
@@ -312,6 +373,67 @@ mod tests {
         }
         .sanitized();
         assert_eq!(all.accounts, vec![a, b]);
+    }
+
+    #[test]
+    fn m4_account_without_product_loads_as_usdm() {
+        let m: AccountMeta = serde_json::from_str(
+            r#"{"id":"6f1c2c8e-1b9a-4a5e-9d57-0f3b2f6a1c11","alias":"old","venue":"Binance","env":"Testnet","position_mode":"Hedge"}"#,
+        )
+        .unwrap();
+        assert_eq!(m.product, AccountProduct::UsdM);
+        assert_eq!(m.env, AccountEnv::Testnet);
+    }
+
+    #[test]
+    fn m4_keychain_item_without_product_is_a_usdm_item() {
+        let m = meta(AccountVenue::Binance, AccountEnv::Testnet);
+        let old = format!(
+            r#"{{"v":1,"venue":"Binance","env":"Testnet","key":"{FAKE_KEY}","secret":"{FAKE_SECRET}"}}"#
+        );
+        let (creds, id) = decode_with_identity(&m, &old).unwrap();
+        assert_eq!(id.product, AccountProduct::UsdM);
+        assert_eq!(creds.key().expose_secret(), FAKE_KEY);
+        // An account that now says Spot must not accept that old (futures) item.
+        let spot = AccountMeta {
+            product: AccountProduct::Spot,
+            ..m
+        };
+        assert_eq!(decode(&spot, &old).unwrap_err(), StoreError::Mismatch);
+    }
+
+    #[test]
+    fn keychain_product_must_match_the_saved_product() {
+        let spot = AccountMeta::new(
+            "s".into(),
+            AccountVenue::Binance,
+            AccountEnv::Testnet,
+            AccountProduct::Spot,
+            PositionMode::OneWay,
+        );
+        let raw = encode(&spot, &creds()).unwrap();
+        assert_eq!(
+            decode_with_identity(&spot, &raw).unwrap().1.product,
+            AccountProduct::Spot
+        );
+        // The saved state was edited to say USDⓈ-M: the item is refused.
+        let edited = AccountMeta {
+            product: AccountProduct::UsdM,
+            ..spot
+        };
+        assert_eq!(decode(&edited, &raw).unwrap_err(), StoreError::Mismatch);
+    }
+
+    #[test]
+    fn okx_accounts_ignore_the_product() {
+        let m = AccountMeta::new(
+            "o".into(),
+            AccountVenue::Okx,
+            AccountEnv::Live,
+            AccountProduct::Spot,
+            PositionMode::OneWay,
+        );
+        assert_eq!(m.product, AccountProduct::UsdM);
     }
 
     #[test]
