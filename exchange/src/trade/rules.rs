@@ -186,6 +186,25 @@ impl SymbolRules {
     }
 }
 
+/// Rules of one symbol that were fresh when the handle was made, with the time they expire.
+/// Build requests from [`FreshRules::rules`]; [`super::gate::OrderIntent`] refuses a request
+/// whose handle has expired by the time it is approved.
+#[derive(Debug, Clone, Copy)]
+pub struct FreshRules<'a> {
+    rules: &'a SymbolRules,
+    valid_until_ms: i64,
+}
+
+impl<'a> FreshRules<'a> {
+    pub fn rules(&self) -> &'a SymbolRules {
+        self.rules
+    }
+
+    pub fn valid_until_ms(&self) -> i64 {
+        self.valid_until_ms
+    }
+}
+
 /// All tradable symbols of one product, with the time the rules were fetched.
 #[derive(Debug, Clone)]
 pub struct RulesTable {
@@ -221,6 +240,23 @@ impl RulesTable {
         }
     }
 
+    /// Look a symbol up and prove the table is fresh. The handle carries the time after
+    /// which the rules are stale again; the send path accepts nothing else (F4, N1).
+    pub(crate) fn fresh_lookup(
+        &self,
+        raw: &str,
+        now_ms: i64,
+        max_age_ms: i64,
+    ) -> Result<FreshRules<'_>, TradeError> {
+        // Whatever the caller asks for, the rules never live longer than the shared limit.
+        let max_age_ms = max_age_ms.min(super::client::MAX_RULES_AGE_MS);
+        self.check_fresh(now_ms, max_age_ms)?;
+        Ok(FreshRules {
+            rules: self.lookup(raw)?,
+            valid_until_ms: self.fetched_at_ms.saturating_add(max_age_ms),
+        })
+    }
+
     /// The only way to get a [`ValidSymbol`] (condition 44).
     pub fn validate(&self, raw: &str) -> Result<ValidSymbol, TradeError> {
         Ok(self.lookup(raw)?.symbol.clone())
@@ -232,7 +268,7 @@ impl RulesTable {
     }
 
     /// Parse a Binance `exchangeInfo` response (spot or USDⓈ-M).
-    pub fn from_binance_exchange_info(
+    pub(crate) fn from_binance_exchange_info(
         product: TradeProduct,
         info: &Value,
         fetched_at_ms: i64,
@@ -270,7 +306,7 @@ impl RulesTable {
     }
 
     /// Parse an OKX `public/instruments` response (SPOT or SWAP).
-    pub fn from_okx_instruments(
+    pub(crate) fn from_okx_instruments(
         product: TradeProduct,
         resp: &Value,
         fetched_at_ms: i64,
@@ -322,6 +358,14 @@ fn dec_opt(v: &Value) -> Result<Option<Decimal>, TradeError> {
     match v {
         Value::Null => Ok(None),
         other => dec(other).map(Some),
+    }
+}
+
+/// Like [`dec_opt`], and an empty string is also "no value" (OKX instruments).
+fn dec_opt_blank(v: &Value) -> Result<Option<Decimal>, TradeError> {
+    match v.as_str() {
+        Some("") => Ok(None),
+        _ => dec_opt(v),
     }
 }
 
@@ -441,8 +485,10 @@ fn parse_okx_instrument(
     let step_sz = step(&item["lotSz"])?;
     let min = dec(&item["minSz"])?;
     // A missing limit field means no limit; a malformed one makes the symbol unusable.
-    let max_lmt = dec_opt(&item["maxLmtSz"])?;
-    let max_mkt = dec_opt(&item["maxMktSz"])?;
+    // OKX's own instruments example returns `""` for a field that has no value: that is a
+    // missing limit (N1), not a malformed one.
+    let max_lmt = dec_opt_blank(&item["maxLmtSz"])?;
+    let max_mkt = dec_opt_blank(&item["maxMktSz"])?;
     let okx = if product == TradeProduct::OkxSwap {
         let ct_type = match item["ctType"].as_str() {
             Some("linear") => OkxContractType::Linear,
@@ -762,7 +808,6 @@ mod tests {
             json!({"maxMktSz": "abc"}),
             json!({"maxLmtSz": "1e5"}),
             json!({"maxMktSz": 1000}),
-            json!({"maxLmtSz": ""}),
         ] {
             let t = okx_spot_with(bad);
             assert!(t.lookup("AAA-USDT").is_err());
@@ -861,6 +906,41 @@ mod tests {
         assert_eq!(
             r.round_trigger_price(&d("1.0000000015")).unwrap(),
             d("1.000000002")
+        );
+    }
+
+    #[test]
+    fn okx_blank_max_sizes_are_missing_limits() {
+        // The official example of `public/instruments` has "" for maxLmtSz and maxMktSz.
+        let resp = json!({"code": "0", "data": [
+            {"instType": "SPOT", "instId": "BTC-USDT", "ctVal": "", "ctType": "",
+             "lotSz": "0.00000001", "minSz": "0.00001", "maxLmtSz": "", "maxMktSz": "",
+             "tickSz": "0.1", "state": "live"}
+        ]});
+        let t = RulesTable::from_okx_instruments(TradeProduct::OkxSpot, &resp, 1_000).unwrap();
+        let r = t.lookup("BTC-USDT").unwrap();
+        assert_eq!(r.lot.max, None);
+        assert!(r.market_lot.is_none_or(|m| m.max.is_none()));
+    }
+
+    #[test]
+    fn fresh_lookup_only_hands_out_rules_inside_the_window() {
+        let t = spot();
+        // fetched at 1000, valid for 1000 ms
+        let fresh = t.fresh_lookup("BTCUSDT", 1_500, 1_000).unwrap();
+        assert_eq!(fresh.valid_until_ms(), 2_000);
+        assert!(t.fresh_lookup("BTCUSDT", 2_500, 1_000).is_err());
+    }
+
+    #[test]
+    fn fresh_lookup_cannot_stretch_the_rules_age_limit() {
+        use super::super::client::MAX_RULES_AGE_MS;
+        let t = spot();
+        let fresh = t.fresh_lookup("BTCUSDT", 1_500, i64::MAX).unwrap();
+        assert_eq!(fresh.valid_until_ms(), 1_000 + MAX_RULES_AGE_MS);
+        assert!(
+            t.fresh_lookup("BTCUSDT", 1_000 + MAX_RULES_AGE_MS + 1, i64::MAX)
+                .is_err()
         );
     }
 }

@@ -10,7 +10,10 @@
 //! session starts untested.
 
 use super::exchange_accounts::{AccountMeta, StoreError, StoredIdentity};
-use exchange::account::{AccountEnv, AccountVenue, CheckReport, PositionMode, Verdict, is_usable};
+use exchange::account::{
+    AccountEnv, AccountKey, AccountVenue, CheckReport, PositionMode, Verdict, is_usable,
+};
+use exchange::trade::{GateClass, GateRequest, SendGate};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -150,6 +153,55 @@ pub fn can_send(
         risk,
         order,
     )
+}
+
+/// The F2 gate as seen by `exchange::trade::TradeClient::submit`: one account's session,
+/// Keychain, proxy, stream and risk state, checked by [`can_send`]. Build one per order, after
+/// re-reading the Keychain item. The Live switch stays [`LIVE_SENDING_ENABLED`].
+///
+/// This is the only implementation of `SendGate` the app may use. The exchange crate cannot
+/// stop another implementation from approving everything, so review must keep it that way.
+pub struct SessionGate<'a> {
+    pub session: Option<&'a SessionEntry>,
+    pub keychain: &'a Result<StoredIdentity, StoreError>,
+    pub saved: &'a AccountMeta,
+    pub proxy_ok: bool,
+    pub stream: StreamState,
+    pub risk: RiskState,
+}
+
+impl SendGate for SessionGate<'_> {
+    type Refusal = GateRejection;
+
+    fn check(&self, request: GateRequest) -> Result<(), GateRejection> {
+        // The client is bound to one account; an order for another one is not this gate's.
+        if request.account != AccountKey::from_bytes(*self.saved.id.as_bytes()) {
+            return Err(GateRejection::IdentityMismatch);
+        }
+        // The request says which venue, environment and product the client will really sign
+        // for. It must be the saved account's: a Testnet verdict never lets a Live client send
+        // (B2), and the Live switch below is judged on this environment.
+        if (request.venue, request.env, request.product)
+            != (self.saved.venue, self.saved.env, self.saved.product)
+        {
+            return Err(GateRejection::IdentityMismatch);
+        }
+        can_send(
+            self.session,
+            self.keychain,
+            self.saved,
+            self.proxy_ok,
+            self.stream,
+            self.risk,
+            OrderRequest {
+                kind: match request.class {
+                    GateClass::Entry => OrderKind::Entry,
+                    GateClass::Reduce => OrderKind::Reduce,
+                },
+                contract: request.contract,
+            },
+        )
+    }
 }
 
 /// [`can_send`] with the Live switch as a parameter, so the full rule table stays tested
@@ -557,5 +609,101 @@ mod tests {
             s.record(&m, &report(Verdict::Usable, Some(true), Some(mode)));
             assert_eq!(ask(&s, true), Ok(()));
         }
+    }
+
+    #[test]
+    fn session_gate_follows_can_send_and_keeps_live_closed() {
+        let live = meta(
+            AccountVenue::Binance,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+        );
+        let entry = good(&live);
+        let kc = Ok(live.identity());
+        let gate = SessionGate {
+            session: Some(&entry),
+            keychain: &kc,
+            saved: &live,
+            proxy_ok: true,
+            stream: StreamState::Connected,
+            risk: RiskState::Clear,
+        };
+        let req = GateRequest {
+            account: AccountKey::from_bytes(*live.id.as_bytes()),
+            venue: live.venue,
+            env: live.env,
+            product: live.product,
+            class: GateClass::Entry,
+            contract: true,
+        };
+        assert_eq!(
+            gate.check(req),
+            Err(GateRejection::LiveTradingNotYetEnabled)
+        );
+        assert_eq!(
+            gate.check(GateRequest {
+                class: GateClass::Reduce,
+                ..req
+            }),
+            Err(GateRejection::LiveTradingNotYetEnabled)
+        );
+        // another account's order is refused before anything else
+        let other = GateRequest {
+            account: AccountKey::from_bytes([9; 16]),
+            ..req
+        };
+        assert_eq!(gate.check(other), Err(GateRejection::IdentityMismatch));
+        // testnet passes the same checks
+        let test = meta(
+            AccountVenue::Binance,
+            AccountEnv::Testnet,
+            AccountProduct::UsdM,
+        );
+        let entry = good(&test);
+        let kc = Ok(test.identity());
+        let gate = SessionGate {
+            session: Some(&entry),
+            keychain: &kc,
+            saved: &test,
+            proxy_ok: true,
+            stream: StreamState::Connected,
+            risk: RiskState::Clear,
+        };
+        let req = GateRequest {
+            account: AccountKey::from_bytes(*test.id.as_bytes()),
+            env: test.env,
+            ..req
+        };
+        assert_eq!(gate.check(req), Ok(()));
+        // The Testnet verdict cannot be used for a request that will be signed for Live, or
+        // for another venue or product (B2).
+        for wrong in [
+            GateRequest {
+                env: AccountEnv::Live,
+                ..req
+            },
+            GateRequest {
+                venue: AccountVenue::Okx,
+                ..req
+            },
+            GateRequest {
+                product: AccountProduct::Spot,
+                ..req
+            },
+        ] {
+            assert_eq!(gate.check(wrong), Err(GateRejection::IdentityMismatch));
+        }
+        let locked = SessionGate {
+            risk: RiskState::Locked,
+            ..gate
+        };
+        assert_eq!(locked.check(req), Err(GateRejection::RiskLocked));
+        assert_eq!(
+            locked.check(GateRequest {
+                class: GateClass::Reduce,
+                ..req
+            }),
+            Ok(())
+        );
     }
 }

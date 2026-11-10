@@ -155,7 +155,7 @@ fn binance_spot_every_type_has_place_cancel_and_query() {
             client_id: &cid,
         };
         assert_eq!(
-            bs::new_protective_order(r, &p).unwrap().path(),
+            bs::build_protective_order(r, &p).unwrap().path(),
             "/api/v3/order"
         );
     }
@@ -184,7 +184,7 @@ fn binance_spot_every_type_has_place_cancel_and_query() {
         exits,
         list_id: &list,
     };
-    assert_eq!(bs::new_oco(&oco).unwrap().path(), "/api/v3/orderList/oco");
+    assert_eq!(bs::build_oco(&oco).unwrap().path(), "/api/v3/orderList/oco");
     let otoco = bs::SpotOtoco {
         rules: r,
         qty: d("0.1"),
@@ -195,7 +195,7 @@ fn binance_spot_every_type_has_place_cancel_and_query() {
         entry_id: &entry,
     };
     assert_eq!(
-        bs::new_otoco(&otoco).unwrap().path(),
+        bs::build_otoco(&otoco).unwrap().path(),
         "/api/v3/orderList/otoco"
     );
     assert_eq!(

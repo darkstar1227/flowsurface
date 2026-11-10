@@ -4,12 +4,13 @@ pub mod depth;
 mod error;
 pub mod rate_limit;
 mod serde_util;
-pub mod signing;
+pub(crate) mod signing;
 pub mod trade;
 pub mod unit;
 
 pub use adapter::{Event, proxy};
 use adapter::{Exchange, MarketKind};
+pub use signing::SigningError;
 
 use unit::price::de_price_from_number;
 use unit::price::{Price, PriceStep};

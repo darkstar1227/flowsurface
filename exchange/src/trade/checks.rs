@@ -72,13 +72,14 @@ pub(crate) fn check_order(
     qty: &Decimal,
     price: Option<&Decimal>,
     market: bool,
-) -> Result<(), TradeError> {
+) -> Result<Option<Decimal>, TradeError> {
     check_qty(rules, qty, market)?;
     if rules.notional.is_some() {
         let price = price.ok_or(TradeError::MissingReferencePrice)?;
         check_notional(rules, qty, price, market)?;
     }
-    Ok(())
+    // The order value, for the single-order cap; `None` when no price is known.
+    price.map(|p| notional(rules, qty, p)).transpose()
 }
 
 /// `|price - reference| / reference > threshold_bps / 10000`, in exact arithmetic.

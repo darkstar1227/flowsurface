@@ -131,6 +131,17 @@ impl fmt::Display for PositionMode {
     }
 }
 
+/// Opaque account identity for per-account rate accounting. The caller derives it from its own
+/// account id; this crate never interprets the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AccountKey([u8; 16]);
+
+impl AccountKey {
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+}
+
 /// API key, secret and (OKX only) passphrase. Debug output is masked.
 pub struct ApiCredentials {
     key: SecretString,
@@ -233,7 +244,7 @@ fn hmac_sha256(secret: &str, message: &str) -> hmac::Tag {
 }
 
 /// Binance: hex(HMAC-SHA256(secret, query)).
-pub fn binance_sign(secret: &str, query: &str) -> String {
+pub(crate) fn binance_sign(secret: &str, query: &str) -> String {
     let tag = hmac_sha256(secret, query);
     let mut out = String::with_capacity(64);
     for b in tag.as_ref() {
@@ -244,7 +255,7 @@ pub fn binance_sign(secret: &str, query: &str) -> String {
 
 /// OKX: base64(HMAC-SHA256(secret, timestamp + method + requestPath + body)).
 /// `request_path` includes the query string.
-pub fn okx_sign(
+pub(crate) fn okx_sign(
     secret: &str,
     timestamp: &str,
     method: &str,
@@ -255,18 +266,18 @@ pub fn okx_sign(
     BASE64.encode(hmac_sha256(secret, &prehash).as_ref())
 }
 
-fn okx_timestamp(now: chrono::DateTime<chrono::Utc>) -> String {
+pub(crate) fn okx_timestamp(now: chrono::DateTime<chrono::Utc>) -> String {
     now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
-fn sensitive(value: &str) -> Result<HeaderValue, AccountError> {
+pub(crate) fn sensitive(value: &str) -> Result<HeaderValue, AccountError> {
     let mut v = HeaderValue::from_str(value).map_err(|_| AccountError::InvalidCredentials)?;
     v.set_sensitive(true);
     Ok(v)
 }
 
 /// OKX request headers. `x-simulated-trading: 1` is sent for testnet (demo) and never for live.
-fn okx_headers(
+pub(crate) fn okx_headers(
     env: AccountEnv,
     key: &str,
     sign: &str,
@@ -480,8 +491,11 @@ impl AccountError {
                 }
             }
             // A 4xx without an exchange `code` may come from a proxy or CDN (408, an HTML error
-            // page), so it proves nothing. Only 403 (Binance WAF block, not verified against
-            // the docs) counts as a refusal; every other status is inconclusive.
+            // page), so it proves nothing. Only 403 counts as a refusal: the spot REST docs
+            // say 403 is returned when a WAF rule was violated (a rate-limit violation or a
+            // security block), i.e. the gateway refused the request itself. The docs copy has
+            // no USDⓈ-M page, so the same meaning for futures is not verified; every other
+            // status is inconclusive.
             AccountError::Http(403) => Delivery::Rejected,
             AccountError::Http(_)
             | AccountError::Timeout
@@ -624,7 +638,8 @@ impl ResponseMeta {
 /// credential headers are never forwarded to another host.
 ///
 /// `body` is sent exactly as given: the caller signs the same string it passes here.
-pub async fn send(
+#[cfg(test)]
+pub(crate) async fn send(
     client: &reqwest::Client,
     method: reqwest::Method,
     url: reqwest::Url,
@@ -708,7 +723,7 @@ pub(crate) async fn send_with_meta(
 /// [`send`] behind the local rate limiter: nothing goes out when the budget (or the Binance
 /// IP-ban pause) says no, and the response's weight, order counts, 429 and 418 are fed back.
 /// Never retries.
-pub async fn send_limited(
+pub(crate) async fn send_limited(
     client: &reqwest::Client,
     key: &LimitKey,
     priority: Priority,
@@ -717,19 +732,36 @@ pub async fn send_limited(
     headers: HeaderMap,
     body: Option<String>,
 ) -> Result<Value, AccountError> {
-    rate_limit::acquire(key, priority, Instant::now())
-        .map_err(|_| AccountError::LocalRateLimited)?;
+    send_limited_meta(client, key, priority, method, url, headers, body)
+        .await
+        .0
+}
+
+/// [`send_limited`] plus the HTTP status (for the `Unknown` outcome's display).
+pub(crate) async fn send_limited_meta(
+    client: &reqwest::Client,
+    key: &LimitKey,
+    priority: Priority,
+    method: reqwest::Method,
+    url: reqwest::Url,
+    headers: HeaderMap,
+    body: Option<String>,
+) -> (Result<Value, AccountError>, Option<u16>) {
+    if rate_limit::acquire(key, priority, Instant::now()).is_err() {
+        return (Err(AccountError::LocalRateLimited), None);
+    }
     let (result, meta) = send_with_meta(client, method, url, headers, body).await;
+    let status = meta.as_ref().map(|m| m.status);
     if let Some(meta) = meta {
         rate_limit::record(key, &meta, Instant::now());
     }
-    result
+    (result, status)
 }
 
 // ── Binance ─────────────────────────────────────────────────────────────
 
 /// `(host for time + /sapi, host for the product's signed calls, time path)`.
-fn binance_hosts(
+pub(crate) fn binance_hosts(
     env: AccountEnv,
     product: AccountProduct,
 ) -> (&'static str, &'static str, &'static str) {
@@ -840,10 +872,7 @@ async fn binance_signed_get(
     headers.insert("X-MBX-APIKEY", sensitive(creds.key().expose_secret())?);
     send_limited(
         client,
-        &LimitKey::Binance {
-            host: host.to_string(),
-            weight,
-        },
+        &LimitKey::binance(host, weight),
         Priority::Query,
         reqwest::Method::GET,
         url,
@@ -864,10 +893,7 @@ async fn binance_clock_offset(
         return 0;
     };
     let local = chrono::Utc::now().timestamp_millis();
-    let key = LimitKey::Binance {
-        host: host.to_string(),
-        weight: 1,
-    };
+    let key = LimitKey::binance(host, 1);
     match send_limited(
         client,
         &key,
