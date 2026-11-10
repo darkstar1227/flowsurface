@@ -1,0 +1,34 @@
+//@version=5
+indicator("Smoothed Bands", overlay = true)
+
+maType = input.string("EMA", "MA type", options = ["SMA", "EMA", "RMA"])
+length = input.int(20, "Length", minval = 1)
+mult = input.float(2.0, "Multiplier", minval = 0.1, step = 0.1)
+
+average(src, len) =>
+    switch maType
+        "SMA" => ta.sma(src, len)
+        "EMA" => ta.ema(src, len)
+        "RMA" => ta.rma(src, len)
+        => na
+
+bandWidth(src, len, k = 2.0) =>
+    basis = ta.sma(src, len)
+    dev = k * ta.stdev(src, len)
+    [basis, dev]
+
+channel(len) =>
+    ta.highest(len) - ta.lowest(len)
+
+mid = average(close, length)
+[basis, dev] = bandWidth(close, length, mult)
+width = channel(length)
+atr = ta.atr(14)
+upper = mid + dev
+lower = mid - dev
+squeeze = width < atr * 3
+
+plot(mid, "Mid", color = color.blue)
+plot(upper, "Upper", color = color.new(color.green, 20))
+plot(lower, "Lower", color = color.new(color.red, 20))
+plot(squeeze ? mid : na, "Squeeze", color = color.orange, linewidth = 3, style = plot.style_linebr)

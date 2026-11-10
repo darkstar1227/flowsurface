@@ -1,0 +1,20 @@
+//@version=5
+indicator(title = "RSI + MACD", shorttitle = "RM", precision = 2)
+
+rsiLen = input.int(14, "RSI length", minval = 2)
+obLevel = input.float(70, "Overbought", step = 0.5)
+osLevel = input.float(30, "Oversold", step = 0.5)
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+rsi = ta.rsi(close, rsiLen)
+
+h1 = hline(obLevel, "Upper", color = color.red, linestyle = hline.style_dashed)
+h2 = hline(osLevel, "Lower", color = color.green)
+hline(50, "Middle", color = #787B86)
+fill(h1, h2, color = color.new(color.purple, 90), title = "Band")
+
+p1 = plot(rsi, "RSI", color = #7E57C2, linewidth = 2)
+p2 = plot(ta.sma(rsi, 5), "RSI MA", color = color.orange)
+fill(p1, p2, color = color.new(color.blue, 80))
+plot(macdLine, "MACD", color = color.blue)
+plot(signalLine, "Signal", color = color.orange)
+plot(histLine, "Histogram", color = histLine >= 0 ? color.teal : color.maroon, style = plot.style_columns)
