@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-static INSTALLED_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+static CATALOG_PATHS: OnceLock<IndicatorCatalogPaths> = OnceLock::new();
 
 /// Filesystem sources used to build the process-wide indicator catalog.
 ///
@@ -35,14 +35,29 @@ fn default_installed_directory() -> PathBuf {
         .unwrap_or_else(|| data_path(Some("indicators")))
 }
 
-fn installed_directory() -> Result<PathBuf, String> {
-    INSTALLED_DIRECTORY
+pub(super) fn installed_directory() -> Result<PathBuf, String> {
+    CATALOG_PATHS
         .get()
-        .cloned()
+        .map(|paths| paths.installed_directory.clone())
         .ok_or_else(|| "Indicator catalog is not initialized".to_owned())
 }
 
-fn installed_sources(directory: &Path) -> Result<Vec<language::LoadedIndicatorSource>, String> {
+/// Rebuild the catalog from the paths used at startup and install it in place of the current one.
+/// Charts keep their existing indicator runtimes until they are rebuilt.
+pub fn reload_indicator_catalog() -> Result<(), String> {
+    let paths = CATALOG_PATHS
+        .get()
+        .ok_or_else(|| "Indicator catalog is not initialized".to_owned())?;
+    let sources = load_catalog_sources(paths)?;
+    let catalog =
+        super::registry::build_catalog(sources.bundled, sources.installed, sources.diagnostics);
+    super::registry::replace_catalog(catalog).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(super) fn installed_sources(
+    directory: &Path,
+) -> Result<Vec<language::LoadedIndicatorSource>, String> {
     let (files, _) = language::indicator_files_in_directory(directory)?;
     Ok(language::load_from_files_report(&files, language::PackageOrigin::Installed).loaded_sources)
 }
@@ -147,7 +162,7 @@ pub fn initialize_indicator_catalog() -> Result<(), String> {
 pub fn initialize_indicator_catalog_with_paths(
     paths: &IndicatorCatalogPaths,
 ) -> Result<(), String> {
-    let _ = INSTALLED_DIRECTORY.set(paths.installed_directory.clone());
+    let _ = CATALOG_PATHS.set(paths.clone());
     let sources = load_catalog_sources(paths)?;
     let bundled_ids = sources
         .bundled

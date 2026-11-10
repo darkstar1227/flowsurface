@@ -200,9 +200,24 @@ impl Sidebar {
             )
         };
 
+        let indicator_editor_button = {
+            let is_active = self.is_menu_active(sidebar::Menu::IndicatorEditor);
+
+            button_with_tooltip(
+                icon_text(Icon::Edit, 14)
+                    .width(24)
+                    .align_x(Alignment::Center),
+                Message::ToggleSidebarMenu(Some(sidebar::Menu::IndicatorEditor)),
+                Some("Indicator editor"),
+                tooltip_position,
+                move |theme, status| crate::style::button::transparent(theme, status, is_active),
+            )
+        };
+
         column![
             ticker_search_button,
             layout_modal_button,
+            indicator_editor_button,
             audio_btn,
             space::vertical(),
             settings_modal_button,

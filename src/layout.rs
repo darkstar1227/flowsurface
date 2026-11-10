@@ -117,7 +117,16 @@ impl SharedChartResources {
             }
             CatalogMessage::SourceChanged { id, change, result } => {
                 match result {
-                    Ok(()) => self.indicator_catalog.operation_succeeded(id, change),
+                    Ok(()) => {
+                        // Load the change now; when the reload fails the catalog state keeps
+                        // showing that a restart is required.
+                        if let Err(error) =
+                            data::chart::kline::indicators::reload_indicator_catalog()
+                        {
+                            log::warn!("Could not reload indicators: {error}");
+                        }
+                        self.indicator_catalog.operation_succeeded(id, change);
+                    }
                     Err(error) => self.indicator_catalog.operation_failed(id, error),
                 }
                 Task::none()

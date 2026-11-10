@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod indicator_editor;
 pub mod layout_manager;
 pub mod network_editor;
 pub mod pane;

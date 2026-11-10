@@ -12,13 +12,18 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::{PoisonError, RwLock};
 
-static CATALOG: OnceLock<IndicatorCatalog> = OnceLock::new();
+/// The installed catalog. Callers borrow definitions as `&'static`, so a reload leaks the new
+/// catalog and swaps the reference instead of freeing the old one; the old one stays valid for
+/// anything still holding a borrow. Reloads only happen when the user saves or installs a source.
+static CATALOG: RwLock<Option<&'static IndicatorCatalog>> = RwLock::new(None);
 static EMPTY_CATALOG: std::sync::LazyLock<IndicatorCatalog> =
     std::sync::LazyLock::new(|| IndicatorCatalog::from_registrations(Vec::new()));
 
 pub fn catalog() -> &'static IndicatorCatalog {
-    CATALOG.get().unwrap_or(&EMPTY_CATALOG)
+    let installed = *CATALOG.read().unwrap_or_else(PoisonError::into_inner);
+    installed.unwrap_or(&EMPTY_CATALOG)
 }
 
 /// Stable identity independent of how a source is distributed.
@@ -438,6 +443,7 @@ impl IndicatorRegistration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogInstallError {
     AlreadyInitialized,
+    NotInitialized,
     Diagnostics(Vec<String>),
 }
 
@@ -447,6 +453,7 @@ impl Display for CatalogInstallError {
             Self::AlreadyInitialized => {
                 formatter.write_str("indicator catalog is already initialized")
             }
+            Self::NotInitialized => formatter.write_str("indicator catalog is not initialized"),
             Self::Diagnostics(diagnostics) => write!(formatter, "{}", diagnostics.join("\n")),
         }
     }
@@ -462,6 +469,26 @@ pub(crate) fn install_catalog_with_bundled_diagnostics(
     installed_registrations: Vec<IndicatorRegistration>,
     loader_diagnostics: Vec<String>,
 ) -> Result<&'static IndicatorCatalog, CatalogInstallError> {
+    let mut installed = CATALOG.write().unwrap_or_else(PoisonError::into_inner);
+    if installed.is_some() {
+        return Err(CatalogInstallError::AlreadyInitialized);
+    }
+    let catalog = build_catalog(
+        bundled_registrations,
+        installed_registrations,
+        loader_diagnostics,
+    );
+    let catalog: &'static IndicatorCatalog = Box::leak(Box::new(catalog));
+    *installed = Some(catalog);
+    Ok(catalog)
+}
+
+/// Build a catalog the same way installation does, without installing it.
+pub(crate) fn build_catalog(
+    bundled_registrations: Vec<IndicatorRegistration>,
+    installed_registrations: Vec<IndicatorRegistration>,
+    loader_diagnostics: Vec<String>,
+) -> IndicatorCatalog {
     let (registrations, loader_diagnostics) = merge_bundled_and_installed(
         bundled_registrations,
         installed_registrations,
@@ -472,11 +499,21 @@ pub(crate) fn install_catalog_with_bundled_diagnostics(
     for diagnostic in &catalog.diagnostics {
         log::warn!("indicator catalog: quarantined source: {diagnostic}");
     }
+    catalog
+}
 
-    CATALOG
-        .set(catalog)
-        .map_err(|_| CatalogInstallError::AlreadyInitialized)?;
-    Ok(CATALOG.get().expect("catalog was installed"))
+/// Replace an installed catalog. Fails when the catalog was never initialized, so a reload
+/// cannot stand in for startup initialization.
+pub(crate) fn replace_catalog(
+    catalog: IndicatorCatalog,
+) -> Result<&'static IndicatorCatalog, CatalogInstallError> {
+    let mut installed = CATALOG.write().unwrap_or_else(PoisonError::into_inner);
+    if installed.is_none() {
+        return Err(CatalogInstallError::NotInitialized);
+    }
+    let catalog: &'static IndicatorCatalog = Box::leak(Box::new(catalog));
+    *installed = Some(catalog);
+    Ok(catalog)
 }
 
 fn merge_bundled_and_installed(

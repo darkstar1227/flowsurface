@@ -154,6 +154,34 @@ impl State {
         }
     }
 
+    /// Rebuild a kline chart that uses `indicator` so it picks up the reloaded catalog entry.
+    /// Returns the fetch the rebuilt chart needs, if any.
+    pub fn reload_indicator(
+        &mut self,
+        indicator: &data::chart::kline::IndicatorId,
+        data_sources: &DataSources,
+        now: Instant,
+    ) -> Option<iced::Task<fetcher::FetchUpdate>> {
+        let uses = matches!(
+            &self.content,
+            Content::Kline { chart: Some(chart), .. } if chart.uses_indicator(indicator)
+        );
+        if !uses {
+            return None;
+        }
+        let tickers = match self.stream_pair_kind()? {
+            StreamPairKind::MultiSource(tickers) => tickers,
+            StreamPairKind::SingleSource(ticker) => vec![ticker],
+        };
+        self.set_content_and_streams(tickers, self.content.kind());
+        match self.invalidate(now) {
+            Some(Action::Chart(super::ChartAction::RequestFetch(requests))) => {
+                Some(self.request_fetch(data_sources, requests))
+            }
+            _ => None,
+        }
+    }
+
     pub fn stream_pair(&self) -> Option<TickerInfo> {
         self.streams.find_ready_map(|stream| match stream {
             StreamKind::Kline { ticker_info, .. } => Some(*ticker_info),
