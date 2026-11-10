@@ -466,6 +466,9 @@ impl Flowsurface {
                 self.ui_scale_factor = value;
             }
             Message::Layouts(message) => {
+                // `SelectActive` switches the active layout before `load_layout` runs, so
+                // publish the outgoing layout's drawing edits first.
+                self.layout_manager.sync_drawings(self.main_window.id);
                 let action = self.layout_manager.update(message);
 
                 match action {
