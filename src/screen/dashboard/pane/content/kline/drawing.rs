@@ -697,13 +697,8 @@ impl DrawingTools {
             || self.sidebar_page == SidebarPage::ObjectList
     }
 
-    pub fn from_parts(active_tool: DrawingTool, mut drawings: Vec<DrawingEntity>) -> Self {
-        drawings.retain(|drawing| drawing.object.coordinates_match(DrawingX::default()));
-        for drawing in &mut drawings {
-            if matches!(&drawing.object, DrawingObject::Box { .. }) {
-                ensure_box_fill_color(&mut drawing.style);
-            }
-        }
+    pub fn from_parts(active_tool: DrawingTool, drawings: Vec<DrawingEntity>) -> Self {
+        let drawings = normalize_loaded(drawings);
         let next_drawing_id = drawings
             .iter()
             .map(|drawing| drawing.id.0)
@@ -737,14 +732,41 @@ impl DrawingTools {
         self.active_tool.supports_magnet() && (self.magnet_enabled || self.magnet_modifier_active)
     }
 
-    /// Replaces the time-anchored drawings, e.g. with edits made in another chart.
-    pub(super) fn replace_time_drawings(&mut self, drawings: Vec<DrawingEntity>) {
+    /// Time-anchored drawings shared with other charts of the same ticker.
+    pub(super) fn shared_drawings(&self) -> Vec<DrawingEntity> {
+        self.time_drawings()
+            .iter()
+            .filter(|drawing| is_shared(drawing))
+            .cloned()
+            .collect()
+    }
+
+    /// Time-anchored drawings on indicator panels, which stay with this chart.
+    pub(super) fn panel_drawings(&self) -> Vec<DrawingEntity> {
+        self.time_drawings()
+            .iter()
+            .filter(|drawing| !is_shared(drawing))
+            .cloned()
+            .collect()
+    }
+
+    /// Replaces the shared drawings, e.g. with edits made in another chart, keeping
+    /// this chart's indicator-panel drawings renumbered past the shared IDs.
+    pub(super) fn replace_shared_drawings(&mut self, shared: Vec<DrawingEntity>) {
         let mut state = self.edit_state();
-        if self.tick_mode {
-            state.inactive_drawings = drawings;
+        let target = if self.tick_mode {
+            &mut state.inactive_drawings
         } else {
-            state.drawings = drawings;
-        }
+            &mut state.drawings
+        };
+        let mut drawings = normalize_loaded(shared);
+        let first_id = drawings.iter().map(|d| d.id.0).max().unwrap_or(0) + 1;
+        let panel = target.drain(..).filter(|drawing| !is_shared(drawing));
+        drawings.extend((first_id..).zip(panel).map(|(id, drawing)| DrawingEntity {
+            id: DrawingId(id),
+            ..drawing
+        }));
+        *target = drawings;
         self.restore_edit_state(state);
     }
 
@@ -2215,4 +2237,20 @@ impl DrawingTools {
             SidebarPage::ObjectList => OBJECT_LIST_SIDEBAR_WIDTH,
         }
     }
+}
+
+/// Main-panel drawings, and drawings spanning every panel, are shared by ticker.
+/// Indicator panels differ between charts, so drawings on them stay with their chart.
+fn is_shared(drawing: &DrawingEntity) -> bool {
+    drawing.object.panel_id().is_none_or(PanelId::is_main)
+}
+
+fn normalize_loaded(mut drawings: Vec<DrawingEntity>) -> Vec<DrawingEntity> {
+    drawings.retain(|drawing| drawing.object.coordinates_match(DrawingX::default()));
+    for drawing in &mut drawings {
+        if matches!(&drawing.object, DrawingObject::Box { .. }) {
+            ensure_box_fill_color(&mut drawing.style);
+        }
+    }
+    drawings
 }

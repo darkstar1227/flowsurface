@@ -61,7 +61,7 @@ impl Content {
         tickers: &[TickerInfo],
         settings: &Settings,
     ) -> Self {
-        let Some(_base_ticker) = tickers.first().copied() else {
+        let Some(base_ticker) = tickers.first().copied() else {
             return Content::Kline {
                 chart: None,
                 layout: None,
@@ -72,13 +72,25 @@ impl Content {
             .selected_basis
             .unwrap_or(Basis::Time(Timeframe::M5));
 
-        let saved_layout = match current_content {
+        let mut saved_layout = match current_content {
             Content::Kline { chart, layout, .. } => chart
                 .as_ref()
                 .map(|chart| chart.serializable_config())
                 .or_else(|| layout.clone().map(|layout| *layout)),
             _ => None,
         };
+        // Indicator-panel drawings belong to the previous ticker; main-panel drawings
+        // come from the shared library for the new one.
+        if let (
+            Content::Kline {
+                chart: Some(chart), ..
+            },
+            Some(layout),
+        ) = (current_content, saved_layout.as_mut())
+            && chart.base_ticker_info().ticker != base_ticker.ticker
+        {
+            layout.drawings.clear();
+        }
 
         let mut chart = saved_layout.as_ref().map_or_else(
             || KlineChart::new(basis, tickers),

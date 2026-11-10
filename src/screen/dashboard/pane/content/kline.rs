@@ -1984,11 +1984,11 @@ impl KlineChart {
             return;
         }
         let ticker = self.data.base_ticker().ticker;
-        let local = self.drawings.tools.time_drawings();
-        if let Some(drawings) = library.sync(ticker, local, &mut self.drawing_sync)
-            && drawings.as_slice() != self.drawings.tools.time_drawings()
+        let local = self.drawings.tools.shared_drawings();
+        if let Some(drawings) = library.sync(ticker, &local, &mut self.drawing_sync)
+            && drawings != local
         {
-            self.drawings.tools.replace_time_drawings(drawings);
+            self.drawings.tools.replace_shared_drawings(drawings);
             self.drawings.clear_history();
             self.render_invalidation.invalidate();
         }
@@ -1998,8 +1998,8 @@ impl KlineChart {
         persisted::Config {
             selected_preset: self.selected_preset,
             settings: self.settings_snapshot(),
-            // Drawings live in the shared library, keyed by ticker.
-            drawings: Vec::new(),
+            // Main-panel drawings live in the shared library, keyed by ticker.
+            drawings: self.drawings.tools.panel_drawings(),
             active_drawing_tool: self.drawings.tools.active_tool(),
             floating_toolbar_position: self.drawings.floating_toolbar.position,
             drawing_sidebar_visible: self.drawing_sidebar_visible,
