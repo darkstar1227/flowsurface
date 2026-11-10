@@ -74,7 +74,7 @@
 ### 3.4 其他交易需求
 
 - 簽名下單、撤單、查持倉與餘額、私有 WebSocket（訂單、成交、持倉、algo 單更新）。
-- DOM 點價下單；圖表上可拖曳止損、止盈線，拖曳等於撤掉舊單再下新單（Binance 條件單不可修改）。
+- DOM 點價下單；圖表上可拖曳止損、止盈線（Binance 條件單不可修改）。拖曳改保護單：交易所允許兩張並存時先下新單、確認成立後再撤舊單；不允許時先撤後下，並顯示裸倉警示（見 docs/trading-security.md 條件 80 與使用者決定 9）。
 - 委託、algo 單、持倉列表，標示各持倉目前掛著哪些保護單。
 - 止損＋止盈若是兩張獨立單（Binance 合約），其中一張成交時，app 收到 user data stream 通知後撤掉另一張；app 未執行時則依賴 `reduceOnly` 防止反向開倉。
 - 睡眠喚醒後私有 WebSocket 自動重連，並以 REST 重新同步委託與持倉。
@@ -132,6 +132,16 @@
   - OKX 只支援 Global（`www.okx.com`／`openapi.okx.com`），UI 註明不支援 US／EEA 帳戶。
   - Binance 現貨納入 M5。
   - LIVE 帳戶一開始就能送單，每次送出前顯示 LIVE 警示並要求二次確認。
+  - 以下 1–9 項的完整說明與條件對照見 docs/trading-security.md「M5 使用者決定」：
+    1. Binance 帳戶加「產品」欄位（現貨／USDⓈ-M），測試網兩個產品各建一個帳戶。
+    2. 三條自動路徑（風控自動平倉、成交後自動附掛保護單、一張成交後撤另一張）採預先授權：確認一次即涵蓋列出的自動行為；風控自動平倉預設關閉，LIVE 需明確開啟；自動路徑只能減倉、平倉、撤單。這是「交易只做手動下單」的唯一例外。
+    3. Binance 現貨私有流在測試網實測 HMAC 可用前，現貨交易停用（fail closed）。
+    4. OKX 追蹤止損在撤單端點核對並實測前不開放。
+    5. hedge 帳戶的保護單只提供全平型（`closePosition`／`closeFraction`）。
+    6. 防手誤門檻預設偏離 5%；limiter 每桶保留 20% 給撤單、平倉、保護單。
+    7. Testnet 帳戶走同一確認流程，但沒有延遲與紅色 LIVE 標記。
+    8. 開發順序：本機風控（M5 段 e）合併前，main 上不開放 LIVE 送單。這是開發限制，不改變上面「LIVE 一開始就能送單」的產品決定。
+    9. 拖曳改保護單：交易所允許時先下新、再撤舊；不允許時先撤後下，並顯示裸倉警示。取代 3.4 的「撤舊單再下新單」順序。
 - **官方文件核對後的差異（M5 設計依據）：**
   - 雙向持倉下 Binance 與 OKX 都不能送 `reduceOnly`，保護單改靠 `positionSide`／`posSide` 與 `closePosition`／`closeFraction`。
   - OKX 單張 `conditional` 同時帶 TP 與 SL 只會執行 SL，兩者並存必須用 `oco` 或 `attachAlgoOrds`。

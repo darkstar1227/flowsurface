@@ -101,6 +101,305 @@
 - `exchange/src/adapter/proxy.rs` 的 `apply_proxy_strict`：簽名用 client 的 proxy fail closed。
 - `src/connector/client.rs` 的 `signed_client`：簽名用 client（`redirect(none)`、`https_only(true)`、嚴格 proxy）。
 
+## M5 交易
+
+M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
+
+- **R1（高）**：`send_get` 在 2xx 但無法解析、超過 1 MiB、或中途斷線時回 `BadResponse`／`Network`。對下單來說結果是**未知**，不是失敗；若沿用兩態，使用者重按就會重複下單（條件 39、60）。
+- **R2（中）**：`connect_ws` 接受 `ws://`，且沒有 host 白名單；私有流組錯 URL 時，OKX login frame（含 apiKey、passphrase、sign）會明文送出（條件 40、46）。
+- **R3（中）**：`allowed_hosts` 只依 (venue, env) 區分，無法表達 Binance 現貨測試網與合約測試網的差異（條件 40、41）。
+- **R4（中）**：F10 只檢查簽名 REST；私有 WS 的 proxy 在 `DataSources::new` 時固定。另外，proxy 載入失敗時 `network.proxy` 是否變成 `None`（直連）**未核對**（條件 42）。
+- **R5（中）**：`exchange_error` 只看頂層 `code`。OKX 下單回 HTTP 200、`code="0"`，但 `data[].sCode` 可能不為 0（條件 77）。
+- **R6（低）**：`binance_clock_offset` 失敗時回 0；下單只會得到 `-1021`，但不得自動重試（條件 76）。
+- **R7（低到中）**：`exchange/src/error.rs` 的 `String::truncate(177)` 遇多位元組字元會 panic，私有 WS 的 adapter task 因此中斷（條件 52、77）。
+- **R8（資訊）**：`adapter/http.rs:94` 限流時會 `log::warn!` 完整 URL；簽名請求不得走這條路徑（條件 19）。
+- **摘要第 8 點（中）**：`data` 依賴 `exchange`，crate 邊界不足以隔離指標與交易（條件 75）。
+
+既有且已確認安全、可沿用：簽名 client 不跟隨 redirect、強制 `https_only`、proxy fail closed（`src/connector/client.rs`）；WS 的 TLS 只信任 webpki roots，沒有 `danger_`；`Proxy` 的 Display 會遮罩帳號密碼；`send_get` 只記 `GET host path` 且回應上限 1 MiB。
+
+段的代號：**a** = trade-core、**b** = trade-stream、**c** = trade-ui、**d** = trade-defaults、**e** = trade-risk、**f** = trade-chart。
+
+### 條件 38–81
+
+以下保留每條的要求與驗證方式，措辭已精簡。「未核對」的標註保留，實作前要先核對。
+
+**G. 簽名下單的傳輸（POST／DELETE）**
+
+- **38（a）**：把 `send_get` 泛化為 `send(method, url, headers, body)`，保留既有安全屬性：log 與錯誤只帶 `METHOD host path`；body 與 query 一律不寫入 log，也不放進錯誤字串；回應 1 MiB 上限；不跟隨 redirect；`https_only`；`reqwest::Error` 只取分類。下單成功時也不記錄回應內容（含 orderId、數量、價格）。
+  - 驗證：單元測試裝上測試 logger，用假 secret、假 key 走成功、4xx、5xx、逾時四條路徑，斷言 log 與 `Display` 都不含 `signature=`、`OK-ACCESS-SIGN`、假 key、假 secret，也不含 body 字串。
+- **39（a）**：下單、撤單、algo 單的結果分三態：`Accepted{ids}`、`Rejected{code,msg}`、`Unknown{client_id}`。
+  - `Unknown` 包括：送出後逾時或連線中斷、HTTP 5xx、2xx 但 body 無法解析、超過上限或缺 id、OKX `code="0"` 但 `data` 為空。
+  - 依錯誤碼判為 `Unknown`（即使 HTTP 4xx 或帶 `code`）：Binance `-1006`（UNEXPECTED_RESP）、`-1007`（TIMEOUT）（`BS/errors.md:35-41`、`BS/rest-api.md:115-120`；合約是否同碼**未核對**）；OKX `50004`（`OKX:63891`）、`51149`（`OKX:64762`）。
+  - 交易所明確拒絕（Binance 4xx 帶 `code`、OKX `sCode≠0`）才是 `Rejected`。`Unknown` 不得在 UI 顯示為「失敗」。
+  - 依據：R1；Binance 5XX 的執行狀態是 UNKNOWN（`BS/rest-api.md:141-142`）。
+  - 驗證：表格式單元測試，(status, body, 傳輸錯誤) → 三態，每列一個 case；`-1006`、`-1007`、`50004`、`51149` 都對應到 `Unknown`。
+- **40（a）**：白名單依 **(venue, env, product, scheme)** 寫死，分 `https_endpoint` 與 `wss_endpoint` 兩個函式。`wss_endpoint` 只接受 `wss`、443 埠，拒絕 `ws://` 與 8443。env 取自 Keychain 項目（沿用條件 30）。
+  - Binance Live：REST `api.binance.com`（現貨、`/sapi`）、`fapi.binance.com`；WS `fstream.binance.com`（合約私有流路徑 `private/stream` 依 SDK 推得，**部分核對**）、`ws-api.binance.com`（`BS/web-socket-api.md:105`）。
+  - Binance Testnet 合約：REST `testnet.binancefuture.com`；WS `fstream.binancefuture.com`（私有流路徑**未核對**，(b) 開工前用測試網確認）。
+  - Binance Testnet 現貨：REST `testnet.binance.vision`；WS `ws-api.testnet.binance.vision`。
+  - OKX Live：REST `www.okx.com`、`openapi.okx.com`；WS `ws.okx.com`。
+  - OKX Testnet：REST `www.okx.com`、`openapi.okx.com`（加 `x-simulated-trading: 1`）；WS `wspap.okx.com`。
+  - 不收：`us.okx.com`、`eea.okx.com`、`demo-*`、`stream.binance.com`（現貨舊 listenKey）。
+  - 依據：R2、R3。Live 金鑰連上 `wspap.okx.com`、或 Testnet 金鑰連上 `ws.okx.com`，環境就混用了；`ws://` 會讓 OKX passphrase 明文傳送。
+  - 驗證：表格式測試，列舉 (venue, env, product, scheme, host, port) 所有組合，只有上表通過；特別包含 Live 不能連 `wspap.okx.com`、Testnet 不能連 `ws.okx.com`／`fstream.binance.com`、`ws://` 與 8443 被拒。
+- **41（a）**：Binance Testnet 帳戶必須綁定產品（現貨或 USDⓈ-M）。產品寫進 Keychain 項目並與存檔比對（比照條件 4、30）；合約測試網金鑰絕不送往 `testnet.binance.vision`，反之亦然。Live 金鑰兩個產品共用。
+  - 驗證：Testnet 合約帳戶對現貨 host 呼叫 `https_endpoint` 會被拒；Keychain 與存檔的產品不一致時拒絕載入。
+- **42（a、b）**：F10 延伸。每次簽名請求、每次私有 WS 連線與重連之前，都比對目前的 `network_config.proxy` 與建立連線時的 proxy 快照，不一致就拒絕並提示重啟。私有 WS 的 proxy 與簽名 client 取自同一份快照，不得沿用 `spawn_venues` 的 proxy。proxy 設了但無法載入時，要用明確狀態（例如 `ProxyState::Broken`），不得變成 `None`（直連）。實作前先核對 R4 的載入路徑。
+  - 驗證：proxy 快照比較函式與 Broken 拒絕連線的單元測試。手動（F9 一併驗）：設定無效 proxy 後下單與開私有流，都應被拒，並用 `lsof -i` 或防火牆紀錄確認沒有直連交易所。
+- **43（a、b）**：不新增任何 `danger_`、自訂 root CA、憑證 pinning 例外；私有 WS 沿用 `TLS_CONNECTOR`（webpki roots）。簽名 REST 只用 `signed_client`，不得用 `exchange_http`、`server_http`、`HttpHub`。
+  - 驗證：`git diff main -- . | grep -n 'danger_'` 結果必須為空；code review 確認呼叫點。
+- **44（a）**：送出的位元組必須等於被簽名的字串。Binance 以固定順序做 form-urlencode，簽名後原樣送出；OKX body 先用 serde 序列化成字串，簽這個字串，再送出同一字串。symbol／instId 必須存在於交易規則清單，字元限制為 `[A-Z0-9-]`，不得直接放入使用者自由輸入的文字。
+  - 依據：不一致會造成 `-1022`；也可能被參數注入（例如 symbol 中塞 `&quantity=`）。
+  - 驗證：golden 測試，builder 輸出的簽名字串等於送出的 body 或 query；含 `&`、`=` 的 symbol 被拒絕。
+
+**H. 私有 WebSocket**
+
+- **45（b）**：listenKey 視為機密：以 newtype 包裝，手寫 Debug 輸出 `***`，不實作 Display、Serialize；不得出現在 log、錯誤字串、`Message`，也不得放進 iced subscription identity 的 Hash／Debug。私有 WS 的 log **只記 host**，不記 path 與 query（Binance 合約的 listenKey 在 URL 裡）。subscription identity 使用 (account uuid, venue, env, product, generation)。
+  - 依據：listenKey 外洩後，有效期內任何人都能訂閱該帳戶的訂單與持倉；`debug` feature 會把 `Message` 前 49 字元送到 comet（條件 11）。
+  - 驗證：對 listenKey 型別、私有事件型別、`Message::AccountWsEvent`、subscription identity 做 `format!("{:?}")`，斷言不含測試 listenKey。code review：私有 WS 模組的 `log::` 不得帶 url 或 path 變數。
+- **46（b）**：送出的認證 frame（OKX `login` 的 apiKey、passphrase、sign；Binance WS API 的 apiKey、signature）一律不寫入 log。收到的 frame 解析失敗時，只記事件型別與長度，不記原文；登入失敗只記 code。`WsTransport::write_frame` 與讀取路徑是否記錄 frame 內容**未核對**，(b) 開工時先確認。
+  - 驗證：用測試 logger 走一次假 login 失敗路徑，斷言 log 不含假 key、passphrase、sign。code review：`ws.rs` 內所有 `log::` 呼叫。
+- **47（b）**：OKX WS login 用新的 `okx_ws_timestamp`（Unix 秒），prehash 為 `ts + "GET" + "/users/self/verify"`。每次連線與重連都重新呼叫 `load_credentials` 並重新簽名；frame 送出後立即釋放憑證，adapter 結構體不保存 secret 與 passphrase。登入被拒（認證類錯誤）時停止、標示「認證失敗」、**不自動重連**；只有網路錯誤才 backoff。
+  - 依據：`OKX:703,782-787`；同一連線 login／subscribe 合計 480 次／小時、單 IP 每秒 3 條連線。認證失敗若進入重連迴圈，會被交易所封鎖。
+  - 驗證：以官方範例的 timestamp 與 prehash 格式、假 secret 做簽名向量測試；狀態機測試：認證失敗 → `AuthFailed`，不排程重連。
+- **48（b）**：Binance 現貨私有流走 WS API `userDataStream.subscribe.signature`（HMAC，`recvWindow ≤ 5000`）。不用 `session.logon`（只支援 Ed25519），也不用已退場的舊 listenKey。文件總則寫明支援 HMAC（`BS/web-socket-api.md:114`），傾向可行，**但需測試網實測**。實測前與訂閱失敗時一律 fail closed：現貨私有流標為「不可用」，並依使用者決定 3 停用現貨交易。
+  - 依據：`BS/web-socket-api.md:8052-8070,8174-8205`；`BS/CHANGELOG.md:740-770`。
+  - 驗證：簽名參數依字母排序、簽名結果符合預期的單元測試。手動：在現貨測試網實際訂閱一次，記錄成功與否。
+- **49（b）**：Binance 合約 listenKey 生命週期：透過簽名 client 建立（經 limiter），每 ≤30 分鐘 `PUT` 延長。收到 `listenKeyExpired` 或 `PUT` 失敗時，重建 listenKey、重連，並以 REST 重新同步。帳戶刪除或停用時 `DELETE` 該 listenKey 並丟棄。listenKey 與 account uuid 綁定，不跨帳戶重用。
+  - 依據：listenKey 60 分鐘後失效；沒察覺的話，app 會以為沒有成交事件，「撤另一張」就不會執行。
+  - 驗證：狀態機單元測試，用假時鐘模擬到期事件與 PUT 失敗。手動：測試網上等待超過延長週期。
+- **50（b）**：重連沿用 `ReconnectBackoff`（500 ms 起、倍增、上限 30 秒、含抖動，`ws.rs:937-956`）。OKX 需要 `private` 與 `business` 兩條登入連線，各自 backoff；每條連線開始前先向 limiter 取得連線配額（每 IP 每秒 3 條）。
+  - 驗證：backoff 序列有上限且帶抖動；同時斷線時，連線請求速率不超過配額。
+- **51（b、c）**：每個帳戶的私有流狀態為 `Connected`／`Reconnecting`／`Resyncing`／`AuthFailed`／`Unavailable`，在 UI 明顯顯示。狀態不是「`Connected` 且已重新同步」時：委託與持倉列表標為「可能過期」；**禁止新進場單與拖曳改單**；撤單、平倉、撤全部、全平仍允許；「一張成交撤另一張」暫停，重連後先以 REST 同步再補做。重新同步的端點：Binance 合約 `positionRisk v3`、`openOrders`、`openAlgoOrders`；現貨 `openOrders`、`openOrderList`、`account`；OKX `positions`、`orders-pending`、`orders-algo-pending`（`orders-algo` 不推快照）。睡眠喚醒視同斷線。
+  - 依據：依過期資料下單或拖曳，會撤錯單，或在已平倉時又掛出新單。
+  - 驗證：狀態機測試，每個狀態下哪些動作允許、哪些拒絕。手動：測試網斷網 30 秒後恢復，確認重新同步完成前不能新進場。
+- **52（b）**：私有事件是不受信任的輸入：不得 `unwrap`、不得 panic；數值以十進位字串解析，不經過 f32；未知事件型別只記型別名稱並忽略；未知訂單狀態一律觸發重新同步，不猜測語意。單一 frame 大小上限沿用既有 WS 設定（是否有上限**未核對**）。
+  - 依據：R7。adapter task 崩潰會讓私有流中斷，而 UI 未必察覺。
+  - 驗證：解析器測試，以官方文件範例為固定檔，另加缺欄位、型別錯誤、超長字串、未知 `X` 狀態等變形輸入，斷言回傳錯誤、不 panic。
+
+**I. 共用限流（F1）**
+
+- **53（a）**：Binance IP weight：簽名與公開請求共用**同一個** limiter 實例（依 base host 區分，`api.binance.com` 與 `fapi.binance.com` 各一個）。實作可用 `Arc<Mutex<_>>` 或 limiter command channel；現況下實例被搬進 worker task，無法共用（依 explorer 報告 2.2）。追蹤下單計數：合約讀 `X-MBX-ORDER-COUNT-10S`／`-1M`；現貨依 `X-MBX-ORDER-COUNT-(intervalNum)(intervalLetter)` 樣式讀取（`BS/rest-api.md:233-237`；被拒的單不保證帶此標頭）。實際區間依 exchangeInfo 的 `rateLimits` 決定，不寫死。上限數值**未核對**。
+  - 依據：條件 34；同一 IP 的 418 封鎖會連行情一起中斷。
+  - 驗證：假回應標頭驅動 limiter，斷言公開與簽名請求消耗同一份額度；計數接近上限時拒絕新進場單。回歸：既有行情 fetch 行為不變。
+- **54（a）**：OKX 依端點建立限流桶：下單與撤單 60 次／2 秒（依 instId）；`order-algo` 與 `cancel-algos` 各 20 次／2 秒；`orders-algo-pending` 20 次／2 秒；`positions` 與 `balance` 各 10 次／2 秒。OKX 依 User ID 計算，不需與公開行情共用。
+  - 依據：現有 `FixedWindowRateLimiter` 是單一全域視窗（依 explorer 報告），查詢流量會擠掉撤單額度。
+  - 驗證：每個桶獨立計數，互不影響。
+- **55（a）**：優先級與保留額度：撤單、平倉、保護單 ＞ 查詢 ＞ 新進場。新進場單不得用掉每個桶最後 20%（暫定值）的額度；撤單與保護單可用到 100%。
+  - 驗證：額度用到 80% 後，新進場單被拒，撤單與保護單仍可送出。
+- **56（a）**：429 與 418：該桶依 `Retry-After` 暫停；**下單類請求不自動重試**。Binance 418（IP 被封）時暫停**所有** Binance 請求，包括公開行情 fetch，直到 `Retry-After` 結束，並在 UI 顯示。保護單遇 429 或 418，視同送出失敗，觸發條件 65 的裸倉警示。不得進入任何重試迴圈。
+  - 依據：條件 34；遇到 418 還繼續送，封鎖時間會延長。
+  - 驗證：429 → 該桶暫停、狀態為 `Rejected(RateLimited)`、沒有重送；418 → 全域暫停旗標生效，公開 fetch 也被擋。
+
+**J. 下單前判定（F2）**
+
+- **57（a、c）**：下單閘門是純函式：`can_send(session_verdict, keychain_meta, saved_meta, proxy_ok, stream_state, risk)`。
+  - `session_verdict` 存在 `Flowsurface` 層的記憶體 session，不是 modal 的 `Status`。
+  - 本 session 沒測過 → 拒絕；`Rejected` → 拒絕；Live 必須是 `Usable`；Testnet 可為 `Unverified`（`is_usable`，`account.rs:171-176`）。
+  - 每次送單都重新 `load_credentials`，比對 Keychain 與存檔的 venue、env、product，不一致就拒絕；簽名後立即釋放憑證。
+  - 帳戶被編輯或刪除、Keychain 載入失敗、私有流 `AuthFailed` 時，session verdict 立即作廢。
+  - Binance Live 現貨另要求 `enableSpotAndMarginTrading == true`（欄位已在官方 wallet SDK 的 `get_api_key_permission_response.py:68` 核對）；合約要求 `enableFutures == true`。缺少或為 false → 該產品不可下單。
+  - 驗證：涵蓋全部組合的表格式單元測試；手動改 `saved-state.json` 的 env 後，下單被拒。
+- **58（a）**：合約下單時，builder 依**交易所回報的實際持倉模式**（存在 session）決定 `positionSide`／`posSide` 與是否帶 `reduceOnly`；實際模式未知 → 拒絕送出合約單。條件 28 的「不一致只警告」仍適用於顯示，但 builder 只看實際值。
+  - 依據：依存檔值組參數，在 hedge 帳戶會送出 `reduceOnly` 或缺 `positionSide`，造成被拒或方向錯誤。
+  - 驗證：golden 測試，one-way、hedge、未知三種模式各一組。
+
+**K. 冪等**
+
+- **59（a）**：每張單（包括 algo、order list 各腿、`attachAlgoOrds`）都帶 app 產生的 client id：字元 `[A-Za-z0-9]`、長度 ≤32，同時滿足 Binance 36 字元、OKX 32 字元，以及 Binance 現貨 FIX 規則。格式為角色前綴（`e`／`s`／`t`／`r` 等）加至少 96 bit 隨機 base62；不含帳戶 id 或個人資訊；不用每次啟動會歸零的序號。送出前依各 venue 正規式驗證。涵蓋欄位：`newClientOrderId`、`clientAlgoId`、`listClientOrderId`、`above/belowClientOrderId`、`clOrdId`、`algoClOrdId`、`attachAlgoClOrdId`。
+  - 依據：沒有 client id，就無法在逾時後查詢這張單是否已成立。
+  - 驗證：性質測試，產生 10⁵ 個 id，全部符合三家正規式且不重複。
+- **60（a、c）**：`Unknown` 的處理：**絕不自動重送**。依 client id 查詢（Binance `GET /fapi/v1/order`、`GET /fapi/v1/algoOrder`、`GET /api/v3/order`、`GET /api/v3/orderList`；OKX `GET /trade/order`、`GET /trade/order-algo`），並在 backoff 下重試查詢，直到查到為止。超過時間窗（Binance 為 `timestamp + recvWindow` 加緩衝）仍查不到，UI 顯示「未成立（推定）」，由使用者**手動**重送，重送用新 client id 並重新確認。查詢期間，該 (帳戶, symbol) 的送單按鈕停用。OKX `expTime` 可縮短不確定時間窗（**未核對**）。
+  - 依據：盲目重送會重複開倉。
+  - 驗證：狀態機單元測試，模擬逾時 → 查到、逾時 → 查不到、查詢本身也逾時三種情境，斷言整個流程沒有任何送單呼叫。
+- **61（c、f）**：防重複按：確認權杖只能用一次，第二個 `Confirm` 視為 no-op；請求進行中與 `Unknown` 未解決時，該 (帳戶, symbol, 動作) 的按鈕停用。這兩者是**唯一**的防線，**不得依賴交易所以 client id 重複來擋**：Binance 與 OKX 的 client id 只在掛單中唯一，前一筆成交或進入終態後就能重用（explorer 報告 1.4、1.5、1.7），立即成交的市價單照樣會被重複送出。
+  - 驗證：在同一個 update 迴圈送入兩個 Confirm，只產生一個送單 Task。
+
+**L. 下單正確性**
+
+- **62（a）**：新增 `TradingRules`，由 exchangeInfo／instruments 的**原始字串**解析成十進位定點數（i128 與 scale，或經審查的 decimal crate；新依賴須符合條件 35）。欄位：tickSize、stepSize、minQty、maxQty、`MARKET_LOT_SIZE`、`MIN_NOTIONAL`／`NOTIONAL`、`PERCENT_PRICE`（**未核對**）、`TRAILING_DELTA`；OKX `tickSz`、`lotSz`、`minSz`、`ctVal`。不得使用 f32／f64、`MinTicksize`、`MinQtySize`。取整：數量一律向零取整；限價買單向下、賣單向上（避免越價成交）；觸發價取最近 tick。輸出不帶指數的十進位字串。規則缺少或過期 → 拒絕送出。標的精度超過內部表示能力 → 該標的不可交易。
+  - 依據：`unit.rs:43-53` 會把 tick 四捨五入成 10 的次方（例如 0.5 變成 1）。
+  - 驗證：golden 測試，tick 0.5、0.25、0.001、1e-9 與 step 0.001、1e-9 的取整結果；取整前後的往返檢查。
+- **63（a、c）**：上限檢查：小於 minNotional 或 minQty、大於 maxQty（市價單用 `MARKET_LOT_SIZE`）一律拒絕；本機單筆上限（PRD 3.3）。防手誤：限價偏離標記價或最新價超過門檻（預設 5%，可設定）時，確認視窗顯示紅色警示。OKX 合約 `sz` 的單位（張）與等值幣量、名目價值，要在表單與確認視窗同時顯示（以 `ctVal` 換算）。
+  - 依據：張數與幣量混淆，下單量可能放大 `1/ctVal` 倍。
+  - 驗證：每項檢查各一個邊界 case。手動：OKX 模擬盤下 1 張單，核對畫面上的名目價值。
+- **64（a）**：方向與模式一致，由純函式 builder 推導：hedge 模式**永遠不送 `reduceOnly`**；平多為 `SELL＋LONG`、平空為 `BUY＋SHORT`；保護單方向必須與持倉相反；`closePosition` 只能用於 `STOP_MARKET`／`TAKE_PROFIT_MARKET`，且不帶 `quantity`；OKX 同時帶 TP 與 SL 時，builder 只產生 `oco`，產生同時帶兩者的 `conditional` 時直接回錯；現貨保護賣單數量 ≤ 扣除手續費後的可用餘額。
+  - 依據：`BF-TRADE:1393-1396,1420`；OKX 的 conditional 同帶 TP 與 SL 時只會執行 SL。
+  - 驗證：golden 測試，one-way、hedge、OKX net、OKX long_short、現貨五種情境，每種含進場、止損、止盈、追蹤；反例：hedge 要求帶 `reduceOnly` 時回錯。
+- **79（a、d）**：現貨保護單使用 `orderList/oco`、`orderList/otoco`，不用已標示 Deprecated 的 `/api/v3/order/oco`。`trailingDelta` 必須落在 `TRAILING_DELTA` filter 範圍內。現貨沒有 `reduceOnly`：止損賣單會賣出帳戶中任何來源的該資產，UI 要提示。
+  - 依據：`BS/rest-api.md:3187,3303`。
+  - 驗證：OCO 與 OTOCO 參數的 golden 測試；`trailingDelta` 超出範圍時被拒。
+
+**M. LIVE 確認與一鍵操作**
+
+- **69（c、f）**：LIVE 二次確認視窗：
+  - 顯示 LIVE 標記、venue、env、帳戶別名、產品（現貨／USDⓈ-M／SWAP）、symbol、方向與 positionSide、類型、數量（兩種單位）、價格或觸發價、預估名目價值、reduceOnly 或 closePosition、將自動附掛的保護單。
+  - **顯示的是 builder 取整後實際送出的值**，不是表單輸入值。
+  - 確認按鈕沒有預設焦點；Enter、Space 與任何快捷鍵都不會觸發；視窗出現後 ≥ 700 ms 才啟用確認按鈕（防連點穿透）。
+  - 確認權杖綁定請求參數的雜湊，參數改變時權杖作廢。
+  - DOM 點價、拖曳改單（撤舊＋下新）、重試保護單同樣適用。
+  - popout 視窗中的操作，確認視窗出現在同一個視窗。
+  - 依據：使用者決定 7（Testnet 不需延遲與紅色標記）；避免第一下點擊後，第二下連點直接落在「確認」上。
+  - 驗證：權杖與參數雜湊不符時不送出；啟用延遲前送入 Confirm 無效；鍵盤事件不產生 Confirm。手動：測試網依序走 Enter、Space、連點三種操作，都不能繞過確認。
+- **70（c、e）**：一鍵撤全部、一鍵全平：確認視窗列出受影響的帳戶、訂單數、持倉數與總名目價值。全平時，one-way 用 `reduceOnly` 市價單；hedge 依 `positionSide` 分別平倉；OKX 用 `close-position` 或等效方式（端點**未核對**）。結果依條件 68 重新查詢後回報。
+  - 驗證：同條件 68；另手動走一次 hedge 帳戶全平。
+
+**N. 本機風控**
+
+- **71（d、e）**：非點擊的送單路徑**只允許**三條：(1) 風控自動撤單與平倉；(2) 成交後自動附掛保護單；(3) 一張成交後撤另一張。三者都只能減倉、平倉或撤單，**不得增加曝險**，並寫入本機日誌。builder 對這三條路徑強制套用 reduce／close 語意。三者與「每次 LIVE 送出都要確認」的關係見使用者決定 2。
+  - 依據：「只能手動下單」的界線要明確，否則日後新增的自動功能會繞過確認。
+  - 驗證：code review 列出所有呼叫送單函式的地方，只能是確認流程與這三條路徑。單元測試：這三條路徑產生進場（增倉）單時回錯。
+- **72（e、c、f）**：單一閘門：所有送單（面板、DOM、拖曳、自動附掛、重試）都經過 `submit(OrderIntent)`，依序執行 F2 閘門 → 風控 → 確認 → 送出。送單函式只接受 `ApprovedOrder`，它不實作 Clone，建構子為私有，只能由閘門產生。風控鎖定時，新進場被拒，減倉、平倉、撤單不受影響。
+  - 依據：避免 DOM 點價或拖曳繞過風控。
+  - 驗證：編譯層，`ApprovedOrder` 在閘門模組外無法建構（加 `compile_fail` doctest）；風控鎖定時各種 intent 的放行結果。
+  - 排程：建議提前併入 a3 一起合併（見切分與順序）。
+- **73（e）**：權益口徑在 UI 寫明：Binance 合約用 `totalMarginBalance`（錢包餘額加未實現損益），OKX 用 `totalEq`，現貨以標記價估值（實際欄位**未核對**，(e) 依測試網回應確認）。權益過期或未知（斷線、REST 失敗）時阻擋新進場，但**不觸發自動平倉**。誤觸發防護：連續 N 次觀測都超過門檻才觸發；轉入轉出（`ACCOUNT_UPDATE` 的 reason 欄）要校正高點；自動平倉預設關閉，LIVE 需每帳戶明確開啟。當日起點要指定時區。高點只存記憶體，重啟後重設，UI 要註明。
+  - 依據：錯誤或過期的權益，可能造成不該發生的全平。
+  - 驗證：純函式單元測試，涵蓋資料缺漏、轉帳、短暫跳動、跨日。
+- **74（e）**：風控日誌寫在資料目錄（`FLOWSURFACE_DATA_PATH` 下），檔案權限 0600，大小有上限並輪替。內容只含時間、帳戶別名與 uuid、venue、env、symbol、動作、原因、數值；不含 key、secret、passphrase、signature、listenKey、交易所 msg（沿用 F11）。路徑由程式組合，不使用外部字串作為檔名。
+  - 驗證：寫入含假 secret 的事件後讀回，斷言不含 secret；確認檔案權限。
+
+**O. 指標與交易隔離**
+
+- **75（a、c）**：(1) `indicator-engine` 不得依賴 `exchange`、`reqwest`、`tokio`、`hyper`；(2) 交易 API 放在 `exchange::trade`，送單函式要求條件 72 的 `ApprovedOrder`；`data/src/chart/kline/indicators/` 與 `indicator-engine/` 不得引用 `exchange::trade`；(3) `.ind` 語言不新增任何具副作用的 intrinsic（下單、警報、網路、檔案）；runtime 輸出只有繪圖與數值；(4) 下單表單不得自動帶入指標值（使用者手動點選採用不在此限）。
+  - 依據：`data` 依賴 `exchange`，crate 邊界本身不構成隔離（摘要第 8 點）。
+  - 驗證：`cargo tree -p flowsurface-indicator-engine -e normal | grep -E 'flowsurface-exchange|reqwest|tokio|hyper'` 必須沒有結果；`grep -rn 'exchange::trade\|ApprovedOrder' data/src/chart indicator-engine/src` 必須沒有結果。
+
+**P. 時間同步**
+
+- **76（a）**：下單請求 `recvWindow ≤ 5000`；時間差在啟動時、每 N 分鐘、睡眠喚醒後重新校正。`-1021`、OKX `50102`／`50112` 視為 `Rejected(ClockSkew)`（請求在處理前就被拒，不會成立），**不自動重送**，UI 提示校時；使用者手動重送時重新產生時間戳與簽名。OKX REST 用 ISO 毫秒時間戳，WS login 用秒。
+  - 依據：條件 33；`binance_clock_offset` 失敗時回 0（R6）。
+  - 驗證：`-1021` 對應到 `Rejected(ClockSkew)`，沒有任何重送呼叫。
+
+**Q. 錯誤訊息**
+
+- **77（a、c）**：交易所 `msg` 只顯示在 UI，依字元（`chars().take`）截斷，不寫入 log（沿用 F11）。`code` 限制為 `[-0-9A-Za-z]` 且 ≤16 字元（處理 F12）。OKX 同時檢查頂層 `code` 與每筆 `data[].sCode`，逐筆判定（R5）。未知錯誤碼一律視為 `Rejected`（前提是交易所明確拒絕）；結果不明的依條件 39 視為 `Unknown`。新程式碼不得使用 `String::truncate`（R7）。
+  - 依據：交易所的 msg 可能回顯 IP 或請求內容。
+  - 驗證：多位元組 msg 截斷不 panic；不合法的 `code` 被替換；OKX `code="0"` 而 `sCode="51008"` → `Rejected`。
+
+**R. 序列化與現貨**
+
+- **78（d、f）**：`AccountMeta` 新欄位全部加 `serde(default)`，不含機密。預設值：自動附掛關閉、自動平倉關閉；`reduceOnly` 只在 one-way 預設開啟，hedge 顯示「由 positionSide 控制」並停用。訂單、持倉、風控高點等執行期狀態，以及圖表上的訂單線，都不得寫入 `saved-state.json`，也不得放進 `layout::drawings::Library`。
+  - 依據：條件 36；檔案可能被人修改後讀回。
+  - 驗證：擴充條件 36 的測試，序列化整個 `State`，斷言不含假 secret、listenKey 或訂單 id；舊版存檔仍能載入。
+- **80（f）**：DOM 點價要用修飾鍵加點擊（不能單擊送單），保留既有的捲動重置行為（依 explorer 報告，`ladder.rs:242-244`）。由列座標反推價格後，取整到**交易所 tick**，不是顯示分組用的 `PriceStep`。
+  - 拖曳改單：放開後先確認原單仍為掛單中。保護單在**交易所允許時**採「先下新單、確認成立後再撤舊單」，避免中間出現無保護的空窗。交易所不允許兩張並存時，改用「先撤後下」，並在空窗期間顯示條件 65 的警示，新單失敗就是裸倉。不允許並存的情況：OKX 每個持倉只允許一張 `closeFraction` 全平 TPSL；現貨 OCO 會鎖住餘額，第二張會被拒；Binance `closePosition` 是否允許並存**未核對**。
+  - 進場限價單採「先撤、撤成功才下新」，撤單失敗（例如已成交）就中止。
+  - 與 PRD 3.4 原本的「撤舊單再下新單」不同，見使用者決定 9。
+  - 驗證：純函式測試，座標 → 價格 → 取整。狀態機測試：舊單已觸發時中止改單。手動：測試網拖曳止損線。
+- **81（b、d）**：進場單在 app 關閉或私有流斷線期間成交時：Binance 合約與現貨（非 OTOCO）的保護單由 app 在成交後送出，附掛意圖只存在記憶體（條件 78），app 不在線時保護單永遠不會送出。要求：
+  1. 啟動時與每次重新同步後，比對所有持倉與掛著的保護單。**沒有任何保護單的持倉**一律顯示條件 65 的紅色橫幅，並提供「掛上預設保護單」（LIVE 需確認）與「平倉」。
+  2. 進場確認視窗明示：「Binance 合約的自動附掛只在 app 執行中有效；若要離線也受保護，請改用 OKX `attachAlgoOrds` 或現貨 OTOCO，或進場後立即手動掛保護單」。
+  3. 掛著進場限價單時關閉 app，要跳出提醒。
+  - 依據：限價進場單常在 app 關閉後才成交，當下沒有任何東西會替它掛保護單。
+  - 驗證：純函式測試，給定持倉與掛單清單，找出無保護的持倉（hedge 兩邊分開計算）。手動：在測試網掛進場限價單、關閉 app、讓它成交後重開，確認橫幅出現。
+
+**保護單、撤單與冪等（65–68）**
+
+- **65（d）**：保護單失敗即裸倉。成交事件 → 送出保護單。保護單 `Rejected`、`Unknown` 未解決、或遇 429 時，顯示**常駐紅色橫幅**與系統通知，並提供「重試保護單」（手動、新 client id、LIVE 需確認）與「平倉」，直到持倉有保護或已平倉為止。不得只寫 log。OKX `attachAlgoOrds` 在部分成交期間沒有保護，UI 標示「部分成交，保護單尚未生效」。
+  - 依據：本專案最大的資金風險。
+  - 驗證：狀態機測試，成交 → 保護單失敗 → 橫幅出現 → 重試成功 → 橫幅消失。手動：測試網用不合法的觸發價，讓保護單被拒一次。
+- **66（d）**：Binance 合約兩張獨立保護單：收到其中一張的 `ALGO_UPDATE` 觸發或成交事件後，撤銷另一張（經 limiter 的優先級）。app 離線的風險要在 UI 與文件說明：one-way 用 `closePosition` 或 `reduceOnly`，不會反向開倉；hedge 下 `positionSide` 決定只能平哪一邊，不會反向開倉，但**殘留的那張可能作用在之後同方向的新持倉上**。啟動或重新同步時，偵測「沒有對應持倉的保護單」，並提示撤銷。`closePosition=true` 在沒有持倉時觸發的行為**未核對**。
+  - 驗證：狀態機測試，一張成交 → 撤另一張；離線後重新同步 → 偵測孤兒保護單。手動：測試網關閉 app，觸發止損後重開。
+- **67（a）**：不能下出撤不掉的單。每種支援的訂單類型，都必須同時具備已實作且測試過的「撤單」與「查單」路徑，才能開放下單。OKX `move_order_stop` 在核對並於模擬盤實測撤單端點前**不開放**。
+  - 依據：`cancel-algos` 不含追蹤止損（explorer 報告 1.5）。
+  - 驗證：合併前核對「類型 × {下單, 撤單, 查單}」矩陣全部打勾，且都有測試網紀錄。
+- **68（a、e）**：「撤全部」涵蓋所有類別：Binance 合約，每個有掛單的 symbol 都撤 `allOpenOrders` 與 `algoOpenOrders`；現貨撤 open orders 與 order list；OKX 撤一般單、`cancel-algos`（conditional、oco）與追蹤止損端點。完成後重新查詢，**掛單數為零才回報成功**；否則列出剩下哪些單。
+  - 依據：`allOpenOrders` 不含 algo 單；以為已全撤，其實止損單還在。
+  - 驗證：假查詢結果模擬部分殘留，斷言回報「部分失敗」並列出剩餘項目。手動：測試網掛齊各類單後撤全部。
+
+## M5 切分與順序
+
+- **a1（傳輸、白名單、limiter、F2 閘門）**：條件 38–44、53–58、57；不含任何下單端點。
+- **a2（TradingRules 與 builder）**：條件 59、62–64、79；只產生參數，不送出。
+- **a3（送出、撤單、查詢、冪等流程）**：條件 39、60、67、68、76、77；建議把條件 72 的 `ApprovedOrder` 閘門一起併入，讓 c 從第一天起就只能經過閘門送單。
+- 順序：a1 → a2 → a3 →（b 與 e 平行）→ c → d → f。
+- a1 拆分的理由：現行 (a) 會同時改動 limiter（影響行情）與 1034 行的 `account.rs`，審查不易。
+- **LIVE 送單路徑在 (e) 合併前不在 main 上開放**：例如 env 為 Live 時由閘門直接拒絕，(e) 合併時移除。這是避免 main 上出現「能送 LIVE 但還沒有風控閘門」的中間版本，見使用者決定 8。
+- OKX 追蹤止損放在 a3 之後的補丁，前提是撤單端點已核對（條件 67）。
+
+## M5 每段合併前的安全驗收清單
+
+共同項目（每段都要做）：
+
+- `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`。
+- `git diff main | grep -n 'danger_'` 結果為空。
+- 新增的 Debug 遮罩測試通過。
+- diff 中沒有任何真實金鑰（以 `grep -nE '[A-Za-z0-9]{40,}'` 人工檢視）。
+- `Cargo.lock` 新依賴符合條件 35。
+
+**a（a1／a2／a3）**
+
+- [ ] 38：log 與錯誤不含 body、query、signature（測試）
+- [ ] 39：三態對應表測試；5xx、2xx 不可解析、`-1006`／`-1007`／`50004`／`51149` → `Unknown`
+- [ ] 40／41：(venue, env, product, scheme) 白名單表格測試；`ws://`、8443、跨環境組合被拒
+- [ ] 42：proxy 快照比較；Broken proxy 拒絕連線；手動驗證不直連（同時完成 F9）
+- [ ] 44：簽名字串等於送出內容的 golden 測試
+- [ ] 53–56：limiter 共用、優先級、429 與 418 測試；行情 fetch 回歸
+- [ ] 57／58：閘門表格測試；改存檔 env 後被拒
+- [ ] 59／60：client id 性質測試；`Unknown` 流程不重送
+- [ ] 62–64、79：取整與 builder golden 測試（含 hedge 不帶 `reduceOnly`、OKX 必須用 oco）
+- [ ] 67：類型 × {下單, 撤單, 查單} 矩陣
+- [ ] 72（若提前）：`ApprovedOrder` 的 `compile_fail` 測試
+- [ ] 75：`cargo tree` 檢查 indicator-engine 依賴
+- [ ] 76／77：`-1021` 不重送；OKX `sCode` 判定；msg 不入 log
+
+**b**
+
+- [ ] 40：私有 WS 只能透過 `wss_endpoint` 建立
+- [ ] 42：每次連線與重連都檢查 proxy 快照
+- [ ] 45／46：listenKey、認證 frame 不出現在 log、Debug、Hash（測試加 code review）
+- [ ] 47：OKX WS 簽名向量；認證失敗不重連
+- [ ] 48：現貨訂閱失敗時 fail closed
+- [ ] 49／50／51：listenKey 生命週期、backoff、斷線狀態與動作矩陣測試
+- [ ] 52：變形輸入不 panic
+- [ ] 手動：測試網斷網 30 秒並恢復，確認重新同步完成前不能新進場
+
+**c**
+
+- [ ] 57：閘門讀取記憶體 session，不讀 modal `Status`
+- [ ] 61：雙 Confirm 只送出一次
+- [ ] 69／70：確認視窗內容是 builder 的輸出；延遲啟用；鍵盤無法繞過（單元測試加手動）
+- [ ] 51：斷線時 UI 狀態與按鈕停用
+- [ ] 新的 `Message` variant 不帶憑證或 listenKey（Debug 測試）
+- [ ] 手動：測試網下單、撤單、LIVE 確認視窗內容逐欄核對
+
+**d**
+
+- [ ] 65：裸倉橫幅狀態機測試，加測試網手動觸發一次
+- [ ] 66：撤另一張、孤兒保護單偵測
+- [ ] 81：啟動與重新同步時偵測無保護持倉；確認視窗註明自動附掛只在 app 執行中有效
+- [ ] 71：自動路徑只允許減倉、平倉、撤單
+- [ ] 78：序列化相容與無機密測試
+
+**e**
+
+- [ ] 72：單一閘門；風控鎖定時減倉仍放行
+- [ ] 73：權益過期 → 阻擋新進場、不自動平倉；轉帳校正；自動平倉預設關閉
+- [ ] 74：日誌無機密、權限 0600、大小上限
+- [ ] 68／70：撤全部、全平後重新查詢才回報結果
+- [ ] 移除「Live 不開放」的暫時限制（採用切分與順序的做法時）
+
+**f**
+
+- [ ] 80：修飾鍵加點擊；取整到交易所 tick；保護單先下新再撤舊
+- [ ] 69：點價與拖曳在 LIVE 下都經過確認
+- [ ] 72：點價與拖曳經過同一個閘門（code review：f 不直接呼叫送單函式）
+- [ ] 78：訂單線不寫入 `Library` 與 `saved-state.json`
+- [ ] 手動：Windows 分支不受影響；popout 視窗中的確認視窗出現在正確的視窗
+
+## M5 使用者決定（2026-11-10）
+
+1. **Binance 帳戶加「產品」欄位**（現貨／USDⓈ-M）。測試網兩個產品各建一個帳戶（條件 41）。
+2. **三條自動路徑採「預先授權」**（條件 71）：進場確認視窗列出之後自動附掛的保護單與互撤行為，確認一次即涵蓋。風控自動平倉預設關閉，LIVE 帳戶要在設定中明確開啟。自動路徑只能減倉、平倉、撤單。
+3. **Binance 現貨私有流在測試網實測確認 HMAC 可用前，現貨交易停用**（fail closed，條件 48）。
+4. **OKX 追蹤止損在撤單端點核對並實測前不開放**（條件 67）。
+5. **hedge 帳戶的保護單只提供全平型**（`closePosition`／`closeFraction`）。
+6. **防手誤門檻預設 5%**（條件 63）；**limiter 每桶保留 20% 給撤單、平倉、保護單**（條件 55）。
+7. **Testnet 帳戶走同一確認流程**，但沒有延遲與紅色 LIVE 標記（條件 69）。
+8. **本機風控（段 e）合併前，main 上不開放 LIVE 送單**（開發順序限制，不改變「LIVE 一開始就能送單」的產品決定；見切分與順序）。
+9. **拖曳改保護單**（條件 80）：交易所允許時「先下新、再撤舊」；不允許時先撤後下，並顯示裸倉警示。
+
 ## M5 前必做
 
 - **F1（中）**：Binance 簽名請求（`exchange/src/account.rs` 的 `send_get`）沒有與公開 `/fapi` 請求共用 limiter。M5 下單與查倉會持續送出簽名請求，必須共用同一個 limiter 實例，並在每次送出前取得配額。
