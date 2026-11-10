@@ -101,7 +101,9 @@ pub fn default_size() -> Size {
 
 #[derive(Debug, Clone, Copy)]
 pub enum Event {
-    Opened(window::Id),
+    Opened(window::Id, Option<Point>, Size),
+    Moved(window::Id, Point),
+    Resized(window::Id, Size),
     Rescaled(window::Id, WindowScaleFactor),
     CloseRequested(window::Id),
 }
@@ -116,7 +118,15 @@ fn filtered_events(
     window: window::Id,
 ) -> Option<Event> {
     match &event {
-        iced::Event::Window(iced::window::Event::Opened { .. }) => Some(Event::Opened(window)),
+        iced::Event::Window(iced::window::Event::Opened { position, size }) => {
+            Some(Event::Opened(window, *position, *size))
+        }
+        iced::Event::Window(iced::window::Event::Moved(position)) => {
+            Some(Event::Moved(window, *position))
+        }
+        iced::Event::Window(iced::window::Event::Resized(size)) => {
+            Some(Event::Resized(window, *size))
+        }
         iced::Event::Window(iced::window::Event::Rescaled(scale_factor)) => Some(Event::Rescaled(
             window,
             WindowScaleFactor::new(*scale_factor),

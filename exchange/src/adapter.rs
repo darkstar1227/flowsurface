@@ -169,6 +169,18 @@ impl UniqueStreams {
         self.update_specs_for_exchange(exchange);
     }
 
+    /// Adds every stream of `other`, so several dashboards share one subscription set.
+    pub fn merge(&mut self, other: &UniqueStreams) {
+        for stream in other
+            .streams
+            .values()
+            .flatten()
+            .flat_map(|by_ticker| by_ticker.values().flatten())
+        {
+            self.add(*stream);
+        }
+    }
+
     pub fn extend<'a>(&mut self, streams: impl IntoIterator<Item = &'a StreamKind>) {
         for stream in streams {
             self.add(*stream);

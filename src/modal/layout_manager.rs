@@ -6,9 +6,9 @@ use crate::widget::column_drag::DragEvent;
 use crate::widget::{manager_icon_button, manager_list, manager_row};
 use crate::{style, tooltip};
 use data::chart::kline::indicators::manifest;
-use data::layout::MAX_NAME_LENGTH;
 use data::layout::presets::{self, Library as PresetLibrary};
 use data::layout::templates;
+use data::layout::{DetachedWindow, MAX_NAME_LENGTH};
 
 use iced::widget::{
     button, center, column, container, row, scrollable, space, text, text_input,
@@ -58,6 +58,10 @@ pub enum Message {
     /// First request arms the delete confirmation; a second one deletes the template file.
     DeleteTemplate(PathBuf),
     OpenTemplatesFolder,
+    /// Move a tab into its own window.
+    DetachTab(Uuid),
+    /// The grip of a tab was pressed; releasing it drops the tab as a new window.
+    TabGrabbed(Uuid),
 }
 
 pub enum Action {
@@ -73,6 +77,24 @@ pub enum Action {
         name: String,
         dashboard: Box<data::Dashboard>,
     },
+    /// Open the layout in its own window; the caller reports the window with `detach`.
+    Detach(Uuid),
+    /// Start tracking a tab drag until the mouse button is released.
+    TabGrabbed(Uuid),
+    /// A detach request that cannot be honoured, e.g. the last remaining tab.
+    DetachRefused,
+    /// Close the window of a layout that was removed while detached.
+    CloseWindow(window::Id),
+}
+
+/// A layout shown in its own window instead of the tab bar.
+struct Detached {
+    layout: Uuid,
+    window: window::Id,
+    /// The window as the dashboard sees its main window.
+    handle: crate::window::Window,
+    /// Last known placement, kept current by window events and written to `saved-state.json`.
+    saved: Option<DetachedWindow>,
 }
 
 pub struct LayoutManager {
@@ -87,6 +109,9 @@ pub struct LayoutManager {
     /// Template whose delete button is awaiting confirmation.
     deleting_template: Option<PathBuf>,
     template_status: Option<Result<String, String>>,
+    detached: Vec<Detached>,
+    /// Detached windows read from the saved state, waiting for the app to open them.
+    restorable: Vec<(Uuid, DetachedWindow)>,
 }
 
 impl LayoutManager {
@@ -116,6 +141,8 @@ impl LayoutManager {
             templates: templates::load_all(&templates::default_directory()),
             deleting_template: None,
             template_status: None,
+            detached: vec![],
+            restorable: vec![],
         }
     }
 
@@ -124,6 +151,7 @@ impl LayoutManager {
         active_layout: Option<LayoutId>,
         chart_presets: Vec<data::chart::kline::ChartPreset>,
         drawings: data::layout::drawings::Config,
+        detached: Vec<(Uuid, DetachedWindow)>,
     ) -> Self {
         let mut manager = Self {
             layouts,
@@ -135,9 +163,191 @@ impl LayoutManager {
             templates: templates::load_all(&templates::default_directory()),
             deleting_template: None,
             template_status: None,
+            detached: vec![],
+            restorable: detached,
         };
         manager.ensure_layout();
         manager
+    }
+
+    /// Detached windows from the saved state that the app should open now.
+    ///
+    /// Drops entries for unknown layouts and the active layout, and always keeps at least one
+    /// layout in the tab bar. Does nothing where extra windows are unsupported.
+    pub fn take_restorable(&mut self) -> Vec<(Uuid, DetachedWindow)> {
+        let requested = std::mem::take(&mut self.restorable);
+        if !crate::window::MULTI_WINDOW_SUPPORTED {
+            return vec![];
+        }
+
+        let mut accepted: Vec<(Uuid, DetachedWindow)> = vec![];
+        for (id, window) in requested {
+            let known = self.get(id).is_some();
+            let duplicate = accepted.iter().any(|(accepted_id, _)| *accepted_id == id);
+            let is_active = Some(id) == self.active_layout_id;
+            // The tab bar keeps at least one layout, and the active one stays in it.
+            let leaves_a_tab = self.layouts.len() > accepted.len() + 1;
+            if known && !duplicate && !is_active && leaves_a_tab {
+                accepted.push((id, window));
+            }
+        }
+
+        let active_is_valid = self
+            .active_layout_id
+            .is_some_and(|id| self.get(id).is_some());
+        if !active_is_valid {
+            self.active_layout_id = self
+                .layouts
+                .iter()
+                .map(|layout| layout.id.unique)
+                .find(|id| !accepted.iter().any(|(accepted_id, _)| accepted_id == id));
+        }
+
+        accepted
+    }
+
+    pub fn is_detached(&self, layout: Uuid) -> bool {
+        self.detached.iter().any(|d| d.layout == layout)
+    }
+
+    pub fn detached_window(&self, layout: Uuid) -> Option<window::Id> {
+        self.detached
+            .iter()
+            .find(|d| d.layout == layout)
+            .map(|d| d.window)
+    }
+
+    pub fn window_handle(&self, window: window::Id) -> Option<&crate::window::Window> {
+        self.detached
+            .iter()
+            .find(|d| d.window == window)
+            .map(|d| &d.handle)
+    }
+
+    pub fn layout_for_window(&self, window: window::Id) -> Option<Uuid> {
+        self.detached
+            .iter()
+            .find(|d| d.window == window)
+            .map(|d| d.layout)
+    }
+
+    pub fn detached_windows(&self) -> impl Iterator<Item = window::Id> + '_ {
+        self.detached.iter().map(|d| d.window)
+    }
+
+    /// Layouts shown in the tab bar, in order.
+    pub fn tab_layouts(&self) -> impl Iterator<Item = &Layout> {
+        self.layouts
+            .iter()
+            .filter(|layout| !self.is_detached(layout.id.unique))
+    }
+
+    fn tab_ids(&self) -> Vec<Uuid> {
+        self.tab_layouts().map(|layout| layout.id.unique).collect()
+    }
+
+    /// The active layout plus every detached one, in tab order.
+    pub fn visible_ids(&self) -> Vec<Uuid> {
+        self.layouts
+            .iter()
+            .map(|layout| layout.id.unique)
+            .filter(|id| Some(*id) == self.active_layout_id || self.is_detached(*id))
+            .collect()
+    }
+
+    pub fn can_detach(&self, id: Uuid) -> bool {
+        self.get(id).is_some() && !self.is_detached(id) && self.tab_ids().len() > 1
+    }
+
+    /// Hides the layout from the tab bar and tracks `window` as its window.
+    ///
+    /// Returns `None` if the layout cannot be detached. Otherwise the inner value is the tab to
+    /// switch to when the detached layout was the active one.
+    pub fn detach(&mut self, id: Uuid, window: window::Id) -> Option<Option<Uuid>> {
+        if !self.can_detach(id) {
+            return None;
+        }
+
+        let next_active = (Some(id) == self.active_layout_id).then(|| {
+            let tabs = self.tab_ids();
+            let index = tabs.iter().position(|tab| *tab == id).unwrap_or_default();
+            let neighbor = if index > 0 { index - 1 } else { index + 1 };
+            tabs[neighbor]
+        });
+
+        self.detached.push(Detached {
+            layout: id,
+            window,
+            handle: crate::window::Window::new(window),
+            saved: None,
+        });
+        Some(next_active)
+    }
+
+    /// Registers a window opened for a layout restored from the saved state.
+    pub fn restore_detached(&mut self, id: Uuid, window: window::Id, saved: DetachedWindow) {
+        if self.get(id).is_some() && !self.is_detached(id) {
+            self.detached.push(Detached {
+                layout: id,
+                window,
+                handle: crate::window::Window::new(window),
+                saved: Some(saved),
+            });
+        }
+    }
+
+    /// Returns the layout of a closed detached window to the tab bar, at its old position.
+    pub fn attach(&mut self, window: window::Id) -> Option<Uuid> {
+        let index = self.detached.iter().position(|d| d.window == window)?;
+        Some(self.detached.remove(index).layout)
+    }
+
+    pub fn saved_window(&self, window: window::Id) -> Option<&DetachedWindow> {
+        self.detached
+            .iter()
+            .find(|d| d.window == window)
+            .and_then(|d| d.saved.as_ref())
+    }
+
+    pub fn saved_placement(&self, layout: Uuid) -> Option<DetachedWindow> {
+        self.detached.iter().find(|d| d.layout == layout).map(|d| {
+            d.saved.unwrap_or_else(|| DetachedWindow {
+                spec: data::layout::WindowSpec::default(),
+                monitor: None,
+            })
+        })
+    }
+
+    /// Records the position and/or size last reported for a detached window.
+    pub fn record_window(
+        &mut self,
+        window: window::Id,
+        position: Option<iced::Point>,
+        size: Option<iced::Size>,
+    ) {
+        let Some(detached) = self.detached.iter_mut().find(|d| d.window == window) else {
+            return;
+        };
+        let saved = detached.saved.get_or_insert(DetachedWindow {
+            spec: data::layout::WindowSpec::default(),
+            monitor: None,
+        });
+        if let Some(position) = position {
+            saved.spec.pos_x = position.x;
+            saved.spec.pos_y = position.y;
+        }
+        if let Some(size) = size {
+            saved.spec.width = size.width;
+            saved.spec.height = size.height;
+        }
+    }
+
+    pub fn record_monitor(&mut self, window: window::Id, monitor: Option<iced::Size>) {
+        if let Some(detached) = self.detached.iter_mut().find(|d| d.window == window)
+            && let Some(saved) = detached.saved.as_mut()
+        {
+            saved.monitor = monitor.map(|size| (size.width, size.height));
+        }
     }
 
     /// Re-read the templates directory, picking up files copied in from elsewhere.
@@ -362,23 +572,31 @@ impl LayoutManager {
 
     /// Exchanges kline drawings between the active layout's charts and the shared library.
     pub fn sync_drawings(&mut self, main_window: window::Id) {
-        let Some(active) = self.active_layout_id else {
-            return;
-        };
+        let visible = self.visible_ids();
         let library = self.chart_resources.drawings_mut();
-        if let Some(layout) = self
+        for layout in self
             .layouts
             .iter_mut()
-            .find(|layout| layout.id.unique == active)
+            .filter(|layout| visible.contains(&layout.id.unique))
         {
-            layout.dashboard.sync_drawings(main_window, library);
+            let window = self
+                .detached
+                .iter()
+                .find(|d| d.layout == layout.id.unique)
+                .map_or(main_window, |d| d.window);
+            layout.dashboard.sync_drawings(window, library);
         }
     }
 
+    /// Parks every layout that is neither the active one nor open in its own window.
     pub fn park_inactive_layouts(&mut self, active_layout_id: Uuid, main_window: window::Id) {
+        let detached = &self.detached;
         self.layouts
             .iter_mut()
-            .filter(|layout| layout.id.unique != active_layout_id)
+            .filter(|layout| {
+                layout.id.unique != active_layout_id
+                    && !detached.iter().any(|d| d.layout == layout.id.unique)
+            })
             .for_each(|layout| layout.dashboard.park_for_inactive_layout(main_window));
     }
 
@@ -395,16 +613,17 @@ impl LayoutManager {
 
     fn close(&mut self, id: Uuid) -> Option<Action> {
         self.closing = None;
-        if self.layouts.len() <= 1 {
+        let tabs = self.tab_ids();
+        if tabs.len() <= 1 || !tabs.contains(&id) {
             return None;
         }
         if Some(id) != self.active_layout_id {
             self.layouts.retain(|layout| layout.id.unique != id);
             return None;
         }
-        let index = self.layouts.iter().position(|l| l.id.unique == id)?;
+        let index = tabs.iter().position(|tab| *tab == id)?;
         let neighbor = if index > 0 { index - 1 } else { index + 1 };
-        let select = self.layouts.get(neighbor)?.id.unique;
+        let select = *tabs.get(neighbor)?;
         Some(Action::Close { select, remove: id })
     }
 
@@ -467,17 +686,17 @@ impl LayoutManager {
                 self.refresh_templates();
             }
             Message::SelectIndex(index) => {
-                let id = self.layouts.get(index)?.id.unique;
+                let id = *self.tab_ids().get(index)?;
                 if Some(id) != self.active_layout_id {
                     return self.update(Message::SelectActive(id));
                 }
             }
             Message::Cycle { forward } => {
-                let len = self.layouts.len();
-                let index = self
-                    .layouts
+                let tabs = self.tab_ids();
+                let len = tabs.len();
+                let index = tabs
                     .iter()
-                    .position(|l| Some(l.id.unique) == self.active_layout_id)?;
+                    .position(|id| Some(*id) == self.active_layout_id)?;
                 let next = if forward {
                     (index + 1) % len
                 } else {
@@ -491,7 +710,7 @@ impl LayoutManager {
                 if self.closing == Some(id) {
                     return self.close(id);
                 }
-                if self.layouts.len() > 1 {
+                if self.tab_ids().len() > 1 {
                     self.closing = Some(id);
                 }
             }
@@ -501,6 +720,9 @@ impl LayoutManager {
             }
             Message::CancelClose => {}
             Message::SelectActive(id) => {
+                if self.is_detached(id) {
+                    return None;
+                }
                 self.active_layout_id = Some(id);
                 return Some(Action::Select(id));
             }
@@ -531,8 +753,20 @@ impl LayoutManager {
                 if Some(id) == self.active_layout_id {
                     return None;
                 }
+                let window = self.detached_window(id);
+                self.detached.retain(|d| d.layout != id);
                 self.layouts.retain(|layout| layout.id.unique != id);
                 self.edit_mode = Editing::Preview;
+                return window.map(Action::CloseWindow);
+            }
+            Message::TabGrabbed(id) => {
+                return Some(Action::TabGrabbed(id));
+            }
+            Message::DetachTab(id) => {
+                if !crate::window::MULTI_WINDOW_SUPPORTED || !self.can_detach(id) {
+                    return Some(Action::DetachRefused);
+                }
+                return Some(Action::Detach(id));
             }
             Message::SetLayoutName(id, new_name) => {
                 let unique_name = self.ensure_unique_name(&new_name, id);
@@ -648,7 +882,7 @@ impl LayoutManager {
                 Editing::None => {
                     layout_row = layout_row.push(create_layout_button(
                         layout_id,
-                        if is_active {
+                        if is_active || self.is_detached(layout_id.unique) {
                             None
                         } else {
                             Some(Message::SelectActive(layout_id.unique))
@@ -841,6 +1075,192 @@ mod tests {
             manager.update(Message::RequestCloseActive),
             Some(Action::Close { select, remove }) if select == second && remove == first
         ));
+    }
+
+    fn window() -> window::Id {
+        window::Id::unique()
+    }
+
+    fn saved_window(x: f32) -> DetachedWindow {
+        DetachedWindow {
+            spec: data::layout::WindowSpec {
+                width: 640.0,
+                height: 480.0,
+                pos_x: x,
+                pos_y: 10.0,
+            },
+            monitor: Some((1920.0, 1080.0)),
+        }
+    }
+
+    #[test]
+    fn the_last_tab_cannot_be_detached() {
+        let mut manager = manager_with(1);
+        let only = active(&manager);
+        assert!(!manager.can_detach(only));
+        assert!(manager.detach(only, window()).is_none());
+        assert!(manager.detached_windows().next().is_none());
+
+        let mut manager = manager_with(2);
+        let first = id_at(&manager, 0);
+        let second = id_at(&manager, 1);
+        assert!(manager.detach(second, window()).is_some());
+        assert!(manager.detach(first, window()).is_none());
+        assert!(manager.detach(second, window()).is_none());
+    }
+
+    #[test]
+    fn detaching_the_active_tab_selects_a_neighbor() {
+        let mut manager = manager_with(3);
+        let first = id_at(&manager, 0);
+        let second = id_at(&manager, 1);
+        let third = id_at(&manager, 2);
+
+        assert_eq!(manager.detach(first, window()), Some(Some(second)));
+        assert!(manager.is_detached(first));
+        assert_eq!(
+            manager
+                .tab_layouts()
+                .map(|l| l.id.unique)
+                .collect::<Vec<_>>(),
+            vec![second, third]
+        );
+
+        // A tab that is not active leaves the selection alone.
+        assert_eq!(manager.detach(third, window()), Some(None));
+    }
+
+    #[test]
+    fn detached_tabs_are_skipped_by_index_and_cycle() {
+        let mut manager = manager_with(3);
+        let first = id_at(&manager, 0);
+        let second = id_at(&manager, 1);
+        let third = id_at(&manager, 2);
+        manager.detach(second, window());
+
+        assert!(matches!(
+            manager.update(Message::SelectIndex(1)),
+            Some(Action::Select(id)) if id == third
+        ));
+        assert!(manager.update(Message::SelectIndex(2)).is_none());
+        assert!(matches!(
+            manager.update(Message::Cycle { forward: true }),
+            Some(Action::Select(id)) if id == first
+        ));
+        assert!(manager.update(Message::SelectActive(second)).is_none());
+        assert_eq!(active(&manager), first);
+    }
+
+    #[test]
+    fn closing_picks_a_tab_neighbor_not_a_detached_one() {
+        let mut manager = manager_with(3);
+        let first = id_at(&manager, 0);
+        let second = id_at(&manager, 1);
+        let third = id_at(&manager, 2);
+        manager.detach(second, window());
+
+        let _ = manager.update(Message::RequestCloseActive);
+        assert!(matches!(
+            manager.update(Message::RequestCloseActive),
+            Some(Action::Close { select, remove }) if select == third && remove == first
+        ));
+    }
+
+    #[test]
+    fn attaching_returns_the_layout_to_its_old_position() {
+        let mut manager = manager_with(3);
+        let first = id_at(&manager, 0);
+        let second = id_at(&manager, 1);
+        let handle = window();
+        manager.detach(second, handle);
+
+        assert_eq!(manager.layout_for_window(handle), Some(second));
+        assert_eq!(manager.attach(handle), Some(second));
+        assert!(!manager.is_detached(second));
+        assert_eq!(id_at(&manager, 1), second);
+        assert_eq!(
+            manager.tab_layouts().map(|l| l.id.unique).nth(1),
+            Some(second)
+        );
+        assert_eq!(active(&manager), first);
+        assert!(manager.attach(handle).is_none());
+    }
+
+    #[test]
+    fn visible_layouts_are_the_active_one_and_the_detached_ones() {
+        let mut manager = manager_with(3);
+        let first = id_at(&manager, 0);
+        let third = id_at(&manager, 2);
+        manager.detach(third, window());
+        assert_eq!(manager.visible_ids(), vec![first, third]);
+    }
+
+    #[test]
+    fn removing_a_detached_layout_closes_its_window() {
+        let mut manager = manager_with(2);
+        let second = id_at(&manager, 1);
+        let handle = window();
+        manager.detach(second, handle);
+
+        assert!(matches!(
+            manager.update(Message::RemoveLayout(second)),
+            Some(Action::CloseWindow(closed)) if closed == handle
+        ));
+        assert_eq!(manager.layouts.len(), 1);
+        assert!(!manager.is_detached(second));
+    }
+
+    #[test]
+    fn restoring_keeps_a_tab_and_keeps_the_active_layout_attached() {
+        let mut manager = manager_with(3);
+        let first = id_at(&manager, 0);
+        let second = id_at(&manager, 1);
+        let third = id_at(&manager, 2);
+        manager.restorable = vec![
+            (first, saved_window(1.0)),
+            (second, saved_window(2.0)),
+            (second, saved_window(3.0)),
+            (third, saved_window(4.0)),
+            (Uuid::new_v4(), saved_window(5.0)),
+        ];
+
+        let restored = manager.take_restorable();
+        let restored_ids = restored.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        assert_eq!(restored_ids, vec![second, third]);
+        assert!(!restored_ids.contains(&first));
+        assert_eq!(active(&manager), first);
+    }
+
+    #[test]
+    fn restoring_replaces_an_active_layout_that_was_detached() {
+        let mut manager = manager_with(2);
+        let first = id_at(&manager, 0);
+        let second = id_at(&manager, 1);
+        manager.active_layout_id = None;
+        manager.restorable = vec![(first, saved_window(1.0))];
+
+        let restored = manager.take_restorable();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(active(&manager), second);
+    }
+
+    #[test]
+    fn window_events_update_the_saved_placement() {
+        let mut manager = manager_with(2);
+        let second = id_at(&manager, 1);
+        let handle = window();
+        manager.detach(second, handle);
+
+        manager.record_window(handle, Some(iced::Point::new(12.0, 34.0)), None);
+        manager.record_window(handle, None, Some(iced::Size::new(500.0, 400.0)));
+        manager.record_monitor(handle, Some(iced::Size::new(2560.0, 1440.0)));
+
+        let saved = manager.saved_placement(second).unwrap();
+        assert_eq!(saved.spec.pos_x, 12.0);
+        assert_eq!(saved.spec.pos_y, 34.0);
+        assert_eq!(saved.spec.width, 500.0);
+        assert_eq!(saved.spec.height, 400.0);
+        assert_eq!(saved.monitor, Some((2560.0, 1440.0)));
     }
 
     #[test]

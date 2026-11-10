@@ -17,6 +17,7 @@ use connector::client::DataSources;
 use data::chart::kline::indicators::manifest;
 use data::config::theme::default_theme;
 use data::{layout::WindowSpec, sidebar};
+use exchange::adapter::UniqueStreams;
 use layout::{LayoutId, configuration};
 use modal::dashboard_modal;
 use modal::{
@@ -41,7 +42,7 @@ use iced::{
     },
 };
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 fn main() {
@@ -99,7 +100,20 @@ struct Flowsurface {
     window_scale_factors: window::WindowScaleFactors,
     antialiasing: bool,
     applied_antialiasing: bool,
+    /// Restored detached windows whose monitor has not been compared with the saved one yet.
+    restoring_windows: HashSet<window::Id>,
+    /// Tab being dragged by its grip, with the last cursor position seen in the main window.
+    tab_drag: Option<TabDrag>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct TabDrag {
+    layout: uuid::Uuid,
+    cursor: Option<iced::Point>,
+}
+
+/// Dropping a tab below this many pixels from the window top places the new window at the cursor.
+const TAB_DROP_MIN_Y: f32 = 90.0;
 
 #[derive(Debug, Clone, Copy)]
 enum Hotkey {
@@ -126,6 +140,11 @@ enum Message {
     ExitRequested(HashMap<window::Id, WindowSpec>),
     SaveStateRequested(HashMap<window::Id, WindowSpec>),
     GoBack,
+    /// Cursor position while a tab is being dragged, in main window coordinates.
+    TabDragMoved(window::Id, iced::Point),
+    TabDragReleased,
+    /// Monitor size reported for a detached window, `None` if the platform cannot tell.
+    DetachedMonitorChecked(window::Id, Option<iced::Size>),
     Hotkey(Hotkey),
     DataFolderRequested,
     OpenUrlRequested(Cow<'static, str>),
@@ -193,6 +212,8 @@ impl Flowsurface {
             network_editor: NetworkEditor::new(&saved_state.network, None),
             antialiasing: saved_state.antialiasing,
             applied_antialiasing: saved_state.antialiasing,
+            restoring_windows: HashSet::new(),
+            tab_drag: None,
         };
 
         for diagnostic in data::chart::kline::indicators::catalog().diagnostics() {
@@ -211,6 +232,9 @@ impl Flowsurface {
             log::error!("No layouts available after loading state; creating a default layout");
             state.layout_manager.ensure_layout();
         }
+
+        // Must run before the active layout is chosen: it keeps the active layout attached.
+        let restore_detached = state.restore_detached_windows();
 
         let active_layout_id = state
             .layout_manager
@@ -244,6 +268,7 @@ impl Flowsurface {
             state,
             open_main_window
                 .chain(load_layout)
+                .chain(restore_detached)
                 .chain(launch_sidebar.map(Message::Sidebar)),
         )
     }
@@ -251,55 +276,70 @@ impl Flowsurface {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::MarketWsEvent(event) => {
-                let main_window_id = self.main_window.id;
-                if self.layout_manager.active_layout_id().is_none() {
+                // Detached layouts keep running, so every visible layout gets the event.
+                let visible = self.layout_manager.visible_ids();
+                if visible.is_empty() {
                     return Task::none();
                 }
-                let dashboard = self.active_dashboard_mut();
 
-                match event {
+                match &event {
                     exchange::Event::Connected(_streams) => {}
                     exchange::Event::Disconnected(_streams, reason) => {
                         log::info!("a stream disconnected from WS: {reason:?}");
                     }
-                    exchange::Event::DepthReceived(stream, update_t, depth) => {
-                        let task =
-                            dashboard.ingest_live_depth(&stream, update_t, depth, main_window_id);
-                        return self.map_dashboard_task(task, None);
-                    }
-                    exchange::Event::TradesReceived(stream, update_t, buffer) => {
-                        let task = dashboard.ingest_live_trades(
-                            &stream,
-                            &buffer,
-                            update_t,
-                            main_window_id,
-                        );
-
-                        if let Some(msg) = self.audio_stream.try_play_sound(&stream, &buffer) {
+                    exchange::Event::TradesReceived(stream, _, buffer) => {
+                        if let Some(msg) = self.audio_stream.try_play_sound(stream, buffer) {
                             self.notifications.push(Toast::error(msg));
                         }
-
-                        return self.map_dashboard_task(task, None);
                     }
-                    exchange::Event::KlineReceived(stream, kline) => {
-                        let task = dashboard.ingest_live_kline(&stream, &kline, main_window_id);
-                        return self.map_dashboard_task(task, None);
-                    }
+                    exchange::Event::DepthReceived(..) | exchange::Event::KlineReceived(..) => {}
                 }
+
+                let mut tasks = vec![];
+                for layout_id in visible {
+                    let window_id = self.layout_window_id(layout_id);
+                    let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) else {
+                        continue;
+                    };
+
+                    let task = match &event {
+                        exchange::Event::Connected(_) | exchange::Event::Disconnected(..) => {
+                            continue;
+                        }
+                        exchange::Event::DepthReceived(stream, update_t, depth) => {
+                            dashboard.ingest_live_depth(stream, *update_t, depth.clone(), window_id)
+                        }
+                        exchange::Event::TradesReceived(stream, update_t, buffer) => {
+                            dashboard.ingest_live_trades(stream, buffer, *update_t, window_id)
+                        }
+                        exchange::Event::KlineReceived(stream, kline) => {
+                            dashboard.ingest_live_kline(stream, kline, window_id)
+                        }
+                    };
+                    tasks.push(self.map_dashboard_task(task, Some(layout_id)));
+                }
+                return Task::batch(tasks);
             }
             Message::Tick(now) => {
                 let main_window_id = self.main_window.id;
                 let data_sources = Arc::clone(&self.data_sources);
-                if self.layout_manager.active_layout_id().is_none() {
+                let visible = self.layout_manager.visible_ids();
+                if visible.is_empty() {
                     return Task::none();
                 }
 
                 self.layout_manager.sync_drawings(main_window_id);
 
-                let task = self
-                    .active_dashboard_mut()
-                    .tick(now, &data_sources, main_window_id);
-                return self.map_dashboard_task(task, None);
+                let mut tasks = vec![];
+                for layout_id in visible {
+                    let window_id = self.layout_window_id(layout_id);
+                    let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) else {
+                        continue;
+                    };
+                    let task = dashboard.tick(now, &data_sources, window_id);
+                    tasks.push(self.map_dashboard_task(task, Some(layout_id)));
+                }
+                return Task::batch(tasks);
             }
             Message::WindowEvent(event) => return self.handle_window_event(event),
             Message::WindowScaleFactorUpdated {
@@ -349,9 +389,24 @@ impl Flowsurface {
                     return Task::none();
                 };
 
-                let main_window = self.main_window;
                 let active_layout_id = active_layout.unique;
                 let layout_id = id.unwrap_or(active_layout_id);
+
+                // A detached layout treats its own window as its main window.
+                let main_window = match self.layout_manager.detached_window(layout_id) {
+                    Some(id) => window::Window::new(id),
+                    None => self.main_window,
+                };
+
+                // Panes of a detached layout cannot be popped out.
+                if self.layout_manager.is_detached(layout_id)
+                    && matches!(
+                        msg,
+                        dashboard::Message::Pane(_, dashboard::pane::Message::Popout)
+                    )
+                {
+                    return Task::none();
+                }
 
                 let Some((main_task, event)) = self.layout_manager.update_dashboard(
                     msg,
@@ -572,8 +627,48 @@ impl Flowsurface {
 
                         return close_popouts.chain(load);
                     }
+                    Some(modal::layout_manager::Action::TabGrabbed(id)) => {
+                        self.tab_drag = Some(TabDrag {
+                            layout: id,
+                            cursor: None,
+                        });
+                    }
+                    Some(modal::layout_manager::Action::Detach(id)) => {
+                        return self.detach_layout(id, None);
+                    }
+                    Some(modal::layout_manager::Action::DetachRefused) => {
+                        self.notifications.push(Toast::info(
+                            "At least one layout must stay in the main window".to_string(),
+                        ));
+                    }
+                    Some(modal::layout_manager::Action::CloseWindow(window_id)) => {
+                        self.window_scale_factors.remove(window_id);
+                        return window::close(window_id);
+                    }
                     None => {}
                 }
+            }
+            Message::TabDragMoved(window_id, position) => {
+                if window_id == self.main_window.id
+                    && let Some(drag) = self.tab_drag.as_mut()
+                {
+                    drag.cursor = Some(position);
+                }
+            }
+            Message::TabDragReleased => {
+                let Some(drag) = self.tab_drag.take() else {
+                    return Task::none();
+                };
+                // Dropped on the tab bar: default placement. Dropped below it: at the cursor.
+                let position = drag
+                    .cursor
+                    .filter(|cursor| cursor.y > TAB_DROP_MIN_Y)
+                    .zip(self.main_window.position)
+                    .map(|(cursor, origin)| origin + iced::Vector::new(cursor.x, cursor.y));
+                return self.detach_layout(drag.layout, position);
+            }
+            Message::DetachedMonitorChecked(window_id, monitor) => {
+                return self.check_detached_monitor(window_id, monitor);
             }
             Message::AudioStream(message) => {
                 if let Some(event) = self.audio_stream.update(message) {
@@ -763,6 +858,10 @@ impl Flowsurface {
     }
 
     fn view(&self, id: window::Id) -> Element<'_, Message> {
+        if let Some(layout_id) = self.layout_manager.layout_for_window(id) {
+            return self.view_detached(id, layout_id);
+        }
+
         let dashboard = self.active_dashboard();
         let sidebar_pos = self.sidebar.position();
 
@@ -860,12 +959,57 @@ impl Flowsurface {
         .into()
     }
 
+    fn view_detached(&self, id: window::Id, layout_id: uuid::Uuid) -> Element<'_, Message> {
+        let pixel_ratio = self
+            .window_scale_factors
+            .pixel_ratio_for_window(id, self.ui_scale_factor);
+        let content: Element<'_, Message> = match self
+            .layout_manager
+            .get(layout_id)
+            .zip(self.layout_manager.window_handle(id))
+        {
+            Some((layout, own_window)) => container(
+                layout
+                    .dashboard
+                    .view(
+                        own_window,
+                        &self.sidebar.tickers_table,
+                        self.timezone,
+                        pixel_ratio,
+                        &self.theme,
+                        self.layout_manager.chart_resources(),
+                    )
+                    .map(move |event| Message::Dashboard {
+                        layout_id: Some(layout_id),
+                        event,
+                    }),
+            )
+            .padding(padding::top(style::TITLE_PADDING_TOP))
+            .into(),
+            None => container(text("Layout not found")).into(),
+        };
+
+        toast::Manager::new(
+            content,
+            self.notifications.toasts(),
+            Alignment::Start,
+            Message::RemoveNotification,
+        )
+        .into()
+    }
+
     fn theme(&self, _window: window::Id) -> iced_core::Theme {
         self.theme.current().clone()
     }
 
-    fn title(&self, _window: window::Id) -> String {
-        if let Some(id) = self.layout_manager.active_layout_id() {
+    fn title(&self, window: window::Id) -> String {
+        if let Some(layout) = self
+            .layout_manager
+            .layout_for_window(window)
+            .and_then(|id| self.layout_manager.get(id))
+        {
+            format!("Flowsurface [{}]", layout.id.name)
+        } else if let Some(id) = self.layout_manager.active_layout_id() {
             format!("Flowsurface [{}]", id.name)
         } else {
             "Flowsurface".to_string()
@@ -880,10 +1024,17 @@ impl Flowsurface {
         let window_events = window::events().map(Message::WindowEvent);
         let sidebar = self.sidebar.subscription().map(Message::Sidebar);
 
-        let exchange_streams = self
-            .active_dashboard()
-            .market_subscriptions(&self.data_sources.exchange)
-            .map(Message::MarketWsEvent);
+        // One merged, order-stable stream set keeps the subscription identity steady and
+        // avoids duplicate connections when layouts share a stream.
+        let mut streams = UniqueStreams::default();
+        for id in self.layout_manager.visible_ids() {
+            if let Some(layout) = self.layout_manager.get(id) {
+                streams.merge(&layout.dashboard.streams);
+            }
+        }
+        let exchange_streams =
+            Dashboard::market_subscriptions(&streams, &self.data_sources.exchange)
+                .map(Message::MarketWsEvent);
 
         let tick = iced::window::frames().map(Message::Tick);
 
@@ -914,7 +1065,23 @@ impl Flowsurface {
             Some(Message::Hotkey(hotkey))
         });
 
+        // The release can land outside the grip, so follow the cursor only while dragging.
+        let tab_drag = if self.tab_drag.is_some() {
+            iced::event::listen_with(|event, _status, window_id| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::TabDragMoved(window_id, position))
+                }
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )) => Some(Message::TabDragReleased),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch(vec![
+            tab_drag,
             exchange_streams,
             sidebar,
             window_events,
@@ -976,20 +1143,29 @@ impl Flowsurface {
         Task::done(message)
     }
 
-    /// Rebuild the active layout's charts that use `indicator` after the catalog was reloaded.
-    /// Inactive layouts are rebuilt from the new catalog when they are loaded.
+    /// Rebuild the charts that use `indicator` after the catalog was reloaded, in the active
+    /// layout and the detached ones. Other layouts are rebuilt from the new catalog when loaded.
     fn reload_indicator(&mut self, indicator: &data::chart::kline::IndicatorId) -> Task<Message> {
-        if self.layout_manager.active_layout_id().is_none() {
-            return Task::none();
-        }
-        let main_window = self.main_window.id;
         let data_sources = Arc::clone(&self.data_sources);
-        self.active_dashboard_mut()
-            .reload_indicator(main_window, indicator, &data_sources)
-            .map(move |event| Message::Dashboard {
-                layout_id: None,
-                event,
-            })
+        let mut tasks = vec![];
+
+        for layout_id in self.layout_manager.visible_ids() {
+            let window_id = self.layout_window_id(layout_id);
+            let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) else {
+                continue;
+            };
+            let task = dashboard.reload_indicator(window_id, indicator, &data_sources);
+            tasks.push(self.map_dashboard_task(task, Some(layout_id)));
+        }
+
+        Task::batch(tasks)
+    }
+
+    /// The window a layout is shown in: its own when detached, otherwise the main window.
+    fn layout_window_id(&self, layout_id: uuid::Uuid) -> window::Id {
+        self.layout_manager
+            .detached_window(layout_id)
+            .unwrap_or(self.main_window.id)
     }
 
     fn active_dashboard(&self) -> &Dashboard {
@@ -1051,20 +1227,49 @@ impl Flowsurface {
             return;
         }
 
-        let main_window = self.main_window.id;
-        self.active_dashboard_mut()
-            .theme_updated(main_window, &theme);
+        for layout_id in self.layout_manager.visible_ids() {
+            let window_id = self.layout_window_id(layout_id);
+            if let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) {
+                dashboard.theme_updated(window_id, &theme);
+            }
+        }
     }
 
     fn handle_window_event(&mut self, event: window::Event) -> Task<Message> {
         match event {
-            window::Event::Opened(window_id) => {
-                window::scale_factor(window_id, |window, scale_factor| {
+            window::Event::Opened(window_id, position, size) => {
+                if window_id == self.main_window.id {
+                    self.main_window.position = position;
+                }
+
+                let mut tasks = vec![window::scale_factor(window_id, |window, scale_factor| {
                     Message::WindowScaleFactorUpdated {
                         window,
                         scale_factor,
                     }
-                })
+                })];
+
+                if self.layout_manager.layout_for_window(window_id).is_some() {
+                    self.layout_manager
+                        .record_window(window_id, position, Some(size));
+                    tasks.push(Self::probe_monitor(window_id));
+                }
+                Task::batch(tasks)
+            }
+            window::Event::Moved(window_id, position) => {
+                if window_id == self.main_window.id {
+                    self.main_window.position = Some(position);
+                } else if self.layout_manager.layout_for_window(window_id).is_some() {
+                    self.layout_manager
+                        .record_window(window_id, Some(position), None);
+                    return Self::probe_monitor(window_id);
+                }
+                Task::none()
+            }
+            window::Event::Resized(window_id, size) => {
+                self.layout_manager
+                    .record_window(window_id, None, Some(size));
+                Task::none()
             }
             window::Event::Rescaled(window_id, scale_factor) => {
                 self.window_scale_factors.set(window_id, scale_factor);
@@ -1075,6 +1280,24 @@ impl Flowsurface {
 
                 if window_id != main_window {
                     self.window_scale_factors.remove(window_id);
+                    self.restoring_windows.remove(&window_id);
+
+                    // Closing a detached window returns its layout to the tab bar.
+                    if self.layout_manager.layout_for_window(window_id).is_some() {
+                        self.layout_manager.sync_drawings(main_window);
+                        if let Some(layout_id) = self.layout_manager.attach(window_id) {
+                            if let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) {
+                                dashboard.clear_focus();
+                            }
+                            if let Some(active) = self.layout_manager.active_layout_id() {
+                                let active = active.unique;
+                                self.layout_manager
+                                    .park_inactive_layouts(active, main_window);
+                            }
+                        }
+                        return window::close(window_id);
+                    }
+
                     self.active_dashboard_mut().popout.remove(&window_id);
                     return window::close(window_id);
                 }
@@ -1087,10 +1310,140 @@ impl Flowsurface {
                     .copied()
                     .collect::<Vec<window::Id>>();
                 active_windows.push(main_window);
+                active_windows.extend(self.layout_manager.detached_windows());
 
                 window::collect_window_specs(active_windows, Message::ExitRequested)
             }
         }
+    }
+
+    /// Asks for the monitor size of a detached window, to store with its position.
+    fn probe_monitor(window_id: window::Id) -> Task<Message> {
+        iced::window::monitor_size(window_id)
+            .map(move |monitor| Message::DetachedMonitorChecked(window_id, monitor))
+    }
+
+    /// Records the monitor of a detached window. A restored window that ended up on a monitor of
+    /// a different size than the saved one is moved next to the main window, so it cannot stay
+    /// off-screen after a monitor was unplugged.
+    fn check_detached_monitor(
+        &mut self,
+        window_id: window::Id,
+        monitor: Option<iced::Size>,
+    ) -> Task<Message> {
+        let saved_monitor = self
+            .layout_manager
+            .saved_window(window_id)
+            .and_then(|saved| saved.monitor);
+        let first_check = self.restoring_windows.remove(&window_id);
+
+        if first_check
+            && let (Some(current), Some((saved_w, saved_h))) = (monitor, saved_monitor)
+            && ((current.width - saved_w).abs() > 1.0 || (current.height - saved_h).abs() > 1.0)
+            && let Some(main_position) = self.main_window.position
+        {
+            self.layout_manager.record_monitor(window_id, monitor);
+            return iced::window::move_to(window_id, main_position + iced::Vector::new(40.0, 40.0));
+        }
+
+        if first_check || self.layout_manager.layout_for_window(window_id).is_some() {
+            self.layout_manager.record_monitor(window_id, monitor);
+        }
+        Task::none()
+    }
+
+    /// Moves a layout out of the tab bar into a window of its own.
+    fn detach_layout(&mut self, id: uuid::Uuid, position: Option<iced::Point>) -> Task<Message> {
+        if !self.layout_manager.can_detach(id) {
+            self.notifications.push(Toast::info(
+                "At least one layout must stay in the main window".to_string(),
+            ));
+            return Task::none();
+        }
+
+        let main_window = self.main_window;
+        let was_active = self
+            .layout_manager
+            .active_layout_id()
+            .is_some_and(|layout| layout.unique == id);
+
+        self.layout_manager.sync_drawings(main_window.id);
+
+        // Popped-out panes go back to the layout's own grid; the layout then owns one window.
+        let (merged_windows, merge_task) = match self.layout_manager.mut_dashboard(id) {
+            Some(dashboard) => dashboard.merge_all_popouts(&main_window),
+            None => (vec![], Task::none()),
+        };
+        let mut tasks = vec![self.map_dashboard_task(merge_task, Some(id))];
+        for popout in merged_windows {
+            self.window_scale_factors.remove(popout);
+            if was_active {
+                tasks.push(window::close::<window::Id>(popout).discard());
+            }
+        }
+
+        let (window_id, open_task) = window::open(window::Settings {
+            position: position.map_or(window::Position::Default, window::Position::Specific),
+            size: window::default_size(),
+            exit_on_close_request: false,
+            min_size: Some(iced::Size::new(400.0, 300.0)),
+            ..window::settings()
+        });
+        tasks.push(open_task.discard());
+
+        let Some(next_active) = self.layout_manager.detach(id, window_id) else {
+            return Task::batch(tasks);
+        };
+
+        if let Some(next) = next_active {
+            tasks.push(self.load_layout(next, main_window.id));
+        }
+
+        // The detached layout stays live: refresh its stream set for its own window.
+        if let Some(dashboard) = self.layout_manager.mut_dashboard(id) {
+            dashboard.clear_focus();
+            let task = dashboard.load_layout(window_id);
+            tasks.push(self.map_dashboard_task(task, Some(id)));
+        }
+
+        Task::batch(tasks)
+    }
+
+    /// Opens the detached windows read from the saved state.
+    fn restore_detached_windows(&mut self) -> Task<Message> {
+        let mut tasks = vec![];
+
+        for (layout_id, saved) in self.layout_manager.take_restorable() {
+            // Without a known monitor the saved coordinates cannot be trusted.
+            let position = if saved.monitor.is_some() {
+                window::Position::Specific(saved.spec.position())
+            } else {
+                window::Position::Centered
+            };
+            let (window_id, open_task) = window::open(window::Settings {
+                position,
+                size: saved.spec.size(),
+                exit_on_close_request: false,
+                min_size: Some(iced::Size::new(400.0, 300.0)),
+                ..window::settings()
+            });
+            tasks.push(open_task.discard());
+
+            self.layout_manager
+                .restore_detached(layout_id, window_id, saved);
+            self.restoring_windows.insert(window_id);
+
+            let own_window = window::Window::new(window_id);
+            if let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) {
+                // Layouts are saved with their popouts merged; fold in any stragglers.
+                let (_, merge_task) = dashboard.merge_all_popouts(&own_window);
+                let load_task = dashboard.load_layout(window_id);
+                tasks.push(self.map_dashboard_task(merge_task, Some(layout_id)));
+                tasks.push(self.map_dashboard_task(load_task, Some(layout_id)));
+            }
+        }
+
+        Task::batch(tasks)
     }
 
     fn load_layout(&mut self, layout_uid: uuid::Uuid, main_window: window::Id) -> Task<Message> {
@@ -1649,6 +2002,11 @@ impl Flowsurface {
                 }
             });
 
+        for (id, spec) in windows {
+            self.layout_manager
+                .record_window(*id, Some(spec.position()), Some(spec.size()));
+        }
+
         self.sidebar.sync_tickers_table_settings();
         self.layout_manager.sync_drawings(self.main_window.id);
 
@@ -1659,6 +2017,7 @@ impl Flowsurface {
                 ser_layouts.push(data::Layout {
                     name: layout.id.name.clone(),
                     dashboard: serialized_dashboard,
+                    detached: self.layout_manager.saved_placement(layout.id.unique),
                 });
             }
         }
