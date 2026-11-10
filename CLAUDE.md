@@ -56,8 +56,10 @@ cargo test -p flowsurface --bin flowsurface --locked  # GUI bin（目前沒有�
 cargo test -p flowsurface-data --lib --locked         # 指標 registry／loader／scripting，會載入 data/indicators/sources 內的全部 .ind
 cargo run --locked -p flowsurface-indicator-engine --bin flowsurface-indicator -- \
   test data/indicators/sources --namespace core       # 用合成 K 棒對內建指標做 smoke test
-cargo package --workspace --locked --target-dir "$(mktemp -d)"   # 確認各 crate 可以打包（改動 Cargo.toml 或新增檔案時執行）
+T=$(mktemp -d); cargo package --workspace --locked --target-dir "$T"; rm -rf "$T"   # 確認各 crate 可以打包（改動 Cargo.toml 或新增檔案時執行）
 ```
+
+暫存目錄用完即刪：`cargo package` 的 `--target-dir`（每次約 4 GB）與 `FLOWSURFACE_DATA_PATH=$(mktemp -d)` 這類目錄，指令結束就 `rm -rf`，不要留在 `$TMPDIR`。
 
 單一測試或部分測試：
 
