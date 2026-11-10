@@ -127,4 +127,12 @@
 - **合併衝突：** 一個功能一個分支，UI 改動盡量放在新增檔案。
 - **API 變動：** Binance 已在 2025-12 改過條件單 API，實作 F7 前要重新查兩家交易所的 changelog。
 - **本機風控的限制：** 帳戶回撤保護只在 app 執行中有效；真正的保護靠交易所端的止損單。
-- **待決定：** 交易只做手動下單，還是之後要接訊號自動下單？這會決定 F7 的架構與風控深度。
+- **已決定（2026-11-10）：**
+  - 交易只做手動下單；指標與訊號不能觸發下單。
+  - OKX 只支援 Global（`www.okx.com`／`openapi.okx.com`），UI 註明不支援 US／EEA 帳戶。
+  - Binance 現貨納入 M5。
+  - LIVE 帳戶一開始就能送單，每次送出前顯示 LIVE 警示並要求二次確認。
+- **官方文件核對後的差異（M5 設計依據）：**
+  - 雙向持倉下 Binance 與 OKX 都不能送 `reduceOnly`，保護單改靠 `positionSide`／`posSide` 與 `closePosition`／`closeFraction`。
+  - OKX 單張 `conditional` 同時帶 TP 與 SL 只會執行 SL，兩者並存必須用 `oco` 或 `attachAlgoOrds`。
+  - 下單取整要用交易所原始的 tickSize／stepSize 字串，不能用 `MinTicksize`（它會四捨五入成 10 的次方）。
