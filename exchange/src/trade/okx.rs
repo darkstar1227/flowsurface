@@ -174,12 +174,20 @@ pub fn place_order(i: &OkxEntry<'_>) -> Result<OkxRequest, TradeError> {
         Exec::Market => (None, "market"),
     };
     // Spot has a notional rule (market cap), so it needs the limit price or a reference.
-    check_order(
+    let order_value = check_order(
         i.rules,
         &qty,
         limit_px.as_ref().or(i.ref_price.as_ref()),
         market,
     )?;
+    // A plain spot sell is not reduce-only (F4): it counts as adding. Only a swap close reduces.
+    let reduces = matches!(
+        i.target,
+        OkxTarget::Swap {
+            action: Action::Close(_),
+            ..
+        }
+    );
 
     // Attached orders are relative to the main order. Only an entry (spot buy, swap open)
     // may carry them; on a sell or a close they would sit on the wrong side.
@@ -200,7 +208,7 @@ pub fn place_order(i: &OkxEntry<'_>) -> Result<OkxRequest, TradeError> {
         None => Vec::new(),
     };
 
-    Ok(OkxRequest::new(
+    let request = OkxRequest::new(
         Method::Post,
         "/api/v5/trade/order".to_string(),
         Some(OkxBody::Order(OkxOrderBody {
@@ -218,7 +226,16 @@ pub fn place_order(i: &OkxEntry<'_>) -> Result<OkxRequest, TradeError> {
             cl_ord_id,
             attach_algo_ords,
         })),
-    ))
+    );
+    // The single-order cap is in USDT. A spot pair quoted in another currency cannot be valued
+    // in USDT, so its value is unknown and the cap refuses it (item 9: the cap applies to
+    // USDT-quoted pairs only; `maxMktAmt` is not used).
+    let usdt_valued = c.swap || i.rules.symbol().as_str().ends_with("-USDT");
+    Ok(if reduces {
+        request.reducing()
+    } else {
+        request.adding(order_value.filter(|_| usdt_valued))
+    })
 }
 
 fn attach_algo(
@@ -326,6 +343,7 @@ pub fn place_algo(i: &OkxProtective<'_>) -> Result<OkxRequest, TradeError> {
     let sl = leg(i.rules, c.dir, true, i.sl_trigger, &i.ref_price)?;
     let ty = i.trigger_type.okx();
 
+    // Protective orders only ever close (condition 64, 71).
     Ok(OkxRequest::new(
         Method::Post,
         "/api/v5/trade/order-algo".to_string(),
@@ -348,7 +366,39 @@ pub fn place_algo(i: &OkxProtective<'_>) -> Result<OkxRequest, TradeError> {
             sl_trigger_px: sl,
             algo_cl_ord_id,
         })),
-    ))
+    )
+    .reducing())
+}
+
+/// `POST /api/v5/trade/close-position`: close a whole swap position at market (condition
+/// 70). Checked against the official docs copy: `instId`, `mgnMode`, `posSide` (required in
+/// long/short mode, only `net` or omitted in net mode), `clOrdId`.
+pub fn close_position(
+    rules: &SymbolRules,
+    mode: Option<PositionMode>,
+    margin: MarginMode,
+    dir: Dir,
+    client_id: &ClientId,
+) -> Result<OkxRequest, TradeError> {
+    rules.require_product(TradeProduct::OkxSwap)?;
+    let mode = mode.ok_or(TradeError::PositionModeUnknown)?;
+    let cl_ord_id = client_id.check(IdField::Okx)?.to_string();
+    Ok(OkxRequest::new(
+        Method::Post,
+        "/api/v5/trade/close-position".to_string(),
+        Some(OkxBody::ClosePosition(
+            super::request::OkxClosePositionBody {
+                inst_id: rules.symbol().as_str().to_string(),
+                pos_side: (mode == PositionMode::Hedge).then_some(match dir {
+                    Dir::Long => "long",
+                    Dir::Short => "short",
+                }),
+                mgn_mode: margin.okx(),
+                cl_ord_id: Some(cl_ord_id),
+            },
+        )),
+    )
+    .reducing())
 }
 
 fn ref_fields(order: &OrderRef) -> Result<(Option<String>, Option<String>), TradeError> {
@@ -1121,5 +1171,80 @@ mod tests {
         assert_eq!(place_order(&e).unwrap_err(), TradeError::QtyAboveMax);
         e.qty = d("20000");
         assert!(place_order(&e).is_ok());
+    }
+
+    #[test]
+    fn close_position_body_and_mode() {
+        let t = okx_swap_table();
+        let r = t.lookup("BTC-USDT-SWAP").unwrap();
+        let cid = id("eAAAA");
+        let net_req = close_position(r, net(), MarginMode::Cross, Dir::Long, &cid).unwrap();
+        assert_eq!(net_req.path(), "/api/v5/trade/close-position");
+        assert_eq!(net_req.exposure(), super::super::request::Exposure::Reduces);
+        let v: serde_json::Value = serde_json::from_str(&body(&net_req)).unwrap();
+        assert_eq!(v["instId"], "BTC-USDT-SWAP");
+        assert_eq!(v["mgnMode"], "cross");
+        assert_eq!(v["clOrdId"], "eAAAA");
+        assert!(v.get("posSide").is_none(), "net mode sends no posSide");
+        let hedge =
+            close_position(r, long_short(), MarginMode::Isolated, Dir::Short, &cid).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body(&hedge)).unwrap();
+        assert_eq!(v["posSide"], "short");
+        assert_eq!(v["mgnMode"], "isolated");
+        // the position mode must be known, and the product must be a swap
+        assert!(close_position(r, None, MarginMode::Cross, Dir::Long, &cid).is_err());
+        let spot_t = okx_spot_table();
+        assert!(
+            close_position(
+                spot_t.lookup("BTC-USDT").unwrap(),
+                net(),
+                MarginMode::Cross,
+                Dir::Long,
+                &cid
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn spot_pairs_not_quoted_in_usdt_have_no_cap_value() {
+        use super::super::request::Exposure;
+        let resp = serde_json::json!({"code": "0", "data": [
+            {"instType": "SPOT", "instId": "BTC-EUR", "ctVal": "", "ctType": "",
+             "lotSz": "0.00000001", "minSz": "0.00001", "maxLmtSz": "9999999999", "maxMktSz": "1000000",
+             "tickSz": "0.1", "state": "live"}
+        ]});
+        let t = super::super::rules::RulesTable::from_okx_instruments(
+            TradeProduct::OkxSpot,
+            &resp,
+            1_000,
+        )
+        .unwrap();
+        let cid = id("eAAAA");
+        let mk = |rules| {
+            place_order(&OkxEntry {
+                rules,
+                target: OkxTarget::Spot { side: Side::Buy },
+                qty: d("0.1"),
+                exec: Exec::Limit {
+                    price: d("60000"),
+                    tif: TimeInForce::Gtc,
+                },
+                ref_price: Some(d("60000")),
+                client_id: &cid,
+                attach: None,
+            })
+            .unwrap()
+            .exposure()
+        };
+        assert_eq!(
+            mk(t.lookup("BTC-EUR").unwrap()),
+            Exposure::Adds { notional: None }
+        );
+        let usdt = okx_spot_table();
+        assert!(matches!(
+            mk(usdt.lookup("BTC-USDT").unwrap()),
+            Exposure::Adds { notional: Some(_) }
+        ));
     }
 }

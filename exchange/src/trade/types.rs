@@ -60,6 +60,7 @@ pub enum TradeError {
     OrderIdInvalid,
     /// The protective sell is larger than the available balance.
     ExceedsAvailable,
+    AutoPathMustReduce,
 }
 
 impl fmt::Display for TradeError {
@@ -98,6 +99,7 @@ impl fmt::Display for TradeError {
             TradeError::ClientIdInvalid => "client id does not match the venue's pattern",
             TradeError::OrderIdInvalid => "order id must be a plain number",
             TradeError::ExceedsAvailable => "quantity exceeds the available balance",
+            TradeError::AutoPathMustReduce => "automatic paths may only reduce, close or cancel",
         };
         f.write_str(text)
     }

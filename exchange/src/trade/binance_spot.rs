@@ -40,7 +40,7 @@ pub fn new_order(i: &SpotEntry<'_>) -> Result<BinanceRequest, TradeError> {
         Exec::Market => (None, None),
     };
     let price = limit_price.as_ref().or(i.ref_price.as_ref());
-    check_order(i.rules, &qty, price, market)?;
+    let order_value = check_order(i.rules, &qty, price, market)?;
 
     let mut r = BinanceRequest::new(Method::Post, "/api/v3/order");
     r.push("symbol", i.rules.symbol().as_str());
@@ -52,7 +52,10 @@ pub fn new_order(i: &SpotEntry<'_>) -> Result<BinanceRequest, TradeError> {
     r.push("quantity", qty.to_plain_string());
     r.push_opt("price", limit_price.map(|p| p.to_plain_string()));
     r.push("newClientOrderId", id);
-    Ok(r)
+    // A plain spot sell is not reduce-only: a repeat would sell more of the holding, and in a
+    // non-USDT pair it buys the quote asset. It counts as adding (F4); only the protective
+    // orders bound to a holding stay `Reduces`.
+    Ok(r.adding(order_value))
 }
 
 fn order_type(kind: ProtectiveKind) -> &'static str {
@@ -68,7 +71,7 @@ fn order_type(kind: ProtectiveKind) -> &'static str {
 /// `POST /api/v3/order`: a protective sell of a spot holding (long only). The sell
 /// quantity must be checked against the available balance by the caller
 /// ([`super::checks::check_protective_qty_available`]).
-pub fn new_protective_order(
+pub(crate) fn build_protective_order(
     rules: &SymbolRules,
     p: &Protective<'_>,
 ) -> Result<BinanceRequest, TradeError> {
@@ -132,7 +135,7 @@ pub fn new_protective_order(
     r.push_opt("stopPrice", trigger.map(|t| t.to_plain_string()));
     r.push_opt("trailingDelta", trailing_delta.map(|b| b.to_string()));
     r.push("newClientOrderId", id);
-    Ok(r)
+    Ok(r.reducing())
 }
 
 /// The sell pair of an OCO or OTOCO: a take-profit `LIMIT_MAKER` above and a stop below.
@@ -189,7 +192,7 @@ pub struct SpotOco<'a> {
 }
 
 /// `POST /api/v3/orderList/oco`: sell with a take-profit above and a stop below.
-pub fn new_oco(i: &SpotOco<'_>) -> Result<BinanceRequest, TradeError> {
+pub(crate) fn build_oco(i: &SpotOco<'_>) -> Result<BinanceRequest, TradeError> {
     i.rules.require_product(PRODUCT)?;
     let list_id = i.list_id.check(IdField::BinanceSpot)?;
     let ex = round_exits(i.rules, &i.exits)?;
@@ -215,7 +218,7 @@ pub fn new_oco(i: &SpotOco<'_>) -> Result<BinanceRequest, TradeError> {
     r.push("aboveClientOrderId", i.exits.take_profit_id.as_str());
     r.push("abovePrice", ex.tp.to_plain_string());
     push_below(&mut r, OCO_BELOW, &ex, &i.exits);
-    Ok(r)
+    Ok(r.reducing())
 }
 
 /// Parameter names of the stop leg: `[type, clientOrderId, price, stopPrice, timeInForce]`.
@@ -267,7 +270,12 @@ pub struct SpotOtoco<'a> {
 }
 
 /// `POST /api/v3/orderList/otoco`: a buy limit that triggers a sell OCO pair.
-pub fn new_otoco(i: &SpotOtoco<'_>) -> Result<BinanceRequest, TradeError> {
+#[cfg(test)]
+pub(crate) fn build_otoco(i: &SpotOtoco<'_>) -> Result<BinanceRequest, TradeError> {
+    otoco_with_fee(i, 0)
+}
+
+fn otoco_with_fee(i: &SpotOtoco<'_>, fee_bps: u32) -> Result<BinanceRequest, TradeError> {
     i.rules.require_product(PRODUCT)?;
     let list_id = i.list_id.check(IdField::BinanceSpot)?;
     let entry_id = i.entry_id.check(IdField::BinanceSpot)?;
@@ -286,8 +294,11 @@ pub fn new_otoco(i: &SpotOtoco<'_>) -> Result<BinanceRequest, TradeError> {
     {
         return Err(TradeError::TriggerOnWrongSide);
     }
-    check_order(i.rules, &qty, Some(&entry), false)?;
+    let order_value = check_order(i.rules, &qty, Some(&entry), false)?;
     check_qty(i.rules, &qty, false)?;
+    // The buy fee is taken from the base asset, so the exit pair may only sell what is left.
+    let pending_qty = after_fee(i.rules, &qty, fee_bps)?;
+    check_qty(i.rules, &pending_qty, false)?;
 
     let mut r = BinanceRequest::new(Method::Post, "/api/v3/orderList/otoco");
     r.push("symbol", i.rules.symbol().as_str());
@@ -299,12 +310,48 @@ pub fn new_otoco(i: &SpotOtoco<'_>) -> Result<BinanceRequest, TradeError> {
     r.push("workingQuantity", qty.to_plain_string());
     r.push("workingTimeInForce", i.entry_tif.binance());
     r.push("pendingSide", "SELL");
-    r.push("pendingQuantity", qty.to_plain_string());
+    r.push("pendingQuantity", pending_qty.to_plain_string());
     r.push("pendingAboveType", "LIMIT_MAKER");
     r.push("pendingAboveClientOrderId", i.exits.take_profit_id.as_str());
     r.push("pendingAbovePrice", ex.tp.to_plain_string());
     push_below(&mut r, OTOCO_BELOW, &ex, &i.exits);
-    Ok(r)
+    Ok(r.adding(order_value))
+}
+
+/// `quantity * (10000 - fee_bps) / 10000`, rounded down to the lot step.
+fn after_fee(rules: &SymbolRules, qty: &Decimal, fee_bps: u32) -> Result<Decimal, TradeError> {
+    if fee_bps >= 10_000 {
+        return Err(TradeError::NonPositive);
+    }
+    let factor =
+        Decimal::from_int(i64::from(10_000 - fee_bps)).checked_mul(&Decimal::parse("0.0001")?)?;
+    rules.round_qty(&qty.checked_mul(&factor)?, false)
+}
+
+/// `POST /api/v3/order` (protective sell). The sell quantity may not exceed `available`, the
+/// free base-asset balance after fees (condition 64).
+pub fn new_protective_order(
+    rules: &SymbolRules,
+    p: &Protective<'_>,
+    available: &Decimal,
+) -> Result<BinanceRequest, TradeError> {
+    if let Size::Qty(q) = p.size {
+        super::checks::check_protective_qty_available(&rules.round_qty(&q, false)?, available)?;
+    }
+    build_protective_order(rules, p)
+}
+
+/// `POST /api/v3/orderList/oco`; the quantity may not exceed `available` (free balance
+/// after fees).
+pub fn new_oco(i: &SpotOco<'_>, available: &Decimal) -> Result<BinanceRequest, TradeError> {
+    super::checks::check_protective_qty_available(&i.rules.round_qty(&i.qty, false)?, available)?;
+    build_oco(i)
+}
+
+/// `POST /api/v3/orderList/otoco`; the exit pair sells the filled quantity less the buy fee
+/// (`fee_bps`, taken in the base asset, rounded down). A fee paid in BNB is not assumed.
+pub fn new_otoco(i: &SpotOtoco<'_>, fee_bps: u32) -> Result<BinanceRequest, TradeError> {
+    otoco_with_fee(i, fee_bps)
 }
 
 /// `DELETE /api/v3/order`.
@@ -461,7 +508,9 @@ mod tests {
         let rules = t.lookup("BTCUSDT").unwrap();
         let cid = id("sBBBB");
         assert_eq!(
-            signed(&new_protective_order(rules, &prot(ProtectiveKind::StopMarket, &cid)).unwrap()),
+            signed(
+                &build_protective_order(rules, &prot(ProtectiveKind::StopMarket, &cid)).unwrap()
+            ),
             format!(
                 "symbol=BTCUSDT&side=SELL&type=STOP_LOSS&quantity=0.12345&stopPrice=59000&newClientOrderId=sBBBB{TAIL}"
             )
@@ -469,7 +518,7 @@ mod tests {
         let mut tp = prot(ProtectiveKind::TakeProfitMarket, &cid);
         tp.trigger_price = Some(d("61000"));
         assert_eq!(
-            signed(&new_protective_order(rules, &tp).unwrap()),
+            signed(&build_protective_order(rules, &tp).unwrap()),
             format!(
                 "symbol=BTCUSDT&side=SELL&type=TAKE_PROFIT&quantity=0.12345&stopPrice=61000&newClientOrderId=sBBBB{TAIL}"
             )
@@ -477,7 +526,7 @@ mod tests {
         let mut sl = prot(ProtectiveKind::StopLimit, &cid);
         sl.limit_price = Some(d("58990.001"));
         assert_eq!(
-            signed(&new_protective_order(rules, &sl).unwrap()),
+            signed(&build_protective_order(rules, &sl).unwrap()),
             format!(
                 "symbol=BTCUSDT&side=SELL&type=STOP_LOSS_LIMIT&timeInForce=GTC&quantity=0.12345&price=58990.01&stopPrice=59000&newClientOrderId=sBBBB{TAIL}"
             )
@@ -493,7 +542,7 @@ mod tests {
         tr.trigger_price = None;
         tr.trailing = Some(Trailing::DeltaBips(150));
         assert_eq!(
-            signed(&new_protective_order(rules, &tr).unwrap()),
+            signed(&build_protective_order(rules, &tr).unwrap()),
             format!(
                 "symbol=BTCUSDT&side=SELL&type=STOP_LOSS&quantity=0.12345&trailingDelta=150&newClientOrderId=rCCCC{TAIL}"
             )
@@ -501,13 +550,13 @@ mod tests {
         for bips in [9, 2001, 0, u32::MAX] {
             tr.trailing = Some(Trailing::DeltaBips(bips));
             assert_eq!(
-                new_protective_order(rules, &tr).unwrap_err(),
+                build_protective_order(rules, &tr).unwrap_err(),
                 TradeError::TrailingDeltaOutOfRange
             );
         }
         for bips in [10, 2000] {
             tr.trailing = Some(Trailing::DeltaBips(bips));
-            assert!(new_protective_order(rules, &tr).is_ok());
+            assert!(build_protective_order(rules, &tr).is_ok());
         }
         // a symbol without a TRAILING_DELTA filter cannot take a trailing stop
         let odd = t.lookup("ODDUSDT").unwrap();
@@ -515,7 +564,7 @@ mod tests {
         tr.ref_price = d("100");
         tr.size = Size::Qty(d("2"));
         assert_eq!(
-            new_protective_order(odd, &tr).unwrap_err(),
+            build_protective_order(odd, &tr).unwrap_err(),
             TradeError::RuleMissing
         );
     }
@@ -528,19 +577,19 @@ mod tests {
         let mut p = prot(ProtectiveKind::StopMarket, &cid);
         p.dir = Dir::Short;
         assert_eq!(
-            new_protective_order(rules, &p).unwrap_err(),
+            build_protective_order(rules, &p).unwrap_err(),
             TradeError::Unsupported
         );
         let mut p = prot(ProtectiveKind::StopMarket, &cid);
         p.size = Size::ClosePosition;
         assert_eq!(
-            new_protective_order(rules, &p).unwrap_err(),
+            build_protective_order(rules, &p).unwrap_err(),
             TradeError::ClosePositionNotAllowed
         );
         let mut p = prot(ProtectiveKind::StopMarket, &cid);
         p.trigger_price = Some(d("60500"));
         assert_eq!(
-            new_protective_order(rules, &p).unwrap_err(),
+            build_protective_order(rules, &p).unwrap_err(),
             TradeError::TriggerOnWrongSide
         );
     }
@@ -568,7 +617,7 @@ mod tests {
             exits: exits(&tp, &sl, None),
             list_id: &list,
         };
-        let r = new_oco(&i).unwrap();
+        let r = build_oco(&i).unwrap();
         assert_eq!(r.path(), "/api/v3/orderList/oco");
         assert_eq!(
             signed(&r),
@@ -581,7 +630,7 @@ mod tests {
             ..i
         };
         assert_eq!(
-            signed(&new_oco(&i2).unwrap()),
+            signed(&build_oco(&i2).unwrap()),
             format!(
                 "symbol=BTCUSDT&listClientOrderId=lDDDD&side=SELL&quantity=0.12345&aboveType=LIMIT_MAKER&aboveClientOrderId=tEEEE&abovePrice=61000.01&belowType=STOP_LOSS_LIMIT&belowClientOrderId=sFFFF&belowPrice=58990.01&belowStopPrice=59000&belowTimeInForce=GTC{TAIL}"
             )
@@ -591,7 +640,7 @@ mod tests {
             ref_price: d("62000"),
             ..i
         };
-        assert_eq!(new_oco(&bad).unwrap_err(), TradeError::TriggerOnWrongSide);
+        assert_eq!(build_oco(&bad).unwrap_err(), TradeError::TriggerOnWrongSide);
     }
 
     #[test]
@@ -608,7 +657,7 @@ mod tests {
             list_id: &list,
             entry_id: &entry,
         };
-        let r = new_otoco(&i).unwrap();
+        let r = build_otoco(&i).unwrap();
         assert_eq!(r.path(), "/api/v3/orderList/otoco");
         assert_eq!(
             signed(&r),
@@ -620,7 +669,10 @@ mod tests {
             entry_price: d("58000"),
             ..i
         };
-        assert_eq!(new_otoco(&bad).unwrap_err(), TradeError::TriggerOnWrongSide);
+        assert_eq!(
+            build_otoco(&bad).unwrap_err(),
+            TradeError::TriggerOnWrongSide
+        );
     }
 
     #[test]
@@ -686,7 +738,7 @@ mod tests {
         let rules = t.lookup("BTCUSDT").unwrap();
         let (list, tp, sl, entry) = (id("lDDDD"), id("tEEEE"), id("sFFFF"), id("eGGGG"));
         let oco = |list: &ClientId, tp: &ClientId, sl: &ClientId| {
-            new_oco(&SpotOco {
+            build_oco(&SpotOco {
                 rules,
                 qty: d("0.12345678"),
                 ref_price: d("60000"),
@@ -700,7 +752,7 @@ mod tests {
         }
 
         let otoco = |list: &ClientId, entry: &ClientId, tp: &ClientId, sl: &ClientId| {
-            new_otoco(&SpotOtoco {
+            build_otoco(&SpotOtoco {
                 rules,
                 qty: d("0.12345678"),
                 entry_price: d("60000"),
@@ -721,5 +773,43 @@ mod tests {
         ] {
             assert_eq!(r.unwrap_err(), TradeError::ClientIdsNotDistinct);
         }
+    }
+
+    #[test]
+    fn otoco_exit_quantity_is_floored_by_the_buy_fee() {
+        let t = spot();
+        let rules = t.lookup("BTCUSDT").unwrap();
+        let (list, tp, sl, entry) = (id("lDDDD"), id("tEEEE"), id("sFFFF"), id("eGGGG"));
+        let i = SpotOtoco {
+            rules,
+            qty: d("0.12345"),
+            entry_price: d("60000"),
+            entry_tif: TimeInForce::Gtc,
+            exits: exits(&tp, &sl, None),
+            list_id: &list,
+            entry_id: &entry,
+        };
+        // 10 bps fee: 0.12345 * 0.999 = 0.12332655, floored to the 0.00001 step
+        let s = signed(&new_otoco(&i, 10).unwrap());
+        assert!(s.contains("workingQuantity=0.12345&"), "{s}");
+        assert!(s.contains("pendingQuantity=0.12332&"), "{s}");
+        // no fee: the old behaviour
+        assert!(signed(&new_otoco(&i, 0).unwrap()).contains("pendingQuantity=0.12345&"));
+    }
+
+    #[test]
+    fn oco_sell_cannot_exceed_the_available_balance() {
+        let t = spot();
+        let rules = t.lookup("BTCUSDT").unwrap();
+        let (list, tp, sl) = (id("lDDDD"), id("tEEEE"), id("sFFFF"));
+        let i = SpotOco {
+            rules,
+            qty: d("0.1"),
+            ref_price: d("60000"),
+            exits: exits(&tp, &sl, None),
+            list_id: &list,
+        };
+        assert!(new_oco(&i, &d("0.09")).is_err());
+        assert!(new_oco(&i, &d("0.1")).is_ok());
     }
 }

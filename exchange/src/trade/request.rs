@@ -7,7 +7,40 @@ use crate::signing::{BinanceSigned, OkxSigned, binance_signed_form, okx_signed_j
 use serde::Serialize;
 use std::fmt;
 
+use super::decimal::Decimal;
+use super::okx::OkxAlgoType;
 use super::types::TradeError;
+
+/// What a request does to the account's exposure. Set by the builders, never by the caller:
+/// the default for anything that is not a cancel or a read is "adds" (fail safe), so a
+/// request can only be sent as a reducing one if the builder said so (condition 71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exposure {
+    /// Opens or grows a position. `notional` is the order value in the quote currency when
+    /// the builder could compute it (limit price or reference price known).
+    Adds { notional: Option<Decimal> },
+    /// Only closes or reduces (reduce-only, close, protective orders).
+    Reduces,
+    /// Cancels and reads.
+    Neutral,
+}
+
+/// How to find an order again by its client id (Unknown outcome flow, condition 60).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupKind {
+    FuturesOrder,
+    FuturesAlgo,
+    SpotOrder,
+    SpotList,
+    OkxOrder,
+    OkxAlgo(OkxAlgoType),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Lookup {
+    pub(crate) kind: LookupKind,
+    pub(crate) client_id: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -33,6 +66,7 @@ pub struct BinanceRequest {
     method: Method,
     path: &'static str,
     params: Vec<(&'static str, String)>,
+    exposure: Exposure,
 }
 
 // Masked: the parameters are the order.
@@ -53,7 +87,68 @@ impl BinanceRequest {
             method,
             path,
             params: Vec::new(),
+            exposure: match method {
+                Method::Post => Exposure::Adds { notional: None },
+                Method::Get | Method::Delete => Exposure::Neutral,
+            },
         }
+    }
+
+    pub(crate) fn reducing(mut self) -> Self {
+        self.exposure = Exposure::Reduces;
+        self
+    }
+
+    pub(crate) fn adding(mut self, notional: Option<Decimal>) -> Self {
+        self.exposure = Exposure::Adds { notional };
+        self
+    }
+
+    pub fn exposure(&self) -> Exposure {
+        self.exposure
+    }
+
+    fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn symbol(&self) -> Option<&str> {
+        self.param("symbol")
+    }
+
+    /// Every client id in the request (entry, legs, list).
+    pub fn client_ids(&self) -> Vec<&str> {
+        self.params
+            .iter()
+            .filter(|(n, _)| n.ends_with("ClientOrderId") || *n == "clientAlgoId")
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    /// Where to look the order up by client id, from the endpoint that created it.
+    /// Only a placing request (POST) has something to look up: a cancel (DELETE) carries the
+    /// id of the order it cancels, and finding that order says nothing about the cancel (F1).
+    /// An unknown cancel is judged by reading the open orders again.
+    pub(crate) fn lookup(&self) -> Option<Lookup> {
+        if self.method != Method::Post {
+            return None;
+        }
+        let (kind, name) = match self.path {
+            "/fapi/v1/order" => (LookupKind::FuturesOrder, "newClientOrderId"),
+            "/fapi/v1/algoOrder" => (LookupKind::FuturesAlgo, "clientAlgoId"),
+            "/api/v3/order" => (LookupKind::SpotOrder, "newClientOrderId"),
+            "/api/v3/orderList/oco" | "/api/v3/orderList/otoco" => {
+                (LookupKind::SpotList, "listClientOrderId")
+            }
+            _ => return None,
+        };
+        Some(Lookup {
+            kind,
+            client_id: self.param(name)?.to_string(),
+        })
     }
 
     pub(crate) fn push(&mut self, name: &'static str, value: impl Into<String>) {
@@ -81,7 +176,7 @@ impl BinanceRequest {
 
     /// Encode, add `recvWindow` and `timestamp`, and sign. `signed.query` is the signed
     /// string; `signed.body` is what is sent (POST body, or after `?` for GET/DELETE).
-    pub fn signed(
+    pub(crate) fn signed(
         &self,
         secret: &str,
         recv_window_ms: u32,
@@ -106,6 +201,7 @@ pub(crate) enum OkxBody {
     Algo(OkxAlgoBody),
     CancelOrder(OkxCancelOrderBody),
     CancelAlgos(Vec<OkxCancelAlgo>),
+    ClosePosition(OkxClosePositionBody),
 }
 
 /// An OKX request. For GET the query is part of `path` and there is no body, which is
@@ -128,6 +224,7 @@ pub struct OkxRequest {
     method: Method,
     path: String,
     body: Option<OkxBody>,
+    exposure: Exposure,
 }
 
 impl fmt::Debug for OkxRequest {
@@ -145,7 +242,83 @@ impl fmt::Debug for OkxRequest {
 
 impl OkxRequest {
     pub(crate) fn new(method: Method, path: String, body: Option<OkxBody>) -> Self {
-        OkxRequest { method, path, body }
+        let neutral = method != Method::Post
+            || path.ends_with("/cancel-order")
+            || path.ends_with("/cancel-algos");
+        OkxRequest {
+            method,
+            path,
+            body,
+            exposure: if neutral {
+                Exposure::Neutral
+            } else {
+                Exposure::Adds { notional: None }
+            },
+        }
+    }
+
+    pub(crate) fn reducing(mut self) -> Self {
+        self.exposure = Exposure::Reduces;
+        self
+    }
+
+    pub(crate) fn adding(mut self, notional: Option<Decimal>) -> Self {
+        self.exposure = Exposure::Adds { notional };
+        self
+    }
+
+    pub fn exposure(&self) -> Exposure {
+        self.exposure
+    }
+
+    pub fn symbol(&self) -> Option<&str> {
+        match self.body.as_ref()? {
+            OkxBody::Order(b) => Some(&b.inst_id),
+            OkxBody::Algo(b) => Some(&b.inst_id),
+            OkxBody::CancelOrder(b) => Some(&b.inst_id),
+            OkxBody::CancelAlgos(v) => v.first().map(|c| c.inst_id.as_str()),
+            OkxBody::ClosePosition(b) => Some(&b.inst_id),
+        }
+    }
+
+    pub fn client_ids(&self) -> Vec<&str> {
+        match &self.body {
+            Some(OkxBody::Order(b)) => std::iter::once(b.cl_ord_id.as_str())
+                .chain(
+                    b.attach_algo_ords
+                        .iter()
+                        .map(|a| a.attach_algo_cl_ord_id.as_str()),
+                )
+                .collect(),
+            Some(OkxBody::Algo(b)) => vec![b.algo_cl_ord_id.as_str()],
+            Some(OkxBody::ClosePosition(b)) => b.cl_ord_id.as_deref().into_iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn lookup(&self) -> Option<Lookup> {
+        match self.body.as_ref()? {
+            OkxBody::Order(b) => Some(Lookup {
+                kind: LookupKind::OkxOrder,
+                client_id: b.cl_ord_id.clone(),
+            }),
+            OkxBody::Algo(b) => {
+                let kind = match b.ord_type {
+                    "conditional" => OkxAlgoType::Conditional,
+                    "oco" => OkxAlgoType::Oco,
+                    _ => return None,
+                };
+                Some(Lookup {
+                    kind: LookupKind::OkxAlgo(kind),
+                    client_id: b.algo_cl_ord_id.clone(),
+                })
+            }
+            OkxBody::ClosePosition(b) => Some(Lookup {
+                kind: LookupKind::OkxOrder,
+                client_id: b.cl_ord_id.clone()?,
+            }),
+            _ => None,
+        }
     }
 
     pub fn method(&self) -> Method {
@@ -157,7 +330,7 @@ impl OkxRequest {
     }
 
     /// Serialise the body once, sign that exact string, and return both.
-    pub fn signed(&self, secret: &str, timestamp: &str) -> Result<OkxSigned, TradeError> {
+    pub(crate) fn signed(&self, secret: &str, timestamp: &str) -> Result<OkxSigned, TradeError> {
         match &self.body {
             Some(body) => {
                 Ok(
@@ -269,4 +442,16 @@ pub(crate) struct OkxCancelAlgo {
     pub(crate) algo_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) algo_cl_ord_id: Option<String>,
+}
+
+/// `POST /api/v5/trade/close-position`: a market close of a whole position.
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OkxClosePositionBody {
+    pub(crate) inst_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pos_side: Option<&'static str>,
+    pub(crate) mgn_mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cl_ord_id: Option<String>,
 }

@@ -53,11 +53,12 @@ pub fn new_order(i: &FuturesEntry<'_>) -> Result<BinanceRequest, TradeError> {
     };
     // A closing order is exempt from the minimum notional on the exchange: only check size,
     // so a small position can always be closed.
+    let mut order_value = None;
     if i.action.is_close() {
         check_qty(i.rules, &qty, market)?;
     } else {
         let price = limit_price.as_ref().or(i.ref_price.as_ref());
-        check_order(i.rules, &qty, price, market)?;
+        order_value = check_order(i.rules, &qty, price, market)?;
     }
 
     let mut r = BinanceRequest::new(Method::Post, "/fapi/v1/order");
@@ -77,7 +78,11 @@ pub fn new_order(i: &FuturesEntry<'_>) -> Result<BinanceRequest, TradeError> {
         r.push("reduceOnly", "true");
     }
     r.push("newClientOrderId", id);
-    Ok(r)
+    Ok(if i.action.is_close() {
+        r.reducing()
+    } else {
+        r.adding(order_value)
+    })
 }
 
 fn algo_type(kind: ProtectiveKind) -> &'static str {
@@ -199,7 +204,8 @@ pub fn new_algo_order(
     r.push_opt("activatePrice", activate_price.map(|a| a.to_plain_string()));
     r.push_opt("callbackRate", callback_rate.map(|c| c.to_plain_string()));
     r.push("clientAlgoId", id);
-    Ok(r)
+    // Protective orders only ever close (condition 64, 71).
+    Ok(r.reducing())
 }
 
 /// `DELETE /fapi/v1/order`.
