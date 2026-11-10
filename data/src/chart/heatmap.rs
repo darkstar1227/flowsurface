@@ -111,6 +111,10 @@ const fn default_depth_contrast() -> f32 {
     1.0
 }
 
+const fn default_show_drawings() -> bool {
+    true
+}
+
 pub const TRADE_MAX_RADIUS_RANGE: (f32, f32) = (4.0, 80.0);
 pub const VOLUME_PROFILE_WIDTH_RANGE: (f32, f32) = (0.02, 0.40);
 pub const DEPTH_CONTRAST_RANGE: (f32, f32) = (0.25, 4.0);
@@ -137,6 +141,9 @@ pub struct Config {
     /// Exponent applied to the normalised quantity; above 1 darkens small orders.
     #[serde(default = "default_depth_contrast")]
     pub depth_contrast: f32,
+    /// Whether the drawings shared with the kline chart are shown and editable on this pane.
+    #[serde(default = "default_show_drawings")]
+    pub show_drawings: bool,
 }
 
 impl Default for Config {
@@ -153,6 +160,7 @@ impl Default for Config {
             depth_cap: DepthCap::default(),
             depth_log: false,
             depth_contrast: default_depth_contrast(),
+            show_drawings: default_show_drawings(),
         }
     }
 }
@@ -1007,6 +1015,17 @@ mod visual_tests {
         assert!(!cfg.depth_log);
         assert_eq!(cfg.depth_contrast, 1.0);
         assert_eq!(cfg.volume_profile_width_pct, 0.10);
+        assert!(cfg.show_drawings);
+    }
+
+    #[test]
+    fn show_drawings_round_trips_when_hidden() {
+        let cfg = Config {
+            show_drawings: false,
+            ..Config::default()
+        };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(!back.show_drawings);
     }
 
     #[test]

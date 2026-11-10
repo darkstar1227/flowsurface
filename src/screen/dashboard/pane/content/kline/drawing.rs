@@ -232,7 +232,7 @@ pub enum DrawingUpdate {
 }
 
 impl DrawingUpdate {
-    pub(super) fn should_bump(self) -> bool {
+    pub(crate) fn should_bump(self) -> bool {
         matches!(
             self,
             Self::Visual
@@ -249,9 +249,9 @@ impl DrawingUpdate {
 }
 
 #[derive(Default)]
-pub(super) struct DrawingState {
+pub(crate) struct DrawingState {
     history: DrawingHistory,
-    pub(super) tools: DrawingTools,
+    pub(crate) tools: DrawingTools,
     pub(super) floating_toolbar: FloatingToolbarState,
 }
 
@@ -262,7 +262,15 @@ pub enum Event {
 }
 
 impl DrawingState {
-    pub(super) fn update(&mut self, event: Event, settings: &mut DrawingSettings) -> DrawingUpdate {
+    /// State for a chart without candles (the heatmap): no measure tool, no magnet.
+    pub(crate) fn without_bar_tools() -> Self {
+        Self {
+            tools: DrawingTools::without_bar_tools(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn update(&mut self, event: Event, settings: &mut DrawingSettings) -> DrawingUpdate {
         let update = match event {
             Event::Tools(
                 message @ (DrawingMessage::SetSelectedDrawingStrokeColor(_)
@@ -304,7 +312,7 @@ impl DrawingState {
         update
     }
 
-    pub(super) fn handle_widget_drawing_event(
+    pub(crate) fn handle_widget_drawing_event(
         &mut self,
         event: KlineWidgetDrawingEvent,
         settings: &DrawingSettings,
@@ -333,21 +341,29 @@ impl DrawingState {
         update
     }
 
-    pub(super) fn handle_escape(&mut self) -> DrawingUpdate {
+    pub(crate) fn handle_escape(&mut self) -> DrawingUpdate {
         let update = self.tools.handle_escape();
         self.history.finish_if_idle(&self.tools);
         update
     }
 
-    pub(super) fn finish_pending_edit(&mut self) {
+    pub(crate) fn finish_pending_edit(&mut self) {
         self.history.finish_drawing(|| self.tools.edit_state());
     }
 
-    pub(super) fn clear_history(&mut self) {
+    pub(crate) fn clear_history(&mut self) {
         self.history.clear();
     }
 
-    pub(super) fn undo(&mut self) -> bool {
+    pub(crate) fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    pub(crate) fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    pub(crate) fn undo(&mut self) -> bool {
         self.finish_pending_edit();
         let Some(entry) = self.history.pop_undo() else {
             return false;
@@ -357,7 +373,7 @@ impl DrawingState {
         true
     }
 
-    pub(super) fn redo(&mut self) -> bool {
+    pub(crate) fn redo(&mut self) -> bool {
         self.finish_pending_edit();
         let Some(entry) = self.history.pop_redo() else {
             return false;
@@ -367,7 +383,7 @@ impl DrawingState {
         true
     }
 
-    pub(super) fn view<'a>(&'a self, theme_accents: ThemeAccents) -> iced::Element<'a, Event> {
+    pub(crate) fn view<'a>(&'a self, theme_accents: ThemeAccents) -> iced::Element<'a, Event> {
         let floating_toolbar = iced::widget::responsive(move |overlay_size| {
             self.tools
                 .selected_toolbar_view(theme_accents, Event::Tools)
@@ -392,12 +408,20 @@ impl DrawingState {
         overlay.into()
     }
 
-    pub(super) fn sidebar_view<'a>(
+    pub(crate) fn sidebar_view<'a>(
         &'a self,
         composition: &'a ChartComposition,
     ) -> iced::Element<'a, Event> {
         self.tools
             .sidebar_view(composition, Event::Tools)
+            .padding(DRAWING_SIDEBAR_PADDING)
+            .into()
+    }
+
+    /// The tool column only, for charts without panels (no object list page).
+    pub(crate) fn tools_sidebar_view(&self) -> iced::Element<'_, Event> {
+        self.tools
+            .view_tools_sidebar(Event::Tools)
             .padding(DRAWING_SIDEBAR_PADDING)
             .into()
     }
@@ -637,6 +661,8 @@ pub struct DrawingTools {
     magnet_modifier_active: bool,
     box_style_target: BoxStyleTarget,
     measure: Option<DrawingMeasure>,
+    /// Measure and magnet read candle values, so charts without bars (heatmap) turn them off.
+    bar_tools: bool,
 }
 
 impl Default for DrawingTools {
@@ -655,11 +681,29 @@ impl Default for DrawingTools {
             magnet_modifier_active: false,
             box_style_target: BoxStyleTarget::default(),
             measure: None,
+            bar_tools: true,
         }
     }
 }
 
 impl DrawingTools {
+    /// Tools for a chart without candles: no measure tool and no magnet.
+    pub fn without_bar_tools() -> Self {
+        Self {
+            bar_tools: false,
+            ..Self::default()
+        }
+    }
+
+    /// Back to the cursor with no selection or unfinished drawing, e.g. when the chart hides
+    /// its drawings. The drawings themselves are untouched.
+    pub fn dismiss_interaction(&mut self) {
+        self.active_tool = DrawingTool::Cursor;
+        self.selected_drawings.clear();
+        self.interaction = DrawingInteraction::Idle;
+        self.measure = None;
+    }
+
     pub(super) fn edit_state(&self) -> DrawingEditState {
         DrawingEditState {
             drawings: self.drawings.clone(),
@@ -684,11 +728,11 @@ impl DrawingTools {
         self.measure = None;
     }
 
-    pub(super) fn is_dragging(&self) -> bool {
+    pub(crate) fn is_dragging(&self) -> bool {
         matches!(self.interaction, DrawingInteraction::Dragging(_))
     }
 
-    pub(super) fn can_handle_escape(&self) -> bool {
+    pub(crate) fn can_handle_escape(&self) -> bool {
         self.active_drag_any().is_some()
             || self.measure.is_some()
             || self.drawing_draft().is_some()
@@ -721,6 +765,7 @@ impl DrawingTools {
             magnet_modifier_active: false,
             box_style_target: BoxStyleTarget::default(),
             measure: None,
+            bar_tools: true,
         }
     }
 
@@ -733,7 +778,7 @@ impl DrawingTools {
     }
 
     /// Time-anchored drawings shared with other charts of the same ticker.
-    pub(super) fn shared_drawings(&self) -> Vec<DrawingEntity> {
+    pub(crate) fn shared_drawings(&self) -> Vec<DrawingEntity> {
         self.time_drawings()
             .iter()
             .filter(|drawing| is_shared(drawing))
@@ -752,7 +797,7 @@ impl DrawingTools {
 
     /// Replaces the shared drawings, e.g. with edits made in another chart, keeping
     /// this chart's indicator-panel drawings renumbered past the shared IDs.
-    pub(super) fn replace_shared_drawings(&mut self, shared: Vec<DrawingEntity>) {
+    pub(crate) fn replace_shared_drawings(&mut self, shared: Vec<DrawingEntity>) {
         let mut state = self.edit_state();
         let target = if self.tick_mode {
             &mut state.inactive_drawings
@@ -1342,7 +1387,11 @@ impl DrawingTools {
             .spacing(6)
             .height(iced::Length::Fill);
 
-        for tool in DrawingTool::all().iter().copied() {
+        for tool in DrawingTool::all()
+            .iter()
+            .copied()
+            .filter(|tool| self.bar_tools || *tool != DrawingTool::Measure)
+        {
             let selected = self.active_tool == tool;
             let icon = match tool {
                 DrawingTool::Cursor => style::Icon::Crosshair,
@@ -1379,11 +1428,13 @@ impl DrawingTools {
         })
         .width(iced::Length::Fill)
         .on_press(on_sidebar_message(DrawingMessage::ToggleMagnet));
-        tools = tools.push(tooltip(
-            magnet_button,
-            Some("Magnet"),
-            TooltipPosition::Right,
-        ));
+        if self.bar_tools {
+            tools = tools.push(tooltip(
+                magnet_button,
+                Some("Magnet"),
+                TooltipPosition::Right,
+            ));
+        }
 
         let objects_button = iced::widget::button(
             style::icon_text(style::Icon::Layers, 16).align_x(iced::Alignment::Center),
@@ -1391,11 +1442,14 @@ impl DrawingTools {
         .style(|theme, status| style::button::transparent(theme, status, false))
         .width(iced::Length::Fill)
         .on_press(on_sidebar_message(DrawingMessage::ShowObjectListPage));
-        tools = tools.push(tooltip(
-            objects_button,
-            Some("Drawings"),
-            TooltipPosition::Right,
-        ));
+        // The object list groups drawings by chart panel, which a heatmap does not have.
+        if self.bar_tools {
+            tools = tools.push(tooltip(
+                objects_button,
+                Some("Drawings"),
+                TooltipPosition::Right,
+            ));
+        }
 
         iced::widget::container(tools)
             .style(style::chart_sidebar_container)
@@ -2243,7 +2297,7 @@ impl DrawingTools {
         SIDEBAR_WIDTH
     }
 
-    pub(super) fn sidebar_width(&self) -> f32 {
+    pub(crate) fn sidebar_width(&self) -> f32 {
         match self.sidebar_page {
             SidebarPage::Tools => SIDEBAR_WIDTH,
             SidebarPage::ObjectList => OBJECT_LIST_SIDEBAR_WIDTH,

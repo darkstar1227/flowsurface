@@ -1,4 +1,4 @@
-mod drawing;
+pub(super) mod drawing;
 mod fetch;
 mod history;
 mod indicator_browser;

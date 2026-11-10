@@ -19,9 +19,9 @@ use iced::theme::palette::Extended;
 use iced::widget::canvas;
 use iced::{Point, Rectangle, Size};
 
-const DRAWING_HIT_TOLERANCE_PX: f32 = 7.0;
-const DRAWING_HANDLE_RADIUS_PX: f32 = 4.0;
-const DRAWING_HANDLE_HIT_RADIUS_PX: f32 = 8.0;
+pub(crate) const DRAWING_HIT_TOLERANCE_PX: f32 = 7.0;
+pub(crate) const DRAWING_HANDLE_RADIUS_PX: f32 = 4.0;
+pub(crate) const DRAWING_HANDLE_HIT_RADIUS_PX: f32 = 8.0;
 
 #[derive(Default)]
 pub(super) struct AxisBadgeFilter {
@@ -50,7 +50,7 @@ pub use data::chart::kline::drawing::{
     MAX_DRAWING_STROKE_WIDTH, MIN_DRAWING_STROKE_WIDTH, MeasureState,
 };
 
-fn iced_color(
+pub(crate) fn iced_color(
     color: DrawingColor,
     palette: &Extended,
     generated_accents: &[iced::Color; ACCENT_COUNT],
@@ -63,7 +63,7 @@ fn iced_color(
     .scale_alpha(color.alpha)
 }
 
-fn intersect_bounds(a: Rectangle, b: Rectangle) -> Option<Rectangle> {
+pub(crate) fn intersect_bounds(a: Rectangle, b: Rectangle) -> Option<Rectangle> {
     let left = a.x.max(b.x);
     let right = (a.x + a.width).min(b.x + b.width);
     let top = a.y.max(b.y);
@@ -1652,7 +1652,11 @@ impl DrawingDrag {
     }
 }
 
-fn clip_segment_to_bounds(start: Point, end: Point, bounds: Rectangle) -> Option<(Point, Point)> {
+pub(crate) fn clip_segment_to_bounds(
+    start: Point,
+    end: Point,
+    bounds: Rectangle,
+) -> Option<(Point, Point)> {
     let left = bounds.x;
     let right = bounds.x + bounds.width;
     let top = bounds.y;
@@ -1708,7 +1712,7 @@ fn clip_segment_to_bounds(start: Point, end: Point, bounds: Rectangle) -> Option
     ))
 }
 
-const FIB_FILL_ALPHA: f32 = 0.08;
+pub(crate) const FIB_FILL_ALPHA: f32 = 0.08;
 
 struct FibLevel {
     ratio: f64,
@@ -1724,19 +1728,25 @@ struct FibGeometry {
     levels: Vec<FibLevel>,
 }
 
-fn fib_ratio_label(ratio: f64) -> String {
+pub(crate) fn fib_ratio_label(ratio: f64) -> String {
     let text = format!("{ratio:.3}");
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Whether `point` is within `tolerance` of any level row spanning `left..=right`.
-fn fib_lines_hit(point: Point, rows: &[f32], left: f32, right: f32, tolerance: f32) -> bool {
+pub(crate) fn fib_lines_hit(
+    point: Point,
+    rows: &[f32],
+    left: f32,
+    right: f32,
+    tolerance: f32,
+) -> bool {
     point.x >= left - tolerance
         && point.x <= right + tolerance
         && rows.iter().any(|y| (point.y - y).abs() <= tolerance)
 }
 
-fn point_segment_distance(point: Point, a: Point, b: Point) -> f32 {
+pub(crate) fn point_segment_distance(point: Point, a: Point, b: Point) -> f32 {
     let vx = b.x - a.x;
     let vy = b.y - a.y;
     let wx = point.x - a.x;

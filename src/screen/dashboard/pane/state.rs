@@ -151,6 +151,8 @@ impl State {
         } = &mut self.content
         {
             chart.sync_shared_drawings(library);
+        } else if let Content::ShaderHeatmap(HeatmapContent::Active(chart)) = &mut self.content {
+            chart.sync_shared_drawings(library);
         }
     }
 
@@ -656,8 +658,8 @@ impl State {
             }
             Content::ShaderHeatmap(heatmap) => {
                 if let HeatmapContent::Active(chart) = heatmap {
-                    let base =
-                        HeatmapShader::view(chart, timezone, pixel_ratio).map(move |message| {
+                    let base = HeatmapShader::view(chart, timezone, pixel_ratio, theme.accents())
+                        .map(move |message| {
                             Message::PaneEvent(id, Event::HeatmapShaderInteraction(message))
                         });
 
@@ -1405,6 +1407,9 @@ impl State {
             chart: Some(chart), ..
         } = &mut self.content
         {
+            return chart.handle_escape();
+        }
+        if let Content::ShaderHeatmap(HeatmapContent::Active(chart)) = &mut self.content {
             return chart.handle_escape();
         }
         false

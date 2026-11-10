@@ -12,6 +12,7 @@ use crate::widget::chart::heatmap::{
 };
 
 use super::super::BackgroundJob;
+use super::kline::drawing::{self, DrawingState, DrawingUpdate};
 use crate::screen::dashboard::pane::ChartAction as Action;
 use crate::screen::dashboard::pane::settings::HeatmapIndicatorMessage;
 use data::aggr::time::TimeSeries;
@@ -42,7 +43,11 @@ const HEATMAP_RESYNC_AFTER_STALL_MS: u64 = 750;
 // Depth profile width in pixels fixed
 const DEPTH_PROFILE_WIDTH_PX: f32 = 160.0;
 
-pub type Message = heatmap_widget::Message;
+#[derive(Debug, Clone)]
+pub enum Message {
+    Chart(heatmap_widget::Message),
+    Drawing(drawing::Event),
+}
 
 #[derive(Debug, Clone)]
 pub enum BackgroundMessage {
@@ -107,6 +112,11 @@ pub struct HeatmapShader {
     depth_distance_input: String,
     replay: BackgroundJob<HeatmapReplay, HistoricalDepth, DepthReplayResult>,
     replay_requested: Option<HeatmapReplay>,
+    /// Drawings shared with the kline chart of the same ticker. Kept in step with the shared
+    /// library even while this pane hides them, so hiding never deletes anything.
+    drawings: DrawingState,
+    drawing_sync: Option<data::layout::drawings::Synced>,
+    drawing_settings: data::chart::kline::DrawingSettings,
 }
 
 impl HeatmapShader {
@@ -157,11 +167,52 @@ impl HeatmapShader {
             rebuild_policy: view::RebuildPolicy::Idle,
             anchor: view::Anchor::default(),
             config: config.unwrap_or_default(),
+            drawings: DrawingState::without_bar_tools(),
+            drawing_sync: None,
+            drawing_settings: Default::default(),
         }
     }
 
     pub fn update(&mut self, message: Message) {
         match message {
+            Message::Chart(message) => self.update_chart(message),
+            Message::Drawing(event) => self.update_drawings(event),
+        }
+    }
+
+    fn update_drawings(&mut self, event: drawing::Event) {
+        if !self.config.show_drawings {
+            return;
+        }
+        let _ = self.drawings.update(event, &mut self.drawing_settings);
+    }
+
+    fn update_chart(&mut self, message: heatmap_widget::Message) {
+        use heatmap_widget::Message;
+
+        match message {
+            Message::Drawing(event) => {
+                if self.config.show_drawings {
+                    let _: DrawingUpdate = self
+                        .drawings
+                        .handle_widget_drawing_event(event, &self.drawing_settings);
+                }
+            }
+            Message::DrawingUndoRequested => {
+                if self.config.show_drawings {
+                    self.drawings.undo();
+                }
+            }
+            Message::DrawingRedoRequested => {
+                if self.config.show_drawings {
+                    self.drawings.redo();
+                }
+            }
+            Message::DrawingDeleteRequested => {
+                self.update_drawings(drawing::Event::Tools(
+                    drawing::DrawingMessage::DeleteSelectedDrawing,
+                ));
+            }
             Message::IndicatorYRangeChanged { kind, range } => {
                 self.indicator_panels[kind].set_range(range);
             }
@@ -319,6 +370,7 @@ impl HeatmapShader {
         &self,
         timezone: data::UserTimezone,
         pixel_ratio: crate::window::PixelRatio,
+        theme_accents: crate::theme::ThemeAccents,
     ) -> iced::Element<'_, Message> {
         if self.base_price.is_none() {
             return iced::widget::center(
@@ -402,7 +454,55 @@ impl HeatmapShader {
         )
         .with_y_axis_gutter(self.y_axis_gutter);
 
-        iced::widget::container(chart).padding(1).into()
+        if !self.config.show_drawings {
+            let chart: iced::Element<'_, heatmap_widget::Message> =
+                iced::widget::container(chart).padding(1).into();
+            return chart.map(Message::Chart);
+        }
+
+        let chart = chart.with_drawings(heatmap_widget::drawing::Layer {
+            snapshot: self.drawings.tools.snapshot(),
+            accents: theme_accents,
+            can_undo: self.drawings.can_undo(),
+            can_redo: self.drawings.can_redo(),
+        });
+        let chart: iced::Element<'_, heatmap_widget::Message> =
+            iced::widget::container(chart).padding(1).into();
+        let chart = iced::widget::Stack::new()
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .push(chart.map(Message::Chart))
+            .push(self.drawings.view(theme_accents).map(Message::Drawing))
+            .clip(true);
+
+        iced::widget::row![
+            self.drawings.tools_sidebar_view().map(Message::Drawing),
+            iced::widget::rule::vertical(1.0).style(crate::style::split_ruler),
+            chart,
+        ]
+        .width(iced::Length::Fill)
+        .height(iced::Length::Fill)
+        .into()
+    }
+
+    /// Publishes this pane's drawing edits to `library`, or loads the drawings other charts
+    /// of the same ticker made. Skipped mid-drag so a gesture is published once.
+    pub fn sync_shared_drawings(&mut self, library: &mut data::layout::drawings::Library) {
+        sync_drawings(
+            &mut self.drawings,
+            self.ticker_info.ticker,
+            library,
+            &mut self.drawing_sync,
+        );
+    }
+
+    /// Escape drops the armed tool, selection or unfinished drawing. Does nothing while the
+    /// drawings are hidden, so Escape behaves as it did before drawings existed.
+    pub fn handle_escape(&mut self) -> bool {
+        if !self.config.show_drawings {
+            return false;
+        }
+        !matches!(self.drawings.handle_escape(), DrawingUpdate::None)
     }
 
     pub fn update_theme(&mut self, theme: &iced_core::Theme) {
@@ -687,6 +787,11 @@ impl HeatmapShader {
 
         let prev = self.config;
         self.config = config;
+
+        if prev.show_drawings && !self.config.show_drawings {
+            // Only the interaction is dropped; the drawings stay and keep syncing.
+            self.drawings.tools.dismiss_interaction();
+        }
 
         let order_filter_changed =
             prev.order_size_filter.to_bits() != self.config.order_size_filter.to_bits();
@@ -1192,5 +1297,128 @@ impl HeatmapShader {
             self.ticker_info.min_ticksize,
         )
         .unwrap_or(DEFAULT_Y_AXIS_GUTTER);
+    }
+}
+
+fn sync_drawings(
+    drawings: &mut DrawingState,
+    ticker: exchange::Ticker,
+    library: &mut data::layout::drawings::Library,
+    synced: &mut Option<data::layout::drawings::Synced>,
+) {
+    if drawings.tools.is_dragging() {
+        return;
+    }
+    let local = drawings.tools.shared_drawings();
+    if let Some(shared) = library.sync(ticker, &local, synced)
+        && shared != local
+    {
+        drawings.tools.replace_shared_drawings(shared);
+        drawings.clear_history();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widget::chart::kline::drawing::{
+        DrawingEntity, DrawingId, DrawingObject, DrawingStyle, DrawingTool, DrawingX,
+    };
+    use data::chart::kline::composition::PanelId;
+    use data::chart::value::YUnit;
+    use data::layout::drawings::Library;
+    use exchange::adapter::Exchange;
+
+    fn btc() -> exchange::Ticker {
+        exchange::Ticker::new("BTCUSDT", Exchange::BinanceLinear)
+    }
+
+    fn vertical(id: u64) -> DrawingEntity {
+        DrawingEntity {
+            id: DrawingId(id),
+            object: DrawingObject::VerticalLine {
+                x: DrawingX::Time(UnixMs::new(1_700_000_000_000 + id)),
+            },
+            style: DrawingStyle::default(),
+            locked: false,
+            visible: true,
+        }
+    }
+
+    fn panel_line(id: u64) -> DrawingEntity {
+        DrawingEntity {
+            id: DrawingId(id),
+            object: DrawingObject::HorizontalLine {
+                panel_id: PanelId::Aux(uuid::Uuid::from_u64_pair(1, 2)),
+                y_unit: YUnit(10),
+                x: DrawingX::Time(UnixMs::new(1_700_000_000_000)),
+                ray: false,
+            },
+            style: DrawingStyle::default(),
+            locked: false,
+            visible: true,
+        }
+    }
+
+    fn state_with(drawings: Vec<DrawingEntity>) -> DrawingState {
+        let mut state = DrawingState::without_bar_tools();
+        state.tools = drawing::DrawingTools::from_parts(DrawingTool::Cursor, drawings);
+        state
+    }
+
+    #[test]
+    fn heatmap_loads_drawings_made_on_the_kline_chart() {
+        let mut library = Library::default();
+        let mut kline_sync = None;
+        library.sync(btc(), &[vertical(1)], &mut kline_sync);
+
+        let mut heatmap = state_with(Vec::new());
+        let mut heatmap_sync = None;
+        sync_drawings(&mut heatmap, btc(), &mut library, &mut heatmap_sync);
+
+        assert_eq!(heatmap.tools.shared_drawings(), vec![vertical(1)]);
+    }
+
+    #[test]
+    fn heatmap_edits_reach_the_kline_chart() {
+        let mut library = Library::default();
+        let mut kline_sync = None;
+        assert_eq!(library.sync(btc(), &[], &mut kline_sync), Some(vec![]));
+
+        let mut heatmap = state_with(Vec::new());
+        let mut heatmap_sync = None;
+        sync_drawings(&mut heatmap, btc(), &mut library, &mut heatmap_sync);
+        heatmap.tools.replace_shared_drawings(vec![vertical(1)]);
+        sync_drawings(&mut heatmap, btc(), &mut library, &mut heatmap_sync);
+
+        assert_eq!(
+            library.sync(btc(), &[], &mut kline_sync),
+            Some(vec![vertical(1)])
+        );
+    }
+
+    #[test]
+    fn indicator_panel_drawings_are_not_shared() {
+        let heatmap = state_with(vec![vertical(1), panel_line(2)]);
+        assert_eq!(heatmap.tools.shared_drawings(), vec![vertical(1)]);
+    }
+
+    #[test]
+    fn hiding_drawings_keeps_the_shared_drawings() {
+        let mut library = Library::default();
+        let mut sync = None;
+        library.sync(btc(), &[vertical(1)], &mut sync);
+
+        let mut heatmap = state_with(Vec::new());
+        let mut heatmap_sync = None;
+        sync_drawings(&mut heatmap, btc(), &mut library, &mut heatmap_sync);
+
+        // What toggling `show_drawings` off does: drop the interaction, keep syncing.
+        heatmap.tools.dismiss_interaction();
+        sync_drawings(&mut heatmap, btc(), &mut library, &mut heatmap_sync);
+        sync_drawings(&mut heatmap, btc(), &mut library, &mut heatmap_sync);
+
+        assert_eq!(heatmap.tools.shared_drawings(), vec![vertical(1)]);
+        assert_eq!(library.get(btc()), &[vertical(1)]);
     }
 }

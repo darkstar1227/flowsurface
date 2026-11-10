@@ -79,6 +79,15 @@ impl DrawingHistory {
         self.pending_drawing = None;
     }
 
+    /// A drawing edit still in progress is committed by `undo`, so it counts as undoable.
+    pub(super) fn can_undo(&self) -> bool {
+        !self.undo.is_empty() || self.pending_drawing.is_some()
+    }
+
+    pub(super) fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
     pub(super) fn pop_undo(&mut self) -> Option<DrawingEdit> {
         self.undo.pop_back()
     }
