@@ -30,6 +30,7 @@ pub struct State {
     pub scale_factor: ScaleFactor,
     pub audio_cfg: AudioStream,
     pub network: Network,
+    pub exchange_accounts: super::exchange_accounts::ExchangeAccounts,
     pub size_in_quote_ccy: exchange::SizeUnit,
     pub cache_market_metadata: bool,
     #[serde(default = "default_antialiasing")]
@@ -47,6 +48,7 @@ impl State {
         scale_factor: ScaleFactor,
         audio_cfg: AudioStream,
         network: Network,
+        exchange_accounts: super::exchange_accounts::ExchangeAccounts,
         volume_size_unit: exchange::SizeUnit,
         cache_market_metadata: bool,
         antialiasing: bool,
@@ -61,6 +63,7 @@ impl State {
             scale_factor,
             audio_cfg,
             network,
+            exchange_accounts,
             size_in_quote_ccy: volume_size_unit,
             cache_market_metadata,
             antialiasing,

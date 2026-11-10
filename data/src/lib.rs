@@ -19,6 +19,7 @@ pub use chart::kline::indicators::{
     IndicatorCatalogPaths, initialize_indicator_catalog, initialize_indicator_catalog_with_paths,
 };
 pub use config::ScaleFactor;
+pub use config::exchange_accounts::{AccountMeta, ExchangeAccounts};
 pub use config::network::{Network, TradeFetchMode};
 pub use config::sidebar::{self, Sidebar};
 pub use config::state::{Layouts, State};

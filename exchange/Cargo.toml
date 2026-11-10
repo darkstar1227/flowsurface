@@ -40,4 +40,6 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 csv = "1.4.0"
 tokio-socks = "0.5.2"
 base64 = "0.22.1"
+ring = "0.17.14"
+secrecy.workspace = true
 futures = { version = "0.3.32", default-features = false, features = ["std", "async-await"] }

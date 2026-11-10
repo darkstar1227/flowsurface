@@ -1198,6 +1198,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1216,11 +1217,13 @@ dependencies = [
  "palette",
  "regex",
  "rustc-hash 2.1.2",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1240,7 +1243,9 @@ dependencies = [
  "log",
  "rand 0.10.1",
  "reqwest",
+ "ring",
  "rustc-hash 2.1.2",
+ "secrecy",
  "serde",
  "serde_json",
  "sonic-rs",
@@ -3893,6 +3898,15 @@ dependencies = [
  "memmap2",
  "smithay-client-toolkit 0.19.2",
  "tiny-skia",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
 ]
 
 [[package]]

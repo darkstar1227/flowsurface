@@ -19,6 +19,8 @@ rustc-hash.workspace = true
 url.workspace = true
 uuid.workspace = true
 exchange.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
 indicator_engine.workspace = true
 
 dirs-next = "2.0.0"
