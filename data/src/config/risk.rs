@@ -9,7 +9,8 @@
 //! Every field has a default, so an older save without a `risk` entry loads, and automatic
 //! close defaults to off (user decision 2).
 
-use exchange::trade::{Decimal, DrawdownAnchor, RiskLimits};
+use exchange::account::AccountKey;
+use exchange::trade::{Decimal, DrawdownAnchor, EquityBasis, EquityTracker, RiskLimits};
 use serde::{Deserialize, Serialize};
 
 const MAX_BPS: u32 = 10_000;
@@ -109,9 +110,52 @@ impl AccountRiskSettings {
     }
 }
 
+impl AccountRiskSettings {
+    /// The tracker for this account. Invalid settings give a tracker that refuses every new
+    /// entry (reducing still passes), never one without limits: the tracker is the only
+    /// source of the risk lock, so the gate and the UI read the same answer.
+    pub fn tracker(&self, account: AccountKey, basis: EquityBasis) -> EquityTracker {
+        match self.limits() {
+            Ok(limits) => EquityTracker::new(account, basis, limits),
+            Err(e) => {
+                log::warn!("risk settings invalid, new entries blocked: {e:?}");
+                EquityTracker::with_invalid_settings(account, basis)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_settings_block_entries_but_not_closes() {
+        use exchange::trade::{Exposure, RiskHook, RiskRefusal, RiskView};
+        let account = AccountKey::from_bytes([3; 16]);
+        let bad = AccountRiskSettings {
+            max_order_notional: Some("-1".into()),
+            ..AccountRiskSettings::default()
+        };
+        assert!(bad.limits().is_err());
+        let t = bad.tracker(account, EquityBasis::OkxTotalEq);
+        assert!(t.settings_invalid());
+        let snap = t.snapshot(0);
+        let entry = RiskView {
+            account,
+            symbol: "BTCUSDT",
+            exposure: Exposure::Adds { notional: None },
+        };
+        assert_eq!(snap.check(&entry), Err(RiskRefusal::SettingsInvalid));
+        let close = RiskView {
+            exposure: Exposure::Reduces,
+            ..entry
+        };
+        assert_eq!(snap.check(&close), Ok(()));
+        // Valid settings give a normal tracker.
+        let ok = AccountRiskSettings::default().tracker(account, EquityBasis::OkxTotalEq);
+        assert!(!ok.settings_invalid());
+    }
 
     #[test]
     fn defaults_have_no_limits_and_automatic_close_off() {

@@ -287,8 +287,8 @@ pub enum Trailing {
 }
 
 /// A protective order for an existing position (derivatives) or holding (spot, long only).
-#[derive(Debug, Clone, Copy)]
-pub struct Protective<'a> {
+#[derive(Debug)]
+pub struct Protective {
     pub kind: ProtectiveKind,
     /// The position being protected. The order's side is always the opposite.
     pub dir: Dir,
@@ -302,7 +302,27 @@ pub struct Protective<'a> {
     pub trailing: Option<Trailing>,
     /// Last or mark price, used to check which side of the market the trigger is on.
     pub ref_price: Decimal,
-    pub client_id: &'a ClientId,
+    /// Owned: one id belongs to one request (condition 61).
+    pub client_id: ClientId,
+}
+
+#[cfg(test)]
+impl Protective {
+    /// Tests build the same order several times; production code cannot (condition 61).
+    pub(crate) fn duplicate(&self) -> Protective {
+        Protective {
+            kind: self.kind,
+            dir: self.dir,
+            size: self.size,
+            trigger_price: self.trigger_price,
+            limit_price: self.limit_price,
+            tif: self.tif,
+            working_type: self.working_type,
+            trailing: self.trailing,
+            ref_price: self.ref_price,
+            client_id: ClientId::parse(self.client_id.as_str()).unwrap(),
+        }
+    }
 }
 
 /// Position mode and margin settings for a derivatives order.
@@ -322,7 +342,7 @@ impl MarginMode {
 }
 
 /// An exchange-assigned order id (digits only) or our own client id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum OrderRef {
     Exchange(String),
     Client(ClientId),

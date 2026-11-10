@@ -31,13 +31,14 @@
 
 use super::request::{BinanceRequest, Exposure, Method, OkxRequest};
 use super::rules::{FreshRules, SymbolRules, TradeProduct};
+use super::stream::{StreamState, TradeAction, allows, stream_state_for};
 use super::types::TradeError;
 use crate::account::{AccountEnv, AccountKey, AccountProduct, AccountVenue};
 use crate::rate_limit::Priority;
 use std::fmt;
 
-/// A request built by one of the builders.
-#[derive(Clone)]
+/// A request built by one of the builders. Not `Clone`: a request carries its client id, and
+/// the same id must not go out twice (condition 61).
 pub(crate) enum Prepared {
     Binance(BinanceRequest),
     Okx(Box<OkxRequest>),
@@ -255,14 +256,34 @@ pub enum RiskRefusal {
     EquityUnavailable,
     /// Locked by the local risk state (a limit tripped); new entries only.
     Locked,
+    /// The saved risk settings of the account are invalid: no entries until fixed.
+    SettingsInvalid,
     /// The hook belongs to another account than the order.
     WrongAccount,
 }
 
 /// Local risk controls (`risk::RiskSnapshot` is the implementation the app wires). Only
 /// entries are checked: reducing, closing and cancelling are always allowed (condition 72).
-pub trait RiskHook {
+///
+/// Sealed: only this crate can implement it, and the one production implementation is
+/// [`RiskSnapshot`](super::risk::RiskSnapshot), which reads the account's `EquityTracker`. A
+/// hook that always says yes cannot be written outside the crate (review item 7).
+///
+/// ```compile_fail,E0603
+/// use flowsurface_exchange::trade::{RiskHook, RiskRefusal, RiskView};
+/// struct Yes;
+/// // `Sealed` is not nameable here, so the bound cannot be met.
+/// impl flowsurface_exchange::trade::gate::sealed::Sealed for Yes {}
+/// impl RiskHook for Yes {
+///     fn check(&self, _: &RiskView<'_>) -> Result<(), RiskRefusal> { Ok(()) }
+/// }
+/// ```
+pub trait RiskHook: sealed::Sealed {
     fn check(&self, view: &RiskView<'_>) -> Result<(), RiskRefusal>;
+}
+
+pub(crate) mod sealed {
+    pub trait Sealed {}
 }
 
 /// The user's confirmation of one order. Single use: `submit` takes it by value, so a second
@@ -315,7 +336,20 @@ pub struct AutoIntent {
 }
 
 impl AutoIntent {
+    /// `AutoPath::RiskClose` is refused here: only the risk-close routine of this crate builds
+    /// it (`AutoIntent::risk_close`), so no caller can claim the risk-control path.
     pub fn new(path: AutoPath, intent: OrderIntent) -> Result<Self, TradeError> {
+        if path == AutoPath::RiskClose {
+            return Err(TradeError::Unsupported);
+        }
+        Self::build(path, intent)
+    }
+
+    pub(crate) fn risk_close(intent: OrderIntent) -> Result<Self, TradeError> {
+        Self::build(AutoPath::RiskClose, intent)
+    }
+
+    fn build(path: AutoPath, intent: OrderIntent) -> Result<Self, TradeError> {
         match intent.exposure() {
             Exposure::Adds { .. } => Err(TradeError::AutoPathMustReduce),
             Exposure::Reduces | Exposure::Neutral => Ok(AutoIntent { path, intent }),
@@ -336,6 +370,12 @@ pub enum SubmitError<R> {
     RulesExpired,
     /// An earlier send for this account and symbol has an unresolved outcome (condition 60).
     Locked,
+    /// The record of this send could not be written ahead of it, so nothing was sent
+    /// (condition 60: an unresolved send must survive a restart).
+    JournalUnavailable,
+    /// The private stream is not `Connected` and synchronised (or does not exist, as for
+    /// Binance spot), so new entries and drags are refused (condition 51).
+    StreamNotReady(StreamState),
     /// The request does not carry the fields the send path needs.
     Malformed(TradeError),
     /// The intent was built for another account than the client that was asked to send it.
@@ -371,6 +411,13 @@ pub(crate) fn approve<G: SendGate>(
         Exposure::Adds { .. } => GateClass::Entry,
         Exposure::Reduces | Exposure::Neutral => GateClass::Reduce,
     };
+    // Condition 51 in the gate itself, not only in the UI: an entry (a drag's new leg is an
+    // entry too) needs a synchronised stream; reducing and cancelling always pass. The state is
+    // read from the account's entry in the stream table, which only the stream writes.
+    let stream = stream_state_for(target.account, target.venue, target.product);
+    if class == GateClass::Entry && !allows(stream, TradeAction::NewEntry) {
+        return Err(SubmitError::StreamNotReady(stream));
+    }
     gate.check(GateRequest {
         account: target.account,
         venue: target.venue,

@@ -140,6 +140,11 @@ impl AccountKey {
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
+
+    /// The bytes the key was made from (for saving it again; they are an id, not a secret).
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
 }
 
 /// API key, secret and (OKX only) passphrase. Debug output is masked.

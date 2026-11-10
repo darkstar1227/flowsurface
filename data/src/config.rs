@@ -10,6 +10,7 @@ pub mod state;
 pub mod theme;
 pub mod timezone;
 pub mod trade_gate;
+pub mod unknown_store;
 
 pub const MIN_SCALE: f32 = 0.8;
 pub const MAX_SCALE: f32 = 1.5;

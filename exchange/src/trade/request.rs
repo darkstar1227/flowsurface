@@ -36,10 +36,19 @@ pub enum LookupKind {
     OkxAlgo(OkxAlgoType),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Lookup {
     pub(crate) kind: LookupKind,
     pub(crate) client_id: String,
+}
+
+impl std::fmt::Debug for Lookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lookup")
+            .field("kind", &self.kind)
+            .field("client_id", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +70,7 @@ impl Method {
 
 /// A Binance request with its parameters in the fixed order the builder chose.
 /// `timestamp` and `recvWindow` are added last, at signing time.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct BinanceRequest {
     method: Method,
     path: &'static str,
@@ -219,7 +228,7 @@ pub(crate) enum OkxBody {
 ///     body: None,
 /// };
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct OkxRequest {
     method: Method,
     path: String,

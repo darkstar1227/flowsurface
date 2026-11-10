@@ -13,6 +13,10 @@ fn id(s: &str) -> ClientId {
     ClientId::parse(s).unwrap()
 }
 
+fn dup(c: &ClientId) -> ClientId {
+    id(c.as_str())
+}
+
 #[test]
 fn binance_futures_every_type_has_place_cancel_and_query() {
     let t = futures();
@@ -35,9 +39,12 @@ fn binance_futures_every_type_has_place_cancel_and_query() {
                 qty: d("0.002"),
                 exec,
                 ref_price: Some(d("60000")),
-                client_id: &cid,
+                client_id: dup(&cid),
             };
-            assert_eq!(bf::new_order(&e).unwrap().path(), "/fapi/v1/order");
+            assert_eq!(
+                bf::new_order(e.duplicate()).unwrap().path(),
+                "/fapi/v1/order"
+            );
             assert_eq!(
                 bf::cancel_order(r, &by_client).unwrap().path(),
                 "/fapi/v1/order"
@@ -83,10 +90,12 @@ fn binance_futures_every_type_has_place_cancel_and_query() {
                     activate_price: None,
                 }),
                 ref_price: d("60000"),
-                client_id: &cid,
+                client_id: dup(&cid),
             };
             assert_eq!(
-                bf::new_algo_order(r, Some(mode), &p).unwrap().path(),
+                bf::new_algo_order(r, Some(mode), p.duplicate())
+                    .unwrap()
+                    .path(),
                 "/fapi/v1/algoOrder"
             );
             assert_eq!(
@@ -121,9 +130,12 @@ fn binance_spot_every_type_has_place_cancel_and_query() {
             qty: d("0.1"),
             exec,
             ref_price: Some(d("60000")),
-            client_id: &cid,
+            client_id: dup(&cid),
         };
-        assert_eq!(bs::new_order(&e).unwrap().path(), "/api/v3/order");
+        assert_eq!(
+            bs::new_order(e.duplicate()).unwrap().path(),
+            "/api/v3/order"
+        );
     }
     for kind in [
         ProtectiveKind::StopMarket,
@@ -152,10 +164,10 @@ fn binance_spot_every_type_has_place_cancel_and_query() {
             working_type: WorkingType::ContractPrice,
             trailing: (kind == ProtectiveKind::Trailing).then_some(Trailing::DeltaBips(100)),
             ref_price: d("60000"),
-            client_id: &cid,
+            client_id: dup(&cid),
         };
         assert_eq!(
-            bs::build_protective_order(r, &p).unwrap().path(),
+            bs::build_protective_order(r, p.duplicate()).unwrap().path(),
             "/api/v3/order"
         );
     }
@@ -174,28 +186,31 @@ fn binance_spot_every_type_has_place_cancel_and_query() {
         stop_trigger: d("59000"),
         stop_limit_price: None,
         stop_tif: TimeInForce::Gtc,
-        take_profit_id: &tp,
-        stop_id: &sl,
+        take_profit_id: dup(&tp),
+        stop_id: dup(&sl),
     };
     let oco = bs::SpotOco {
         rules: r,
         qty: d("0.1"),
         ref_price: d("60000"),
-        exits,
-        list_id: &list,
+        exits: exits.duplicate(),
+        list_id: dup(&list),
     };
-    assert_eq!(bs::build_oco(&oco).unwrap().path(), "/api/v3/orderList/oco");
+    assert_eq!(
+        bs::build_oco(oco.duplicate()).unwrap().path(),
+        "/api/v3/orderList/oco"
+    );
     let otoco = bs::SpotOtoco {
         rules: r,
         qty: d("0.1"),
         entry_price: d("60000"),
         entry_tif: TimeInForce::Gtc,
-        exits,
-        list_id: &list,
-        entry_id: &entry,
+        exits: exits.duplicate(),
+        list_id: dup(&list),
+        entry_id: dup(&entry),
     };
     assert_eq!(
-        bs::build_otoco(&otoco).unwrap().path(),
+        bs::build_otoco(otoco.duplicate()).unwrap().path(),
         "/api/v3/orderList/otoco"
     );
     assert_eq!(
@@ -236,10 +251,13 @@ fn okx_every_type_has_place_cancel_and_query() {
                 qty: d("2"),
                 exec,
                 ref_price: Some(d("60000")),
-                client_id: &cid,
+                client_id: dup(&cid),
                 attach: None,
             };
-            assert_eq!(okx::place_order(&e).unwrap().path(), "/api/v5/trade/order");
+            assert_eq!(
+                okx::place_order(e.duplicate()).unwrap().path(),
+                "/api/v5/trade/order"
+            );
         }
         let kinds = [
             (OkxAlgoType::Conditional, None, Some("59000")),
@@ -256,10 +274,10 @@ fn okx_every_type_has_place_cancel_and_query() {
                 sl_trigger: sl.map(d),
                 trigger_type: TriggerPxType::Last,
                 ref_price: d("60000"),
-                client_id: &cid,
+                client_id: dup(&cid),
             };
             assert_eq!(
-                okx::place_algo(&p).unwrap().path(),
+                okx::place_algo(p.duplicate()).unwrap().path(),
                 "/api/v5/trade/order-algo"
             );
             assert_eq!(
@@ -301,10 +319,13 @@ fn okx_every_type_has_place_cancel_and_query() {
             qty: d("0.1"),
             exec,
             ref_price: Some(d("60000")),
-            client_id: &cid,
+            client_id: dup(&cid),
             attach: None,
         };
-        assert_eq!(okx::place_order(&e).unwrap().path(), "/api/v5/trade/order");
+        assert_eq!(
+            okx::place_order(e.duplicate()).unwrap().path(),
+            "/api/v5/trade/order"
+        );
     }
     for (ord_type, tp, sl) in [
         (OkxAlgoType::Conditional, None, Some("59000")),
@@ -319,10 +340,10 @@ fn okx_every_type_has_place_cancel_and_query() {
             sl_trigger: sl.map(d),
             trigger_type: TriggerPxType::Last,
             ref_price: d("60000"),
-            client_id: &cid,
+            client_id: dup(&cid),
         };
         assert_eq!(
-            okx::place_algo(&p).unwrap().path(),
+            okx::place_algo(p.duplicate()).unwrap().path(),
             "/api/v5/trade/order-algo"
         );
         assert_eq!(
@@ -347,9 +368,9 @@ fn okx_every_type_has_place_cancel_and_query() {
         sl_trigger: Some(d("59000")),
         trigger_type: TriggerPxType::Last,
         ref_price: d("60000"),
-        client_id: &cid,
+        client_id: dup(&cid),
     };
-    assert!(okx::place_algo(&p).is_err());
+    assert!(okx::place_algo(p.duplicate()).is_err());
     assert!(
         okx::cancel_algos(
             sr,

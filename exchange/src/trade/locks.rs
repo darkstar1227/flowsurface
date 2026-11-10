@@ -8,6 +8,7 @@
 
 use crate::account::AccountKey;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 type Key = (AccountKey, String);
@@ -33,6 +34,57 @@ impl State {
     }
 }
 
+/// Accounts whose new entries are refused outright: a saved unresolved send could not be tied
+/// to a symbol (its id is invalid). Cleared only by a restart.
+static BLOCKED: LazyLock<Mutex<HashSet<AccountKey>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+pub(crate) fn block_entries(account: AccountKey) {
+    BLOCKED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(account);
+}
+
+/// Set when the saved unresolved sends could not be read at startup: every new entry of every
+/// account is refused. Cleared only by a restart; closes and cancels are not affected.
+#[cfg(not(test))]
+static BLOCK_ALL: AtomicBool = AtomicBool::new(false);
+
+// Tests share one process and cannot undo a restart-only flag, so under test it is per thread
+// (every async test runs on its own current-thread runtime).
+#[cfg(test)]
+thread_local! {
+    static BLOCK_ALL: AtomicBool = const { AtomicBool::new(false) };
+}
+
+pub(crate) fn block_all() {
+    #[cfg(not(test))]
+    BLOCK_ALL.store(true, Ordering::SeqCst);
+    #[cfg(test)]
+    BLOCK_ALL.with(|f| f.store(true, Ordering::SeqCst));
+}
+
+/// Undo [`block_all`] on this thread; the harness may run several tests on one thread.
+#[cfg(test)]
+pub(crate) fn unblock_all_for_test() {
+    BLOCK_ALL.with(|f| f.store(false, Ordering::SeqCst));
+}
+
+fn block_all_set() -> bool {
+    #[cfg(not(test))]
+    return BLOCK_ALL.load(Ordering::SeqCst);
+    #[cfg(test)]
+    BLOCK_ALL.with(|f| f.load(Ordering::SeqCst))
+}
+
+fn blocked(account: AccountKey) -> bool {
+    block_all_set()
+        || BLOCKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&account)
+}
+
 static LOCKS: LazyLock<Mutex<HashMap<Key, State>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn with<T>(f: impl FnOnce(&mut HashMap<Key, State>) -> T) -> T {
@@ -50,9 +102,18 @@ fn release(map: &mut HashMap<Key, State>, key: &Key) {
 pub(crate) struct Locked;
 
 pub(crate) fn is_locked(account: AccountKey, symbol: &str) -> bool {
+    blocked(account)
+        || with(|m| {
+            m.get(&(account, symbol.to_string()))
+                .is_some_and(|s| !s.idle())
+        })
+}
+
+/// True while `client_id` is registered as an unresolved send of this (account, symbol).
+pub(crate) fn has_unresolved_id(account: AccountKey, symbol: &str, client_id: &str) -> bool {
     with(|m| {
         m.get(&(account, symbol.to_string()))
-            .is_some_and(|s| !s.idle())
+            .is_some_and(|s| s.ids.contains(client_id))
     })
 }
 
@@ -111,6 +172,9 @@ pub(crate) fn reserve(
     symbol: &str,
     client_id: Option<&str>,
 ) -> Result<Inflight, Locked> {
+    if blocked(account) {
+        return Err(Locked);
+    }
     with(|m| {
         let key = (account, symbol.to_string());
         let s = m.entry(key.clone()).or_default();
@@ -168,12 +232,22 @@ impl Drop for Inflight {
             with(|m| {
                 if let Some(s) = m.get_mut(&self.key) {
                     s.inflight = s.inflight.saturating_sub(1);
-                    s.unknown += 1;
-                    if let Some(id) = &self.client_id {
+                    // The stream already reported this order while it was in flight: the
+                    // exchange knows it, so there is nothing unresolved to remember (L-1).
+                    let seen = self.client_id.as_ref().is_some_and(|id| {
                         s.pending.remove(id);
-                        s.seen.remove(id);
+                        s.seen.remove(id)
+                    });
+                    if !seen {
+                        s.unknown += 1;
+                        if let Some(id) = &self.client_id {
+                            // Registered, so a later stream event or lookup for this id can
+                            // release the count; without it only a restart would (review L-1).
+                            s.ids.insert(id.clone());
+                        }
                     }
                 }
+                release(m, &self.key);
             });
         }
     }
@@ -182,6 +256,35 @@ impl Drop for Inflight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dropped_send_can_be_released_by_its_client_id() {
+        let a = key(209);
+        let g = reserve(a, "BTCUSDT", Some("eDROP1")).unwrap();
+        drop(g);
+        assert!(is_locked(a, "BTCUSDT"));
+        assert!(resolve_client_id(a, "BTCUSDT", "eDROP1"));
+        assert!(!is_locked(a, "BTCUSDT"));
+    }
+
+    #[test]
+    fn a_dropped_send_the_stream_already_saw_does_not_lock() {
+        let a = key(210);
+        let g = reserve(a, "BTCUSDT", Some("eSEEN1")).unwrap();
+        assert!(!resolve_client_id(a, "BTCUSDT", "eSEEN1"));
+        drop(g);
+        assert!(!is_locked(a, "BTCUSDT"));
+    }
+
+    #[test]
+    fn a_blocked_account_refuses_every_entry_symbol() {
+        let a = key(211);
+        block_entries(a);
+        assert!(is_locked(a, "BTCUSDT"));
+        assert!(is_locked(a, "ETHUSDT"));
+        assert_eq!(reserve(a, "BTCUSDT", None).err(), Some(Locked));
+        assert!(!is_locked(key(212), "BTCUSDT"));
+    }
 
     fn key(n: u8) -> AccountKey {
         AccountKey::from_bytes([n; 16])

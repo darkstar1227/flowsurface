@@ -193,11 +193,15 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 
 **J. 下單前判定（F2）**
 
-- **57（a、c）**：下單閘門是純函式：`can_send(session_verdict, keychain_meta, saved_meta, proxy_ok, stream_state, risk)`。
+- **57（a、c）**：下單前有兩層判定，兩層都通過才送出。
+  1. **F2 閘門**（純函式，`data::config::trade_gate`）：`can_send(session_verdict, keychain_meta, saved_meta, proxy_ok, order)`，由 `SessionGate` 以唯一的 `SendGate` 實作提供。私有流狀態不是它的參數：data 不再保存第二份串流狀態（`StreamState`、`SessionGate.stream` 已移除），避免 UI 與送單讀到不同的值。
+  2. **exchange 的 `approve`**：從以帳戶為 key 的串流狀態 registry 讀取私有流狀態（由私有流的 driver 寫入，送單端與 GUI 都不能寫）。非 `Connected` 拒絕新進場與拖曳，沒有登記等於 `Reconnecting`，現貨 `Unavailable` 等於現貨交易停用；本機風控 `RiskHook`（唯一來源是 `EquityTracker` → `RiskSnapshot`，設定無效等於鎖定新進場）；規則有效期；未解決 Unknown 的 (帳戶, symbol) 鎖。
+
+  本機風控不是 `can_send` 的參數，UI 的鎖定顯示也讀同一個 `EquityTracker`。平倉、減倉、撤單不受私有流與風控鎖定限制（條件 60）。
   - `session_verdict` 存在 `Flowsurface` 層的記憶體 session，不是 modal 的 `Status`。
   - 本 session 沒測過 → 拒絕；`Rejected` → 拒絕；Live 必須是 `Usable`；Testnet 可為 `Unverified`（`is_usable`，`account.rs:171-176`）。
   - 每次送單都重新 `load_credentials`，比對 Keychain 與存檔的 venue、env、product，不一致就拒絕；簽名後立即釋放憑證。
-  - 帳戶被編輯或刪除、Keychain 載入失敗、私有流 `AuthFailed` 時，session verdict 立即作廢。
+  - 帳戶被編輯或刪除、Keychain 載入失敗、私有流 `AuthFailed`（`StreamOutput::InvalidateSession`）時，session verdict 立即作廢。
   - Binance Live 現貨另要求 `enableSpotAndMarginTrading == true`（欄位已在官方 wallet SDK 的 `get_api_key_permission_response.py:68` 核對）；合約要求 `enableFutures == true`。缺少或為 false → 該產品不可下單。
   - 驗證：涵蓋全部組合的表格式單元測試；手動改 `saved-state.json` 的 env 後，下單被拒。
 - **58（a）**：合約下單時，builder 依**交易所回報的實際持倉模式**（存在 session）決定 `positionSide`／`posSide` 與是否帶 `reduceOnly`；實際模式未知 → 拒絕送出合約單。條件 28 的「不一致只警告」仍適用於顯示，但 builder 只看實際值。

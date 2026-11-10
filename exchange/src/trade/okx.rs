@@ -197,15 +197,16 @@ fn ctx(rules: &SymbolRules, target: OkxTarget) -> Result<Ctx, TradeError> {
 
 /// Take-profit and stop-loss triggers attached to an entry (`attachAlgoOrds`). OKX creates
 /// them only after the entry is **fully** filled, so a partial fill is unprotected.
-#[derive(Debug, Clone, Copy)]
-pub struct OkxAttach<'a> {
+#[derive(Debug)]
+pub struct OkxAttach {
     pub tp_trigger: Option<Decimal>,
     pub sl_trigger: Option<Decimal>,
     pub trigger_type: TriggerPxType,
-    pub client_id: &'a ClientId,
+    /// Owned: one id belongs to one request (condition 61).
+    pub client_id: ClientId,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct OkxEntry<'a> {
     pub rules: &'a SymbolRules,
     pub target: OkxTarget,
@@ -214,12 +215,40 @@ pub struct OkxEntry<'a> {
     pub exec: Exec,
     /// Last price; needed to check attached triggers.
     pub ref_price: Option<Decimal>,
-    pub client_id: &'a ClientId,
-    pub attach: Option<OkxAttach<'a>>,
+    pub client_id: ClientId,
+    pub attach: Option<OkxAttach>,
+}
+
+#[cfg(test)]
+impl OkxAttach {
+    /// Tests build the same order several times; production code cannot (condition 61).
+    pub(crate) fn duplicate(&self) -> OkxAttach {
+        OkxAttach {
+            tp_trigger: self.tp_trigger,
+            sl_trigger: self.sl_trigger,
+            trigger_type: self.trigger_type,
+            client_id: ClientId::parse(self.client_id.as_str()).unwrap(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl OkxEntry<'_> {
+    pub(crate) fn duplicate(&self) -> OkxEntry<'_> {
+        OkxEntry {
+            rules: self.rules,
+            target: self.target,
+            qty: self.qty,
+            exec: self.exec,
+            ref_price: self.ref_price,
+            client_id: ClientId::parse(self.client_id.as_str()).unwrap(),
+            attach: self.attach.as_ref().map(OkxAttach::duplicate),
+        }
+    }
 }
 
 /// `POST /api/v5/trade/order`.
-pub fn place_order(i: &OkxEntry<'_>) -> Result<OkxRequest, TradeError> {
+pub fn place_order(i: OkxEntry<'_>) -> Result<OkxRequest, TradeError> {
     let c = ctx(i.rules, i.target)?;
     let cl_ord_id = i.client_id.check(IdField::Okx)?.to_string();
     let market = matches!(i.exec, Exec::Market);
@@ -307,7 +336,7 @@ pub fn place_order(i: &OkxEntry<'_>) -> Result<OkxRequest, TradeError> {
 fn attach_algo(
     rules: &SymbolRules,
     c: &Ctx,
-    a: &OkxAttach<'_>,
+    a: &OkxAttach,
     ref_price: Option<&Decimal>,
 ) -> Result<OkxAttachAlgo, TradeError> {
     let id = a.client_id.check(IdField::Okx)?.to_string();
@@ -352,7 +381,7 @@ fn leg(
 }
 
 /// A protective algo order for an existing position or spot holding.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct OkxProtective<'a> {
     pub rules: &'a SymbolRules,
     /// Spot: a sell. Swap: `Action::Close(dir)`.
@@ -363,14 +392,31 @@ pub struct OkxProtective<'a> {
     pub sl_trigger: Option<Decimal>,
     pub trigger_type: TriggerPxType,
     pub ref_price: Decimal,
-    pub client_id: &'a ClientId,
+    pub client_id: ClientId,
+}
+
+#[cfg(test)]
+impl OkxProtective<'_> {
+    pub(crate) fn duplicate(&self) -> OkxProtective<'_> {
+        OkxProtective {
+            rules: self.rules,
+            target: self.target,
+            ord_type: self.ord_type,
+            size: self.size,
+            tp_trigger: self.tp_trigger,
+            sl_trigger: self.sl_trigger,
+            trigger_type: self.trigger_type,
+            ref_price: self.ref_price,
+            client_id: ClientId::parse(self.client_id.as_str()).unwrap(),
+        }
+    }
 }
 
 /// `POST /api/v5/trade/order-algo`.
 ///
 /// A `conditional` order with both TP and SL is an error (OKX would run only the SL), and
 /// an `oco` needs both. Triggers execute at market (`-1`).
-pub fn place_algo(i: &OkxProtective<'_>) -> Result<OkxRequest, TradeError> {
+pub fn place_algo(i: OkxProtective<'_>) -> Result<OkxRequest, TradeError> {
     let c = ctx(i.rules, i.target)?;
     let ord_type = i.ord_type.okx()?;
     let algo_cl_ord_id = i.client_id.check(IdField::Okx)?.to_string();
@@ -444,7 +490,7 @@ pub fn close_position(
     mode: Option<PositionMode>,
     margin: MarginMode,
     dir: Dir,
-    client_id: &ClientId,
+    client_id: ClientId,
 ) -> Result<OkxRequest, TradeError> {
     rules.require_product(TradeProduct::OkxSwap)?;
     let mode = mode.ok_or(TradeError::PositionModeUnknown)?;
@@ -582,6 +628,30 @@ mod tests {
         ClientId::parse(s).unwrap()
     }
 
+    // The builders consume their input (one id, one request). These wrappers let a test build
+    // the same input again, with a copy of the id.
+    fn dup(c: &ClientId) -> ClientId {
+        id(c.as_str())
+    }
+
+    fn place_order(i: &OkxEntry<'_>) -> Result<OkxRequest, TradeError> {
+        super::place_order(i.duplicate())
+    }
+
+    fn place_algo(i: &OkxProtective<'_>) -> Result<OkxRequest, TradeError> {
+        super::place_algo(i.duplicate())
+    }
+
+    fn close_position(
+        rules: &SymbolRules,
+        mode: Option<PositionMode>,
+        margin: MarginMode,
+        dir: Dir,
+        cid: &ClientId,
+    ) -> Result<OkxRequest, TradeError> {
+        super::close_position(rules, mode, margin, dir, dup(cid))
+    }
+
     /// The signed body, which the golden strings are compared to. Also checks that the
     /// signature covers exactly that body.
     fn body(r: &OkxRequest) -> String {
@@ -619,7 +689,7 @@ mod tests {
             qty: d("3"),
             exec,
             ref_price: Some(d("60000")),
-            client_id: cid,
+            client_id: dup(cid),
             attach: None,
         }
     }
@@ -642,7 +712,7 @@ mod tests {
             sl_trigger: sl.map(d),
             trigger_type: TriggerPxType::Mark,
             ref_price: d("60000"),
-            client_id: cid,
+            client_id: dup(cid),
         }
     }
 
@@ -691,7 +761,7 @@ mod tests {
             tp_trigger: Some(d("61000.04")),
             sl_trigger: Some(d("59000")),
             trigger_type: TriggerPxType::Mark,
-            client_id: &aid,
+            client_id: dup(&aid),
         });
         assert_eq!(
             body(&place_order(&e).unwrap()),
@@ -702,7 +772,7 @@ mod tests {
             tp_trigger: Some(d("59000")),
             sl_trigger: None,
             trigger_type: TriggerPxType::Last,
-            client_id: &aid,
+            client_id: dup(&aid),
         });
         assert_eq!(place_order(&e).unwrap_err(), TradeError::TriggerOnWrongSide);
     }
@@ -863,7 +933,17 @@ mod tests {
             r#"{"instId":"BTC-USDT-SWAP","clOrdId":"eAAAA"}"#
         );
         assert_eq!(
-            body(&cancel_algos(r, OkxAlgoType::Oco, &[by_id.clone(), by_client.clone()]).unwrap()),
+            body(
+                &cancel_algos(
+                    r,
+                    OkxAlgoType::Oco,
+                    &[
+                        OrderRef::exchange("680800019749904384").unwrap(),
+                        OrderRef::Client(id("eAAAA"))
+                    ]
+                )
+                .unwrap()
+            ),
             r#"[{"instId":"BTC-USDT-SWAP","algoId":"680800019749904384"},{"instId":"BTC-USDT-SWAP","algoClOrdId":"eAAAA"}]"#
         );
         let q = query_order(r, &by_client).unwrap();
@@ -888,7 +968,16 @@ mod tests {
             "/api/v5/trade/order-algo?algoId=680800019749904384"
         );
         assert!(cancel_algos(r, OkxAlgoType::Oco, &[]).is_err());
-        assert!(cancel_algos(r, OkxAlgoType::Oco, &vec![by_id; 11]).is_err());
+        assert!(
+            cancel_algos(
+                r,
+                OkxAlgoType::Oco,
+                &(0..11)
+                    .map(|_| OrderRef::exchange("680800019749904384").unwrap())
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
     }
 
     // ── long_short swap ─────────────────────────────────────────────────
@@ -1127,12 +1216,12 @@ mod tests {
 
     // ── attached TP/SL only on entries (B1) ──────────────────────────────
 
-    fn attach<'a>(aid: &'a ClientId, tp: &str) -> Option<OkxAttach<'a>> {
+    fn attach(aid: &ClientId, tp: &str) -> Option<OkxAttach> {
         Some(OkxAttach {
             tp_trigger: Some(d(tp)),
             sl_trigger: None,
             trigger_type: TriggerPxType::Last,
-            client_id: aid,
+            client_id: dup(aid),
         })
     }
 
@@ -1299,7 +1388,7 @@ mod tests {
                     tif: TimeInForce::Gtc,
                 },
                 ref_price: Some(d("60000")),
-                client_id: &cid,
+                client_id: dup(&cid),
                 attach: None,
             })
             .unwrap()

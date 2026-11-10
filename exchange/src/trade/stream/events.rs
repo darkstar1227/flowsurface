@@ -113,9 +113,29 @@ pub struct BalanceUpdate {
 
 /// Total account equity as the exchange defines it (OKX `totalEq`). Binance's
 /// `totalMarginBalance` is not pushed; segment e reads it by REST.
+///
+/// `non_exhaustive`: only the parsers of this crate can build one, so a reading cannot be
+/// passed off as coming from the private stream (review item 8).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EquityUpdate {
-    pub total_equity: Decimal,
+    pub(crate) total_equity: Decimal,
+    /// Whether the venue's stream tells a transfer apart from a trading result. Set by the
+    /// parser that made the update, never by a caller (review B2): OKX's equity push does not.
+    pub(crate) transfer_flags: bool,
+}
+
+impl EquityUpdate {
+    pub(crate) fn new(total_equity: Decimal, transfer_flags: bool) -> Self {
+        Self {
+            total_equity,
+            transfer_flags,
+        }
+    }
+
+    pub fn total_equity(&self) -> Decimal {
+        self.total_equity
+    }
 }
 
 /// Why an account changed (Binance `ACCOUNT_UPDATE` `m`). Segment e uses it to re-base the

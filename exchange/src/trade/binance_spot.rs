@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 
 const PRODUCT: TradeProduct = TradeProduct::BinanceSpot;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct SpotEntry<'a> {
     pub rules: &'a SymbolRules,
     pub side: Side,
@@ -26,11 +26,27 @@ pub struct SpotEntry<'a> {
     pub exec: Exec,
     /// Last price; needed for the notional check of a market order.
     pub ref_price: Option<Decimal>,
-    pub client_id: &'a ClientId,
+    /// Owned: one id belongs to one request (condition 61).
+    pub client_id: ClientId,
+}
+
+#[cfg(test)]
+impl SpotEntry<'_> {
+    /// Tests build the same order several times; production code cannot (condition 61).
+    pub(crate) fn duplicate(&self) -> SpotEntry<'_> {
+        SpotEntry {
+            rules: self.rules,
+            side: self.side,
+            qty: self.qty,
+            exec: self.exec,
+            ref_price: self.ref_price,
+            client_id: ClientId::parse(self.client_id.as_str()).unwrap(),
+        }
+    }
 }
 
 /// `POST /api/v3/order` (LIMIT or MARKET).
-pub fn new_order(i: &SpotEntry<'_>) -> Result<BinanceRequest, TradeError> {
+pub fn new_order(i: SpotEntry<'_>) -> Result<BinanceRequest, TradeError> {
     i.rules.require_product(PRODUCT)?;
     let id = i.client_id.check(IdField::BinanceSpot)?;
     let market = matches!(i.exec, Exec::Market);
@@ -73,7 +89,7 @@ fn order_type(kind: ProtectiveKind) -> &'static str {
 /// ([`super::checks::check_protective_qty_available`]).
 pub(crate) fn build_protective_order(
     rules: &SymbolRules,
-    p: &Protective<'_>,
+    p: Protective,
 ) -> Result<BinanceRequest, TradeError> {
     rules.require_product(PRODUCT)?;
     let id = p.client_id.check(IdField::BinanceSpot)?;
@@ -139,15 +155,29 @@ pub(crate) fn build_protective_order(
 }
 
 /// The sell pair of an OCO or OTOCO: a take-profit `LIMIT_MAKER` above and a stop below.
-#[derive(Debug, Clone, Copy)]
-pub struct SpotExits<'a> {
+#[derive(Debug)]
+pub struct SpotExits {
     pub take_profit_price: Decimal,
     pub stop_trigger: Decimal,
     /// `Some` makes the stop a `STOP_LOSS_LIMIT` with this limit price.
     pub stop_limit_price: Option<Decimal>,
     pub stop_tif: TimeInForce,
-    pub take_profit_id: &'a ClientId,
-    pub stop_id: &'a ClientId,
+    pub take_profit_id: ClientId,
+    pub stop_id: ClientId,
+}
+
+#[cfg(test)]
+impl SpotExits {
+    pub(crate) fn duplicate(&self) -> SpotExits {
+        SpotExits {
+            take_profit_price: self.take_profit_price,
+            stop_trigger: self.stop_trigger,
+            stop_limit_price: self.stop_limit_price,
+            stop_tif: self.stop_tif,
+            take_profit_id: ClientId::parse(self.take_profit_id.as_str()).unwrap(),
+            stop_id: ClientId::parse(self.stop_id.as_str()).unwrap(),
+        }
+    }
 }
 
 struct Exits {
@@ -156,7 +186,7 @@ struct Exits {
     stop_limit: Option<Decimal>,
 }
 
-fn round_exits(rules: &SymbolRules, e: &SpotExits<'_>) -> Result<Exits, TradeError> {
+fn round_exits(rules: &SymbolRules, e: &SpotExits) -> Result<Exits, TradeError> {
     e.take_profit_id.check(IdField::BinanceSpot)?;
     e.stop_id.check(IdField::BinanceSpot)?;
     // Sells: limit prices round up, the stop trigger to the nearest tick.
@@ -181,18 +211,31 @@ fn check_distinct(ids: &[&str]) -> Result<(), TradeError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct SpotOco<'a> {
     pub rules: &'a SymbolRules,
     pub qty: Decimal,
     /// Last price: `stop < last < take profit` must hold.
     pub ref_price: Decimal,
-    pub exits: SpotExits<'a>,
-    pub list_id: &'a ClientId,
+    pub exits: SpotExits,
+    pub list_id: ClientId,
+}
+
+#[cfg(test)]
+impl SpotOco<'_> {
+    pub(crate) fn duplicate(&self) -> SpotOco<'_> {
+        SpotOco {
+            rules: self.rules,
+            qty: self.qty,
+            ref_price: self.ref_price,
+            exits: self.exits.duplicate(),
+            list_id: ClientId::parse(self.list_id.as_str()).unwrap(),
+        }
+    }
 }
 
 /// `POST /api/v3/orderList/oco`: sell with a take-profit above and a stop below.
-pub(crate) fn build_oco(i: &SpotOco<'_>) -> Result<BinanceRequest, TradeError> {
+pub(crate) fn build_oco(i: SpotOco<'_>) -> Result<BinanceRequest, TradeError> {
     i.rules.require_product(PRODUCT)?;
     let list_id = i.list_id.check(IdField::BinanceSpot)?;
     let ex = round_exits(i.rules, &i.exits)?;
@@ -240,7 +283,7 @@ const OTOCO_BELOW: BelowNames = [
     "pendingBelowTimeInForce",
 ];
 
-fn push_below(r: &mut BinanceRequest, names: BelowNames, ex: &Exits, e: &SpotExits<'_>) {
+fn push_below(r: &mut BinanceRequest, names: BelowNames, ex: &Exits, e: &SpotExits) {
     r.push(
         names[0],
         if ex.stop_limit.is_some() {
@@ -257,25 +300,40 @@ fn push_below(r: &mut BinanceRequest, names: BelowNames, ex: &Exits, e: &SpotExi
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct SpotOtoco<'a> {
     pub rules: &'a SymbolRules,
     pub qty: Decimal,
     /// Working order: a buy `LIMIT` that, once fully filled, places the exit pair.
     pub entry_price: Decimal,
     pub entry_tif: TimeInForce,
-    pub exits: SpotExits<'a>,
-    pub list_id: &'a ClientId,
-    pub entry_id: &'a ClientId,
+    pub exits: SpotExits,
+    pub list_id: ClientId,
+    pub entry_id: ClientId,
+}
+
+#[cfg(test)]
+impl SpotOtoco<'_> {
+    pub(crate) fn duplicate(&self) -> SpotOtoco<'_> {
+        SpotOtoco {
+            rules: self.rules,
+            qty: self.qty,
+            entry_price: self.entry_price,
+            entry_tif: self.entry_tif,
+            exits: self.exits.duplicate(),
+            list_id: ClientId::parse(self.list_id.as_str()).unwrap(),
+            entry_id: ClientId::parse(self.entry_id.as_str()).unwrap(),
+        }
+    }
 }
 
 /// `POST /api/v3/orderList/otoco`: a buy limit that triggers a sell OCO pair.
 #[cfg(test)]
-pub(crate) fn build_otoco(i: &SpotOtoco<'_>) -> Result<BinanceRequest, TradeError> {
+pub(crate) fn build_otoco(i: SpotOtoco<'_>) -> Result<BinanceRequest, TradeError> {
     otoco_with_fee(i, 0)
 }
 
-fn otoco_with_fee(i: &SpotOtoco<'_>, fee_bps: u32) -> Result<BinanceRequest, TradeError> {
+fn otoco_with_fee(i: SpotOtoco<'_>, fee_bps: u32) -> Result<BinanceRequest, TradeError> {
     i.rules.require_product(PRODUCT)?;
     let list_id = i.list_id.check(IdField::BinanceSpot)?;
     let entry_id = i.entry_id.check(IdField::BinanceSpot)?;
@@ -332,7 +390,7 @@ fn after_fee(rules: &SymbolRules, qty: &Decimal, fee_bps: u32) -> Result<Decimal
 /// free base-asset balance after fees (condition 64).
 pub fn new_protective_order(
     rules: &SymbolRules,
-    p: &Protective<'_>,
+    p: Protective,
     available: &Decimal,
 ) -> Result<BinanceRequest, TradeError> {
     if let Size::Qty(q) = p.size {
@@ -343,14 +401,14 @@ pub fn new_protective_order(
 
 /// `POST /api/v3/orderList/oco`; the quantity may not exceed `available` (free balance
 /// after fees).
-pub fn new_oco(i: &SpotOco<'_>, available: &Decimal) -> Result<BinanceRequest, TradeError> {
+pub fn new_oco(i: SpotOco<'_>, available: &Decimal) -> Result<BinanceRequest, TradeError> {
     super::checks::check_protective_qty_available(&i.rules.round_qty(&i.qty, false)?, available)?;
     build_oco(i)
 }
 
 /// `POST /api/v3/orderList/otoco`; the exit pair sells the filled quantity less the buy fee
 /// (`fee_bps`, taken in the base asset, rounded down). A fee paid in BNB is not assumed.
-pub fn new_otoco(i: &SpotOtoco<'_>, fee_bps: u32) -> Result<BinanceRequest, TradeError> {
+pub fn new_otoco(i: SpotOtoco<'_>, fee_bps: u32) -> Result<BinanceRequest, TradeError> {
     otoco_with_fee(i, fee_bps)
 }
 
@@ -426,6 +484,39 @@ mod tests {
         ClientId::parse(s).unwrap()
     }
 
+    // The builders consume their input (one id, one request). These wrappers let a test build
+    // the same input again, with a copy of the id.
+    fn dup(c: &ClientId) -> ClientId {
+        id(c.as_str())
+    }
+
+    fn new_order(i: &SpotEntry<'_>) -> Result<BinanceRequest, TradeError> {
+        super::new_order(i.duplicate())
+    }
+
+    fn build_protective_order(
+        rules: &SymbolRules,
+        p: &Protective,
+    ) -> Result<BinanceRequest, TradeError> {
+        super::build_protective_order(rules, p.duplicate())
+    }
+
+    fn build_oco(i: &SpotOco<'_>) -> Result<BinanceRequest, TradeError> {
+        super::build_oco(i.duplicate())
+    }
+
+    fn build_otoco(i: &SpotOtoco<'_>) -> Result<BinanceRequest, TradeError> {
+        super::build_otoco(i.duplicate())
+    }
+
+    fn new_oco(i: &SpotOco<'_>, available: &Decimal) -> Result<BinanceRequest, TradeError> {
+        super::new_oco(i.duplicate(), available)
+    }
+
+    fn new_otoco(i: &SpotOtoco<'_>, fee_bps: u32) -> Result<BinanceRequest, TradeError> {
+        super::new_otoco(i.duplicate(), fee_bps)
+    }
+
     fn signed(r: &BinanceRequest) -> String {
         let s = r.signed(SECRET, 5000, TS).unwrap();
         assert!(s.body.starts_with(&s.query));
@@ -440,7 +531,7 @@ mod tests {
         s.query
     }
 
-    fn prot<'a>(kind: ProtectiveKind, cid: &'a ClientId) -> Protective<'a> {
+    fn prot(kind: ProtectiveKind, cid: &ClientId) -> Protective {
         Protective {
             kind,
             dir: Dir::Long,
@@ -451,7 +542,7 @@ mod tests {
             working_type: WorkingType::ContractPrice,
             trailing: None,
             ref_price: d("60000"),
-            client_id: cid,
+            client_id: dup(cid),
         }
     }
 
@@ -471,7 +562,7 @@ mod tests {
                 tif: TimeInForce::Gtc,
             },
             ref_price: None,
-            client_id: &cid,
+            client_id: dup(&cid),
         };
         assert_eq!(
             signed(&new_order(&e).unwrap()),
@@ -483,7 +574,7 @@ mod tests {
             exec: Exec::Market,
             ref_price: Some(d("60000")),
             side: Side::Sell,
-            ..e
+            ..e.duplicate()
         };
         assert_eq!(
             signed(&new_order(&m).unwrap()),
@@ -494,7 +585,7 @@ mod tests {
         // a market order cannot be checked against min notional without a reference price
         let m = SpotEntry {
             ref_price: None,
-            ..m
+            ..m.duplicate()
         };
         assert_eq!(
             new_order(&m).unwrap_err(),
@@ -594,14 +685,14 @@ mod tests {
         );
     }
 
-    fn exits<'a>(tp_id: &'a ClientId, sl_id: &'a ClientId, limit: Option<&str>) -> SpotExits<'a> {
+    fn exits(tp_id: &ClientId, sl_id: &ClientId, limit: Option<&str>) -> SpotExits {
         SpotExits {
             take_profit_price: d("61000.001"),
             stop_trigger: d("59000.004"),
             stop_limit_price: limit.map(d),
             stop_tif: TimeInForce::Gtc,
-            take_profit_id: tp_id,
-            stop_id: sl_id,
+            take_profit_id: dup(tp_id),
+            stop_id: dup(sl_id),
         }
     }
 
@@ -615,7 +706,7 @@ mod tests {
             qty: d("0.12345678"),
             ref_price: d("60000"),
             exits: exits(&tp, &sl, None),
-            list_id: &list,
+            list_id: dup(&list),
         };
         let r = build_oco(&i).unwrap();
         assert_eq!(r.path(), "/api/v3/orderList/oco");
@@ -627,7 +718,7 @@ mod tests {
         );
         let i2 = SpotOco {
             exits: exits(&tp, &sl, Some("58990.001")),
-            ..i
+            ..i.duplicate()
         };
         assert_eq!(
             signed(&build_oco(&i2).unwrap()),
@@ -638,7 +729,7 @@ mod tests {
         // last price outside the pair
         let bad = SpotOco {
             ref_price: d("62000"),
-            ..i
+            ..i.duplicate()
         };
         assert_eq!(build_oco(&bad).unwrap_err(), TradeError::TriggerOnWrongSide);
     }
@@ -654,8 +745,8 @@ mod tests {
             entry_price: d("60000.009"),
             entry_tif: TimeInForce::Gtc,
             exits: exits(&tp, &sl, None),
-            list_id: &list,
-            entry_id: &entry,
+            list_id: dup(&list),
+            entry_id: dup(&entry),
         };
         let r = build_otoco(&i).unwrap();
         assert_eq!(r.path(), "/api/v3/orderList/otoco");
@@ -667,7 +758,7 @@ mod tests {
         );
         let bad = SpotOtoco {
             entry_price: d("58000"),
-            ..i
+            ..i.duplicate()
         };
         assert_eq!(
             build_otoco(&bad).unwrap_err(),
@@ -721,13 +812,13 @@ mod tests {
                 tif: TimeInForce::Gtc,
             },
             ref_price: None,
-            client_id: &cid,
+            client_id: dup(&cid),
         };
         // 0.00001 * 100 = 0.001 < 5
         assert_eq!(new_order(&e).unwrap_err(), TradeError::NotionalBelowMin);
         let e = SpotEntry {
             qty: d("0.000001"),
-            ..e
+            ..e.duplicate()
         };
         assert_eq!(new_order(&e).unwrap_err(), TradeError::NonPositive);
     }
@@ -743,7 +834,7 @@ mod tests {
                 qty: d("0.12345678"),
                 ref_price: d("60000"),
                 exits: exits(tp, sl, None),
-                list_id: list,
+                list_id: dup(list),
             })
         };
         assert!(oco(&list, &tp, &sl).is_ok());
@@ -758,8 +849,8 @@ mod tests {
                 entry_price: d("60000"),
                 entry_tif: TimeInForce::Gtc,
                 exits: exits(tp, sl, None),
-                list_id: list,
-                entry_id: entry,
+                list_id: dup(list),
+                entry_id: dup(entry),
             })
         };
         assert!(otoco(&list, &entry, &tp, &sl).is_ok());
@@ -786,8 +877,8 @@ mod tests {
             entry_price: d("60000"),
             entry_tif: TimeInForce::Gtc,
             exits: exits(&tp, &sl, None),
-            list_id: &list,
-            entry_id: &entry,
+            list_id: dup(&list),
+            entry_id: dup(&entry),
         };
         // 10 bps fee: 0.12345 * 0.999 = 0.12332655, floored to the 0.00001 step
         let s = signed(&new_otoco(&i, 10).unwrap());
@@ -807,7 +898,7 @@ mod tests {
             qty: d("0.1"),
             ref_price: d("60000"),
             exits: exits(&tp, &sl, None),
-            list_id: &list,
+            list_id: dup(&list),
         };
         assert!(new_oco(&i, &d("0.09")).is_err());
         assert!(new_oco(&i, &d("0.1")).is_ok());
