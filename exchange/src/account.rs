@@ -1143,7 +1143,7 @@ pub async fn check_account(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -1682,7 +1682,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::{Mutex, Once};
 
-    static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    pub(crate) static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     struct CaptureLogger;
     impl log::Log for CaptureLogger {
@@ -1698,7 +1698,7 @@ mod tests {
         fn flush(&self) {}
     }
 
-    fn capture_logs() {
+    pub(crate) fn capture_logs() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             let _ = log::set_logger(&CaptureLogger);

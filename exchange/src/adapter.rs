@@ -3,7 +3,7 @@ mod http;
 mod hub;
 pub(crate) mod limiter;
 pub mod proxy;
-mod ws;
+pub(crate) mod ws;
 
 use super::Timeframe;
 pub use super::error::{AdapterError, FetchError};

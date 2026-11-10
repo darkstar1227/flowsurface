@@ -128,7 +128,7 @@ impl TradeClient {
             let at = self.mono_ms();
             let look = self.lookup_once(&pending).await;
             if look == Look::Found {
-                self.unlock(&pending.symbol);
+                self.unlock(&pending.symbol, pending.client_id());
                 return Resolution::Found;
             }
             let next = match waits.next() {
@@ -146,7 +146,7 @@ impl TradeClient {
             }
         };
         if last == Look::NotFound && at >= settled {
-            self.unlock(&pending.symbol);
+            self.unlock(&pending.symbol, pending.client_id());
             Resolution::NotPlacedPresumed
         } else {
             Resolution::Unresolved(Box::new(pending))

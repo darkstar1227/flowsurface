@@ -5,7 +5,8 @@ use crate::{Ticker, TickerInfo, Trade, UnixMs};
 
 use bytes::Bytes;
 use fastwebsockets::{
-    FragmentCollectorRead, Frame, OpCode, Payload, WebSocket, WebSocketError, WebSocketWrite,
+    FragmentCollectorRead, Frame, OpCode, Payload, WebSocket, WebSocketError, WebSocketRead,
+    WebSocketWrite,
 };
 use http_body_util::Empty;
 use hyper::{
@@ -24,14 +25,13 @@ use tokio_rustls::{
 use url::Url;
 
 use futures::StreamExt;
-#[cfg(not(feature = "unbounded-channel"))]
-use futures::channel::mpsc::Sender;
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 const HEARTBEAT_SEND_FAILED_REASON: &str = "Failed to send heartbeat ping";
 const HEARTBEAT_PONG_FAILED_REASON: &str = "Failed to reply pong";
+const FRAGMENTED_FRAME_REASON: &str = "Fragmented frame on a private stream";
 const HEARTBEAT_TIMEOUT_REASON: &str = "Heartbeat timeout (no websocket activity)";
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -57,6 +57,9 @@ enum AnySender<T> {
     #[cfg(not(feature = "unbounded-channel"))]
     Bounded(Sender<T>),
     Unbounded(UnboundedSender<T>),
+    /// Always bounded, whatever the `unbounded-channel` feature says: the private streams use
+    /// it, and a full channel ends the connection (the caller reconnects and reads again).
+    Capped(Sender<T>),
 }
 
 impl<T> AnySender<T> {
@@ -65,6 +68,7 @@ impl<T> AnySender<T> {
             #[cfg(not(feature = "unbounded-channel"))]
             AnySender::Bounded(tx) => tx.try_send(item),
             AnySender::Unbounded(tx) => tx.unbounded_send(item),
+            AnySender::Capped(tx) => tx.try_send(item),
         }
     }
 }
@@ -238,7 +242,8 @@ impl WsSession {
                     let (tx, rx) = futures::channel::mpsc::unbounded();
                     (AnySender::Unbounded(tx), AnyReceiver::Unbounded(rx))
                 };
-                let io_handle = tokio::spawn(transport.read_frame(heartbeat_policy, frame_tx));
+                let io_handle =
+                    tokio::spawn(transport.read_frame(heartbeat_policy, frame_tx, false));
 
                 for event in adapter.on_connected().await {
                     let _ = event_tx.send(event);
@@ -366,7 +371,7 @@ pub(crate) enum PingPayload {
 /// frames. The policy determines when the connection sends a heartbeat and
 /// when a lack of inbound activity is treated as a dead connection.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum HeartbeatPolicy {
+pub(crate) enum HeartbeatPolicy {
     /// Send an application or control ping at a fixed cadence.
     ///
     /// The next ping is scheduled after the previous write succeeds. The
@@ -397,7 +402,7 @@ pub(super) enum HeartbeatPolicy {
 impl HeartbeatPolicy {
     /// Creates a [`PeriodicClientPing`](HeartbeatPolicy::PeriodicClientPing) policy
     /// that sends an application-level text ping.
-    pub(super) const fn periodic_text(
+    pub(crate) const fn periodic_text(
         payload: &'static [u8],
         every: Duration,
         silence_timeout: Duration,
@@ -426,7 +431,7 @@ impl HeartbeatPolicy {
 
     /// Creates a [`PingAfterIdle`](HeartbeatPolicy::PingAfterIdle) policy
     /// that sends an application-level text ping.
-    pub(super) const fn ping_after_idle_text(
+    pub(crate) const fn ping_after_idle_text(
         payload: &'static [u8],
         idle_for: Duration,
         response_timeout: Duration,
@@ -440,7 +445,7 @@ impl HeartbeatPolicy {
 
     /// Creates a [`ServerDriven`](HeartbeatPolicy::ServerDriven) policy
     /// that only observes server-driven activity.
-    pub(super) const fn server_driven(silence_timeout: Duration) -> Self {
+    pub(crate) const fn server_driven(silence_timeout: Duration) -> Self {
         Self::ServerDriven { silence_timeout }
     }
 }
@@ -593,8 +598,40 @@ impl WsHeartbeat {
     }
 }
 
+/// One frame, copied out of the reader.
+struct OwnedFrame {
+    opcode: OpCode,
+    fin: bool,
+    payload: Vec<u8>,
+}
+
+/// Where a connection reads its frames from.
+enum FrameReader<R> {
+    /// Fragments are joined by the library (public streams).
+    Collected(FragmentCollectorRead<R>),
+    /// Frames are handed over as they come, so the caller sees a fragment (private streams,
+    /// which refuse them: the library puts no limit on the joined size).
+    Strict(WebSocketRead<R>),
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    async fn read(&mut self) -> Result<OwnedFrame, WebSocketError> {
+        let mut no_control_send =
+            |_frame: Frame<'_>| std::future::ready(Ok::<(), std::io::Error>(()));
+        let frame = match self {
+            Self::Collected(r) => r.read_frame(&mut no_control_send).await?,
+            Self::Strict(r) => r.read_frame(&mut no_control_send).await?,
+        };
+        Ok(OwnedFrame {
+            opcode: frame.opcode,
+            fin: frame.fin,
+            payload: Vec::from(frame.payload),
+        })
+    }
+}
+
 struct WsConnection<R, W> {
-    reader: FragmentCollectorRead<R>,
+    reader: FrameReader<R>,
     writer: WebSocketWrite<W>,
     heartbeat: WsHeartbeat,
     frame_tx: AnySender<Result<Vec<u8>, String>>,
@@ -606,7 +643,7 @@ where
     W: AsyncWrite + Unpin,
 {
     fn new(
-        reader: FragmentCollectorRead<R>,
+        reader: FrameReader<R>,
         writer: WebSocketWrite<W>,
         heartbeat_policy: HeartbeatPolicy,
         frame_tx: AnySender<Result<Vec<u8>, String>>,
@@ -628,9 +665,7 @@ where
         } = self;
 
         loop {
-            let mut no_control_send =
-                |_frame: Frame<'_>| std::future::ready(Ok::<(), std::io::Error>(()));
-            let mut read_future = Box::pin(reader.read_frame(&mut no_control_send));
+            let mut read_future = Box::pin(reader.read());
 
             let outcome = loop {
                 let deadline = heartbeat.next_deadline();
@@ -662,13 +697,16 @@ where
 
             heartbeat.mark_activity(Instant::now());
 
+            // Only a strict reader can show a fragment; a joined message is always final.
+            if !message.fin || message.opcode == OpCode::Continuation {
+                let _ = frame_tx.send(Err(FRAGMENTED_FRAME_REASON.into()));
+                break;
+            }
+
             let keep_connection = match message.opcode {
-                OpCode::Text => {
-                    let payload = Vec::from(&message.payload[..]);
-                    frame_tx.send(Ok(payload)).is_ok()
-                }
+                OpCode::Text => frame_tx.send(Ok(message.payload)).is_ok(),
                 OpCode::Ping => {
-                    let payload = Vec::from(message.payload);
+                    let payload = message.payload;
                     if writer
                         .write_frame(Frame::pong(Payload::Owned(payload)))
                         .await
@@ -681,7 +719,7 @@ where
                     }
                 }
                 OpCode::Close => {
-                    let payload = Vec::from(message.payload);
+                    let payload = message.payload;
                     let close_reason = format_close_frame_reason(&payload);
                     let _ = writer
                         .write_frame(Frame::close_raw(Payload::Owned(payload)))
@@ -769,7 +807,7 @@ fn format_close_frame_reason(payload: &[u8]) -> String {
     }
 }
 
-pub(super) struct WsTransport(WebSocket<TokioIo<Upgraded>>);
+pub(crate) struct WsTransport(WebSocket<TokioIo<Upgraded>>);
 
 impl WsTransport {
     /// Reads frames, handles heartbeat and Ping/Pong at transport level,
@@ -778,22 +816,75 @@ impl WsTransport {
         self,
         heartbeat_policy: HeartbeatPolicy,
         frame_tx: AnySender<Result<Vec<u8>, String>>,
+        strict: bool,
     ) {
         let (mut reader, writer) = self.0.split(tokio::io::split);
         reader.set_auto_pong(false);
         reader.set_auto_close(false);
 
-        let reader = FragmentCollectorRead::new(reader);
+        let reader = if strict {
+            FrameReader::Strict(reader)
+        } else {
+            FrameReader::Collected(FragmentCollectorRead::new(reader))
+        };
         WsConnection::new(reader, writer, heartbeat_policy, frame_tx)
             .run()
             .await;
     }
 
-    pub(super) async fn write_frame(&mut self, frame: Frame<'_>) -> Result<(), WebSocketError> {
+    /// Starts the reader task: text frames arrive on the returned receiver (an empty payload
+    /// marks a control frame), a transport failure arrives once as `Err(reason)`, and the
+    /// receiver closes when the task ends. Dropping the handle's task (`abort`) stops reading.
+    ///
+    /// For private streams: the channel holds at most `capacity` frames (a full channel ends
+    /// the connection, so a flood or a stalled consumer cannot grow memory), and a fragmented
+    /// message ends it too (their total length is not capped by the library).
+    pub(crate) fn spawn_reader(
+        self,
+        heartbeat_policy: HeartbeatPolicy,
+        capacity: usize,
+    ) -> (
+        Receiver<Result<Vec<u8>, String>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = futures::channel::mpsc::channel(capacity);
+        let handle = tokio::spawn(self.read_frame(heartbeat_policy, AnySender::Capped(tx), true));
+        (rx, handle)
+    }
+
+    /// Writes one frame. Nothing here logs the frame: login and subscribe frames carry
+    /// credentials (condition 46).
+    pub(crate) async fn write_frame(&mut self, frame: Frame<'_>) -> Result<(), WebSocketError> {
         self.0.write_frame(frame).await
     }
 
-    pub(super) async fn establish(
+    /// Reads the next complete text frame before the reader task starts (login and subscribe
+    /// answers). Pings are answered by the library; a close, a binary or a fragmented frame, a
+    /// timeout or an error ends the wait with a coarse reason that holds no frame content.
+    pub(crate) async fn read_text(&mut self, wait: Duration) -> Result<Vec<u8>, &'static str> {
+        let read = async {
+            loop {
+                let frame = self.0.read_frame().await.map_err(|_| "read failed")?;
+                match frame.opcode {
+                    OpCode::Text if frame.fin => return Ok(frame.payload.to_vec()),
+                    OpCode::Ping | OpCode::Pong => {}
+                    OpCode::Close => return Err("closed"),
+                    _ => return Err("unexpected frame"),
+                }
+            }
+        };
+        tokio::time::timeout(wait, read)
+            .await
+            .map_err(|_| "timed out")?
+    }
+
+    /// Caps the size of one incoming frame (the library default is 64 MiB). Used by the
+    /// private streams, whose frames are small (condition 52).
+    pub(crate) fn limit_frame_size(&mut self, max_bytes: usize) {
+        self.0.set_max_message_size(max_bytes);
+    }
+
+    pub(crate) async fn establish(
         domain: &str,
         url: &str,
         proxy_cfg: Option<&Proxy>,
@@ -934,7 +1025,7 @@ impl WsTransport {
 /// Delay doubles on each failure, resets to the initial 500ms on success.
 /// Capped at 30s with ±25% multiplicative jitter to spread reconnections
 /// across streams when multiple disconnect at once.
-struct ReconnectBackoff {
+pub(crate) struct ReconnectBackoff {
     current: Duration,
 }
 
@@ -943,27 +1034,27 @@ impl ReconnectBackoff {
     const MAX: Duration = Duration::from_secs(30);
     const JITTER: f32 = 0.25;
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             current: Self::INITIAL,
         }
     }
 
     /// Returns the delay before the next reconnect attempt, with ±jitter applied.
-    fn delay(&self) -> Duration {
+    pub(crate) fn delay(&self) -> Duration {
         let factor = 1.0 + (rand::random::<f32>() * 2.0 - 1.0) * Self::JITTER;
         let secs = self.current.as_secs_f32() * factor;
         Duration::from_secs_f32(secs.max(0.0)).min(Self::MAX)
     }
 
     /// Doubles the delay (capped) after a failed attempt.
-    fn record_failure(&mut self) {
+    pub(crate) fn record_failure(&mut self) {
         self.current = (self.current.mul_f32(2.0)).min(Self::MAX);
     }
 
     /// Resets the delay to the initial value after genuine success
     /// (real market-data events were produced by the connection).
-    fn record_success(&mut self) {
+    pub(crate) fn record_success(&mut self) {
         self.current = Self::INITIAL;
     }
 }
@@ -1023,5 +1114,82 @@ impl TradeBuffer {
         }
 
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastwebsockets::Role;
+    use tokio::io::AsyncWriteExt;
+
+    fn text(fin: bool, continuation: bool, body: &[u8]) -> Vec<u8> {
+        let op = if continuation { 0x0 } else { 0x1 };
+        let mut v = vec![if fin { 0x80 } else { 0x00 } | op, body.len() as u8];
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Feed raw server frames to a connection and collect what it forwards until it ends.
+    async fn run(strict: bool, capacity: usize, frames: Vec<u8>) -> Vec<Result<Vec<u8>, String>> {
+        let (client_io, mut server_io) = tokio::io::duplex(1 << 16);
+        let (mut r, w) =
+            WebSocket::after_handshake(client_io, Role::Client).split(tokio::io::split);
+        r.set_auto_pong(false);
+        r.set_auto_close(false);
+        let reader = if strict {
+            FrameReader::Strict(r)
+        } else {
+            FrameReader::Collected(FragmentCollectorRead::new(r))
+        };
+        let (tx, mut rx) = futures::channel::mpsc::channel(capacity);
+        let conn = WsConnection::new(
+            reader,
+            w,
+            HeartbeatPolicy::server_driven(Duration::from_secs(60)),
+            AnySender::Capped(tx),
+        );
+        let task = tokio::spawn(conn.run());
+        server_io.write_all(&frames).await.unwrap();
+        drop(server_io);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the connection ended")
+            .unwrap();
+        let mut got = Vec::new();
+        while let Some(item) = rx.next().await {
+            got.push(item);
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn a_strict_reader_ends_the_connection_on_a_fragment() {
+        let mut frames = text(false, false, b"ab");
+        frames.extend(text(true, true, b"cd"));
+        let got = run(true, 8, frames).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(matches!(&got[0], Err(e) if e == FRAGMENTED_FRAME_REASON));
+        // A stray continuation is refused too.
+        let got = run(true, 8, text(true, true, b"cd")).await;
+        assert!(matches!(&got[0], Err(e) if e == FRAGMENTED_FRAME_REASON));
+    }
+
+    #[tokio::test]
+    async fn a_strict_reader_passes_whole_frames_and_a_joining_reader_still_joins() {
+        let got = run(true, 8, text(true, false, b"whole")).await;
+        assert_eq!(got[0], Ok(b"whole".to_vec()));
+        let mut frames = text(false, false, b"ab");
+        frames.extend(text(true, true, b"cd"));
+        let got = run(false, 8, frames).await;
+        assert_eq!(got[0], Ok(b"abcd".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_full_channel_ends_the_connection_instead_of_growing() {
+        let frames: Vec<u8> = (0..50).flat_map(|_| text(true, false, b"x")).collect();
+        let got = run(true, 1, frames).await;
+        let frames_seen = got.iter().filter(|g| g.is_ok()).count();
+        assert!(frames_seen <= 3, "{frames_seen} frames were queued");
     }
 }
