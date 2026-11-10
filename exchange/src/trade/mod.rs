@@ -23,6 +23,7 @@ pub mod queries;
 pub mod request;
 pub mod risk;
 pub mod rules;
+pub mod stream;
 pub mod types;
 pub mod unknown;
 

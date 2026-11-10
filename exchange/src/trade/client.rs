@@ -359,6 +359,48 @@ impl TradeClient {
         send_limited_meta(&self.http, &key, priority, method, url, headers, body).await
     }
 
+    // ── Private stream support (stage b) ────────────────────────────────
+
+    /// Set the server-time offset measured elsewhere (the stream task shares one offset).
+    pub(super) fn set_clock_offset_ms(&self, offset: i64) {
+        self.clock_offset_ms.store(offset, Ordering::Relaxed);
+    }
+
+    /// A USDⓈ-M user-data-stream call (`POST`/`PUT`/`DELETE /fapi/v1/listenKey`, condition 49).
+    /// These endpoints take the API key only: no signature, no parameters (the account has one
+    /// key, `POST` returns it again and extends it). The request goes through the shared limiter
+    /// at IP weight 1, with protective priority so extending the key is never starved. The
+    /// response is returned parsed; the caller turns it into a `ListenKey` at once.
+    pub(super) async fn listen_key_call(
+        &self,
+        method: reqwest::Method,
+    ) -> Result<Value, AccountError> {
+        check_proxy_snapshot(&self.proxy_snapshot, &(self.current_proxy)())?;
+        if (self.venue, self.product) != (AccountVenue::Binance, AccountProduct::UsdM) {
+            return Err(AccountError::InvalidEndpoint);
+        }
+        let (_, host, _) = binance_hosts(self.env, self.product);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-MBX-APIKEY", sensitive(self.creds.key().expose_secret())?);
+        let url = self.url(host, "/fapi/v1/listenKey")?;
+        let key = LimitKey::Binance {
+            host: self.limit_host(host),
+            weight: 1,
+            account: Some(self.account),
+        };
+        send_limited_meta(
+            &self.http,
+            &key,
+            Priority::Protective,
+            method,
+            url,
+            headers,
+            None,
+        )
+        .await
+        .0
+    }
+
     // ── The gate ────────────────────────────────────────────────────────
 
     /// Run the single gate and send. `token` is the user's confirmation, spent here.
@@ -410,15 +452,19 @@ impl TradeClient {
         // An entry is marked in flight before it goes out (F2): a second entry on the same
         // symbol is refused until this one returns, and a send that is dropped half way
         // leaves the symbol locked.
-        let inflight = match intent.exposure() {
-            Exposure::Adds { .. } => Some(locks::reserve(self.account, &intent.symbol)?),
-            Exposure::Reduces | Exposure::Neutral => None,
-        };
         let lookup: Option<Lookup> = match &intent.prepared {
             Prepared::Binance(r) => r.lookup(),
             Prepared::Okx(r) => r.lookup(),
         };
         let client_id = lookup.as_ref().map(|l| l.client_id.clone());
+        let inflight = match intent.exposure() {
+            Exposure::Adds { .. } => Some(locks::reserve(
+                self.account,
+                &intent.symbol,
+                client_id.as_deref(),
+            )?),
+            Exposure::Reduces | Exposure::Neutral => None,
+        };
         let outcome = match &intent.prepared {
             Prepared::Binance(r) => {
                 let (result, status) = self.call_binance(r, priority).await;
@@ -440,8 +486,10 @@ impl TradeClient {
             lookup.is_some(),
         );
         match inflight {
-            Some(g) => g.finish(unknown),
-            None if unknown => locks::lock_unknown(self.account, &intent.symbol),
+            Some(g) => g.finish(unknown, client_id.as_deref()),
+            None if unknown => {
+                locks::lock_unknown(self.account, &intent.symbol, client_id.as_deref())
+            }
             None => {}
         }
         let pending = match (&outcome, lookup) {
@@ -464,8 +512,9 @@ impl TradeClient {
         locks::is_locked(self.account, symbol)
     }
 
-    pub(super) fn unlock(&self, symbol: &str) {
-        locks::unlock_unknown(self.account, symbol);
+    /// Release the lock of a resolved send, by its client id (see `locks::resolve_client_id`).
+    pub(super) fn unlock(&self, symbol: &str, client_id: &str) {
+        locks::resolve_client_id(self.account, symbol, client_id);
     }
 
     /// Look one order up by its client id. `Ok(true)` when the exchange knows it, `Ok(false)`
