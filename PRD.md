@@ -86,6 +86,7 @@
 - 用子帳戶金鑰並綁 IP。Binance HMAC 金鑰沒綁 IP 時只能有讀取權限；OKX 子帳戶的交易金鑰必須綁 IP。
 - OKX 下單端點有限流；Binance 依 weight 與下單數限流。沿用 `exchange/src/adapter/limiter.rs`。
 - 指標與交易完全隔離，指標不能觸發下單。
+- 完整安全條件與後續項目見 docs/trading-security.md。
 
 ## 4. 其他關鍵規格
 
