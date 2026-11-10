@@ -351,6 +351,7 @@ pub fn load_saved_state() -> SavedState {
     match data::read_from_file(data::SAVED_STATE_PATH) {
         Ok(state) => {
             let mut de_layouts = vec![];
+            let mut detached = vec![];
 
             for layout in &state.layout_manager.layouts {
                 let mut popout_windows = Vec::new();
@@ -367,6 +368,10 @@ pub fn load_saved_state() -> SavedState {
                     popout_windows,
                     layout.dashboard.chart_settings,
                 );
+
+                if let Some(window) = layout.detached {
+                    detached.push((layout_id, window));
+                }
 
                 de_layouts.push((layout.name.clone(), layout_id, dashboard));
             }
@@ -404,6 +409,7 @@ pub fn load_saved_state() -> SavedState {
                     active_layout,
                     state.layout_manager.chart_presets.clone(),
                     state.layout_manager.drawings.clone(),
+                    detached,
                 )
             };
 

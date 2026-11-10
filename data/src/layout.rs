@@ -14,6 +14,18 @@ pub const MAX_NAME_LENGTH: usize = 20;
 pub struct Layout {
     pub name: String,
     pub dashboard: Dashboard,
+    /// Set when the layout was open in its own window at save time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached: Option<DetachedWindow>,
+}
+
+/// Where a detached layout window was, and the size of the monitor it was on.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct DetachedWindow {
+    pub spec: WindowSpec,
+    /// Monitor size reported for the window; `None` when the platform could not tell.
+    #[serde(default)]
+    pub monitor: Option<(f32, f32)>,
 }
 
 impl Default for Layout {
@@ -21,6 +33,7 @@ impl Default for Layout {
         Self {
             name: "Default".to_string(),
             dashboard: Dashboard::default(),
+            detached: None,
         }
     }
 }
@@ -70,5 +83,53 @@ impl From<(&iced_core::Point, &iced_core::Size)> for WindowSpec {
             pos_x: point.x,
             pos_y: point.y,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layouts_saved_before_detaching_still_load() {
+        let json = serde_json::to_string(&Layout::default()).unwrap();
+        assert!(!json.contains("detached"));
+
+        let layout: Layout = serde_json::from_str(&json).unwrap();
+        assert!(layout.detached.is_none());
+        assert_eq!(layout.name, "Default");
+    }
+
+    #[test]
+    fn detached_window_round_trips() {
+        let layout = Layout {
+            detached: Some(DetachedWindow {
+                spec: WindowSpec {
+                    width: 800.0,
+                    height: 600.0,
+                    pos_x: -1920.0,
+                    pos_y: 32.0,
+                },
+                monitor: Some((1920.0, 1080.0)),
+            }),
+            ..Layout::default()
+        };
+
+        let json = serde_json::to_string(&layout).unwrap();
+        let back: Layout = serde_json::from_str(&json).unwrap();
+        let detached = back.detached.expect("detached window is kept");
+
+        assert_eq!(detached.spec.width, 800.0);
+        assert_eq!(detached.spec.height, 600.0);
+        assert_eq!(detached.spec.pos_x, -1920.0);
+        assert_eq!(detached.spec.pos_y, 32.0);
+        assert_eq!(detached.monitor, Some((1920.0, 1080.0)));
+    }
+
+    #[test]
+    fn detached_window_without_monitor_loads() {
+        let json = r#"{"name":"A","dashboard":{"pane":"Starter","popout":[]},"detached":{"spec":{"width":1.0,"height":2.0,"pos_x":3.0,"pos_y":4.0}}}"#;
+        let layout: Layout = serde_json::from_str(json).unwrap();
+        assert!(layout.detached.unwrap().monitor.is_none());
     }
 }

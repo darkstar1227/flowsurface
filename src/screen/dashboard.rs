@@ -494,6 +494,32 @@ impl Dashboard {
         Task::none()
     }
 
+    /// Moves every popped-out pane back into the main grid.
+    ///
+    /// Returns the windows the panes were in, which the caller closes if they are still open.
+    pub fn merge_all_popouts(&mut self, main_window: &Window) -> (Vec<window::Id>, Task<Message>) {
+        let windows = self.popout.keys().copied().collect::<Vec<_>>();
+        let mut tasks = vec![];
+
+        for window in &windows {
+            let Some((state, _)) = self.popout.remove(window) else {
+                continue;
+            };
+            for (_, pane_state) in state.panes {
+                // A focused main-grid pane would be split into a blank pane instead.
+                self.focus = None;
+                tasks.push(self.new_pane(
+                    pane_grid::Axis::Horizontal,
+                    main_window,
+                    Some(pane_state),
+                ));
+            }
+        }
+        self.focus = None;
+
+        (windows, Task::batch(tasks))
+    }
+
     pub fn get_pane(
         &self,
         main_window: window::Id,
@@ -1168,9 +1194,11 @@ impl Dashboard {
         }
     }
 
-    pub fn market_subscriptions(&self, handles: &AdapterHandles) -> Subscription<exchange::Event> {
-        let unique_streams = self
-            .streams
+    pub fn market_subscriptions(
+        streams: &UniqueStreams,
+        handles: &AdapterHandles,
+    ) -> Subscription<exchange::Event> {
+        let unique_streams = streams
             .combined_used()
             .flat_map(|(exchange, specs)| {
                 let mut subs = vec![];
