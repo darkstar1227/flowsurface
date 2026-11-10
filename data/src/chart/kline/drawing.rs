@@ -19,6 +19,7 @@ pub enum DrawingTool {
     VerticalLine,
     Box,
     Measure,
+    FibRetracement,
 }
 
 impl DrawingTool {
@@ -29,7 +30,11 @@ impl DrawingTool {
     pub const fn supports_magnet(self) -> bool {
         matches!(
             self,
-            Self::Trendline | Self::Box | Self::HorizontalLine | Self::VerticalLine
+            Self::Trendline
+                | Self::Box
+                | Self::HorizontalLine
+                | Self::VerticalLine
+                | Self::FibRetracement
         )
     }
 
@@ -40,6 +45,7 @@ impl DrawingTool {
             Self::HorizontalLine,
             Self::VerticalLine,
             Self::Box,
+            Self::FibRetracement,
             Self::Measure,
         ]
     }
@@ -52,6 +58,7 @@ impl DrawingTool {
             Self::HorizontalLine => "Horizontal line",
             Self::VerticalLine => "Vertical line",
             Self::Measure => "Measure",
+            Self::FibRetracement => "Fib retracement",
         }
     }
 
@@ -74,6 +81,10 @@ impl DrawingTool {
                 style.stroke_width = 1.0;
             }
             Self::VerticalLine => {
+                style.stroke_color = DrawingColor::accent(ThemeAccent::One, 1.0);
+                style.stroke_width = 1.0;
+            }
+            Self::FibRetracement => {
                 style.stroke_color = DrawingColor::accent(ThemeAccent::One, 1.0);
                 style.stroke_width = 1.0;
             }
@@ -383,6 +394,7 @@ pub struct DrawingStyleDefaults {
     pub box_drawing: DrawingStyle,
     pub horizontal_line: DrawingStyle,
     pub vertical_line: DrawingStyle,
+    pub fib_retracement: DrawingStyle,
 }
 
 impl Default for DrawingStyleDefaults {
@@ -392,6 +404,7 @@ impl Default for DrawingStyleDefaults {
             box_drawing: DrawingTool::Box.default_style(),
             horizontal_line: DrawingTool::HorizontalLine.default_style(),
             vertical_line: DrawingTool::VerticalLine.default_style(),
+            fib_retracement: DrawingTool::FibRetracement.default_style(),
         }
     }
 }
@@ -403,6 +416,7 @@ impl DrawingStyleDefaults {
             DrawingTool::Box => self.box_drawing,
             DrawingTool::HorizontalLine => self.horizontal_line,
             DrawingTool::VerticalLine => self.vertical_line,
+            DrawingTool::FibRetracement => self.fib_retracement,
             DrawingTool::Cursor | DrawingTool::Measure => tool.default_style(),
         }
     }
@@ -413,6 +427,7 @@ impl DrawingStyleDefaults {
             DrawingTool::Box => &mut self.box_drawing,
             DrawingTool::HorizontalLine => &mut self.horizontal_line,
             DrawingTool::VerticalLine => &mut self.vertical_line,
+            DrawingTool::FibRetracement => &mut self.fib_retracement,
             DrawingTool::Cursor | DrawingTool::Measure => return false,
         };
 
@@ -458,6 +473,10 @@ pub enum DrawingObject {
         #[serde(rename = "time")]
         x: DrawingX,
     },
+    FibRetracement {
+        start: DrawingAnchor,
+        end: DrawingAnchor,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -482,13 +501,19 @@ pub enum DrawingDraft {
         style: DrawingStyle,
         extend_right: bool,
     },
+    FibRetracement {
+        start: DrawingAnchor,
+        current: DrawingAnchor,
+        style: DrawingStyle,
+    },
 }
 
 impl DrawingDraft {
     pub fn update_anchor(&mut self, anchor: DrawingAnchor) -> bool {
         match self {
             DrawingDraft::Trendline { start, current, .. }
-            | DrawingDraft::Box { start, current, .. } => {
+            | DrawingDraft::Box { start, current, .. }
+            | DrawingDraft::FibRetracement { start, current, .. } => {
                 if anchor.panel_id != start.panel_id {
                     return false;
                 }
@@ -504,12 +529,15 @@ impl DrawingDraft {
         match self {
             Self::Trendline { .. } => DrawingTool::Trendline,
             Self::Box { .. } => DrawingTool::Box,
+            Self::FibRetracement { .. } => DrawingTool::FibRetracement,
         }
     }
 
     pub fn style(&self) -> DrawingStyle {
         match self {
-            Self::Trendline { style, .. } | Self::Box { style, .. } => *style,
+            Self::Trendline { style, .. }
+            | Self::Box { style, .. }
+            | Self::FibRetracement { style, .. } => *style,
         }
     }
 
@@ -525,18 +553,26 @@ impl DrawingDraft {
                 extend_right,
                 ..
             } => DrawingObject::normalized_box(*start, *current, *extend_right),
+            Self::FibRetracement { start, current, .. } => DrawingObject::FibRetracement {
+                start: *start,
+                end: *current,
+            },
         }
     }
 
     pub fn panel_id(&self) -> PanelId {
         match self {
-            Self::Trendline { start, .. } | Self::Box { start, .. } => start.panel_id,
+            Self::Trendline { start, .. }
+            | Self::Box { start, .. }
+            | Self::FibRetracement { start, .. } => start.panel_id,
         }
     }
 
     pub fn belongs_to_panel(&self, panel_id: PanelId) -> bool {
         match self {
-            Self::Trendline { start, current, .. } | Self::Box { start, current, .. } => {
+            Self::Trendline { start, current, .. }
+            | Self::Box { start, current, .. }
+            | Self::FibRetracement { start, current, .. } => {
                 start.panel_id == panel_id || current.panel_id == panel_id
             }
         }
@@ -550,6 +586,13 @@ impl DrawingDraft {
                 }
 
                 Some((DrawingObject::Trendline { start, end }, style))
+            }
+            Self::FibRetracement { start, style, .. } => {
+                if end.panel_id != start.panel_id || !start.x.compatible(end.x) {
+                    return None;
+                }
+
+                Some((DrawingObject::FibRetracement { start, end }, style))
             }
             Self::Box {
                 start,
@@ -599,6 +642,16 @@ pub enum AxisLabelAnchor {
     Y { panel_id: PanelId, y_unit: YUnit },
 }
 
+/// Retracement ratios drawn by [`DrawingObject::FibRetracement`], from the end anchor (0)
+/// to the start anchor (1).
+pub const FIB_LEVELS: [f64; 7] = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0];
+
+/// The y unit of a retracement `ratio` between the two anchors: 0 is `end`, 1 is `start`.
+pub fn fib_level_y_unit(start: YUnit, end: YUnit, ratio: f64) -> YUnit {
+    let span = (start.0 as f64) - (end.0 as f64);
+    YUnit(end.0.saturating_add((span * ratio).round() as i64))
+}
+
 impl DrawingObject {
     fn normalized_box(
         mut start: DrawingAnchor,
@@ -622,6 +675,7 @@ impl DrawingObject {
             Self::Box { .. } => DrawingTool::Box,
             Self::HorizontalLine { .. } => DrawingTool::HorizontalLine,
             Self::VerticalLine { .. } => DrawingTool::VerticalLine,
+            Self::FibRetracement { .. } => DrawingTool::FibRetracement,
         }
     }
 
@@ -631,12 +685,15 @@ impl DrawingObject {
             Self::Trendline { .. } => "Trendline",
             Self::HorizontalLine { .. } => "Horizontal Line",
             Self::VerticalLine { .. } => "Vertical Line",
+            Self::FibRetracement { .. } => "Fib Retracement",
         }
     }
 
     pub fn panel_id(&self) -> Option<PanelId> {
         match self {
-            Self::Trendline { start, .. } | Self::Box { start, .. } => Some(start.panel_id),
+            Self::Trendline { start, .. }
+            | Self::Box { start, .. }
+            | Self::FibRetracement { start, .. } => Some(start.panel_id),
             Self::HorizontalLine { panel_id, .. } => Some(*panel_id),
             Self::VerticalLine { .. } => None,
         }
@@ -644,7 +701,9 @@ impl DrawingObject {
 
     pub fn handle_panel_id(&self) -> Option<PanelId> {
         match self {
-            Self::Trendline { start, end } | Self::Box { start, end, .. } => {
+            Self::Trendline { start, end }
+            | Self::Box { start, end, .. }
+            | Self::FibRetracement { start, end } => {
                 (start.panel_id == end.panel_id).then_some(start.panel_id)
             }
             Self::HorizontalLine { panel_id, .. } => Some(*panel_id),
@@ -654,7 +713,7 @@ impl DrawingObject {
 
     pub fn axis_label_anchors(&self) -> Vec<AxisLabelAnchor> {
         match self {
-            Self::Trendline { start, end } => vec![
+            Self::Trendline { start, end } | Self::FibRetracement { start, end } => vec![
                 AxisLabelAnchor::X { x: start.x },
                 AxisLabelAnchor::Y {
                     panel_id: start.panel_id,
@@ -718,7 +777,9 @@ impl DrawingObject {
 
     pub fn belongs_to_panel(&self, panel_id: PanelId) -> bool {
         match self {
-            Self::Trendline { start, end } | Self::Box { start, end, .. } => {
+            Self::Trendline { start, end }
+            | Self::Box { start, end, .. }
+            | Self::FibRetracement { start, end } => {
                 start.panel_id == panel_id || end.panel_id == panel_id
             }
             Self::HorizontalLine {
@@ -731,9 +792,9 @@ impl DrawingObject {
 
     pub fn coordinates_match(&self, x: DrawingX) -> bool {
         match self {
-            Self::Trendline { start, end } | Self::Box { start, end, .. } => {
-                start.x.compatible(x) && end.x.compatible(x)
-            }
+            Self::Trendline { start, end }
+            | Self::Box { start, end, .. }
+            | Self::FibRetracement { start, end } => start.x.compatible(x) && end.x.compatible(x),
             Self::HorizontalLine { x: origin, .. } | Self::VerticalLine { x: origin } => {
                 origin.compatible(x)
             }
@@ -751,6 +812,10 @@ impl DrawingObject {
         };
         Some(match self {
             Self::Trendline { start, end } => Self::Trendline {
+                start: shift(*start)?,
+                end: shift(*end)?,
+            },
+            Self::FibRetracement { start, end } => Self::FibRetracement {
                 start: shift(*start)?,
                 end: shift(*end)?,
             },
@@ -791,8 +856,14 @@ impl DrawingObject {
         }
         if matches!(anchor.x, DrawingX::Tick(_)) {
             let x = match (self, handle) {
-                (Self::Trendline { start, .. }, DrawingHandleKind::TrendlineStart) => start.x,
-                (Self::Trendline { end, .. }, DrawingHandleKind::TrendlineEnd) => end.x,
+                (
+                    Self::Trendline { start, .. } | Self::FibRetracement { start, .. },
+                    DrawingHandleKind::TrendlineStart,
+                ) => start.x,
+                (
+                    Self::Trendline { end, .. } | Self::FibRetracement { end, .. },
+                    DrawingHandleKind::TrendlineEnd,
+                ) => end.x,
                 (Self::HorizontalLine { x, .. }, DrawingHandleKind::HorizontalLineStart) => *x,
                 (
                     Self::Box { start, end, .. },
@@ -818,6 +889,24 @@ impl DrawingObject {
             }
             (Self::Trendline { start, end }, DrawingHandleKind::TrendlineEnd) => {
                 Some(Self::Trendline {
+                    start: *start,
+                    end: DrawingAnchor {
+                        panel_id: end.panel_id,
+                        ..anchor
+                    },
+                })
+            }
+            (Self::FibRetracement { start, end }, DrawingHandleKind::TrendlineStart) => {
+                Some(Self::FibRetracement {
+                    start: DrawingAnchor {
+                        panel_id: start.panel_id,
+                        ..anchor
+                    },
+                    end: *end,
+                })
+            }
+            (Self::FibRetracement { start, end }, DrawingHandleKind::TrendlineEnd) => {
+                Some(Self::FibRetracement {
                     start: *start,
                     end: DrawingAnchor {
                         panel_id: end.panel_id,
@@ -956,5 +1045,114 @@ impl DrawingObject {
 impl DrawingEntity {
     pub fn belongs_to_panel(&self, panel_id: PanelId) -> bool {
         self.object.belongs_to_panel(panel_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn anchor(x: u64, y: i64) -> DrawingAnchor {
+        DrawingAnchor {
+            panel_id: PanelId::Main,
+            x: DrawingX::Time(UnixMs::new(x)),
+            y_unit: YUnit(y),
+        }
+    }
+
+    #[test]
+    fn fib_levels_interpolate_from_end_to_start() {
+        let (start, end) = (YUnit(1000), YUnit(0));
+        let units: Vec<i64> = FIB_LEVELS
+            .iter()
+            .map(|ratio| fib_level_y_unit(start, end, *ratio).0)
+            .collect();
+        assert_eq!(units, vec![0, 236, 382, 500, 618, 786, 1000]);
+    }
+
+    #[test]
+    fn fib_levels_work_for_a_downward_swing() {
+        let (start, end) = (YUnit(200), YUnit(1200));
+        assert_eq!(fib_level_y_unit(start, end, 0.0), end);
+        assert_eq!(fib_level_y_unit(start, end, 1.0), start);
+        assert_eq!(fib_level_y_unit(start, end, 0.5), YUnit(700));
+    }
+
+    #[test]
+    fn fib_drag_and_translate_keep_the_object_kind() {
+        let object = DrawingObject::FibRetracement {
+            start: anchor(1_000, 100),
+            end: anchor(2_000, 300),
+        };
+
+        let moved = object
+            .translated(anchor(1_000, 100), anchor(3_000, 150))
+            .expect("translate");
+        assert_eq!(
+            moved,
+            DrawingObject::FibRetracement {
+                start: anchor(3_000, 150),
+                end: anchor(4_000, 350),
+            }
+        );
+
+        let dragged = object
+            .handle_dragged(
+                DrawingHandleKind::TrendlineEnd,
+                anchor(2_000, 300),
+                anchor(2_500, 400),
+            )
+            .expect("drag end");
+        assert_eq!(
+            dragged,
+            DrawingObject::FibRetracement {
+                start: anchor(1_000, 100),
+                end: anchor(2_500, 400),
+            }
+        );
+        assert_eq!(dragged.tool(), DrawingTool::FibRetracement);
+    }
+
+    #[test]
+    fn fib_draft_commits_within_one_panel_only() {
+        let style = DrawingTool::FibRetracement.default_style();
+        let draft = DrawingDraft::FibRetracement {
+            start: anchor(1_000, 100),
+            current: anchor(1_500, 200),
+            style,
+        };
+        assert_eq!(draft.tool(), DrawingTool::FibRetracement);
+
+        let (object, committed_style) = draft
+            .clone()
+            .try_commit(anchor(2_000, 300))
+            .expect("commit");
+        assert_eq!(committed_style, style);
+        assert!(matches!(object, DrawingObject::FibRetracement { .. }));
+
+        let mut other = anchor(2_000, 300);
+        other.panel_id = PanelId::named(1);
+        assert!(draft.try_commit(other).is_none());
+    }
+
+    #[test]
+    fn fib_serde_round_trip_and_old_style_defaults_load() {
+        let object = DrawingObject::FibRetracement {
+            start: anchor(1_000, 100),
+            end: anchor(2_000, 300),
+        };
+        let json = serde_json::to_string(&object).expect("serialize");
+        let back: DrawingObject = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, object);
+
+        // Saved states written before the Fib tool have no `fib_retracement` entry.
+        let defaults: DrawingStyleDefaults =
+            serde_json::from_str(r#"{"trendline":{"stroke_color":{"accent":"One","alpha":1.0},"stroke_width":2.0,"fill_color":null}}"#)
+                .expect("old defaults");
+        assert_eq!(defaults.trendline.stroke_width, 2.0);
+        assert_eq!(
+            defaults.fib_retracement,
+            DrawingTool::FibRetracement.default_style()
+        );
     }
 }
