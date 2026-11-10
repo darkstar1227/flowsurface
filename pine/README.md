@@ -40,3 +40,7 @@ cargo test -p flowsurface-pine --locked
 ```
 
 Fixtures live in `pine/tests/fixtures/`.
+
+## Indicator editor: From Pine
+
+The indicator editor's **From Pine** button uses the same translator. Pine v5 or v6 source pasted there is converted into a new, unsaved `.ind` source. Unsupported lines are shown as errors and lossy translations as warnings; both are labelled with the Pine line number (`Pine line N: ...`). Save and Check are disabled while the Pine input is shown.

@@ -1181,6 +1181,7 @@ dependencies = [
  "flowsurface-data",
  "flowsurface-exchange",
  "flowsurface-indicator-engine",
+ "flowsurface-pine",
  "iced",
  "iced_core",
  "iced_wgpu",

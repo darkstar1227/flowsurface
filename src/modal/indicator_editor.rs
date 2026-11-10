@@ -17,8 +17,12 @@ pub enum Message {
     Open(IndicatorId),
     Edit(text_editor::Action),
     Check,
+    FromPine,
+    PineEdit(text_editor::Action),
+    PineConvert,
+    PineCancel,
     Save,
-    Saved(Result<SavedSource, Vec<SourceDiagnostic>>),
+    Saved(SaveStamp, Result<SavedSource, Vec<SourceDiagnostic>>),
     JumpTo { line: usize, column: usize },
 }
 
@@ -45,6 +49,27 @@ impl Origin {
     }
 }
 
+/// The editor state a save started from, to tell whether the text changed while it was running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SaveStamp {
+    /// Bumped whenever other source text is loaded.
+    loaded: u64,
+    /// Bumped on every text change, including loads.
+    edited: u64,
+}
+
+impl SaveStamp {
+    /// The saved text still belongs to the open source (same load).
+    fn same_source(self, current: Self) -> bool {
+        self.loaded == current.loaded
+    }
+
+    /// The editor text is still exactly what was saved.
+    fn unchanged(self, current: Self) -> bool {
+        self == current
+    }
+}
+
 enum Status {
     Info(String),
     Success(String),
@@ -61,6 +86,11 @@ pub struct IndicatorEditor {
     saving: bool,
     /// A target the user asked to open while the text had unsaved changes; asking again opens it.
     discard_for: Option<Option<IndicatorId>>,
+    /// Pine source being typed; `Some` while the Pine input replaces the source editor.
+    pine: Option<Content>,
+    /// Converting would replace unsaved text; converting again confirms.
+    pine_discard: bool,
+    stamp: SaveStamp,
 }
 
 impl Default for IndicatorEditor {
@@ -80,19 +110,27 @@ impl IndicatorEditor {
             dirty: false,
             saving: false,
             discard_for: None,
+            pine: None,
+            pine_discard: false,
+            stamp: SaveStamp::default(),
         };
         editor.start_new();
         editor
     }
 
-    /// Re-read the catalog listing; call when the editor is shown.
+    /// Re-read the catalog listing and leave Pine input mode; call when the editor is shown.
     pub fn refresh(&mut self) {
         self.entries = editor::sources();
+        self.pine = None;
+        self.pine_discard = false;
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Action>) {
         if !matches!(message, Message::New | Message::Open(_)) {
             self.discard_for = None;
+        }
+        if !matches!(message, Message::PineConvert) {
+            self.pine_discard = false;
         }
         match message {
             Message::New => {
@@ -108,9 +146,12 @@ impl IndicatorEditor {
             Message::Edit(action) => {
                 if action.is_edit() {
                     self.dirty = true;
+                    self.stamp.edited += 1;
                 }
                 self.content.perform(action);
             }
+            // The source editor is hidden in Pine mode; Save and Check are ignored there.
+            Message::Check | Message::Save if self.pine.is_some() => {}
             Message::Check => {
                 let source = self.content.text();
                 match editor::check(&source) {
@@ -121,6 +162,54 @@ impl IndicatorEditor {
                     Err(diagnostics) => self.show_errors(diagnostics),
                 }
             }
+            Message::FromPine => {
+                self.pine.get_or_insert_with(Content::new);
+                self.status = Some(Status::Info(
+                    "Paste Pine Script v5/v6, then press Convert.".to_owned(),
+                ));
+            }
+            Message::PineEdit(action) => {
+                self.pine_discard = false;
+                if let Some(pine) = &mut self.pine {
+                    pine.perform(action);
+                }
+            }
+            Message::PineCancel => {
+                self.pine = None;
+                self.status = None;
+            }
+            Message::PineConvert => {
+                let Some(pine) = &self.pine else {
+                    return (Task::none(), None);
+                };
+                if self.dirty && !self.pine_discard {
+                    self.pine_discard = true;
+                    self.status = Some(Status::Info(
+                        "Unsaved changes. Press Convert again to replace them.".to_owned(),
+                    ));
+                    return (Task::none(), None);
+                }
+                let transpiled = pine::transpile(&pine.text(), &pine::Options::default());
+                let mut diagnostics = pine_diagnostics(&transpiled);
+                self.pine = None;
+                self.load(Origin::New, &transpiled.source);
+                self.dirty = true;
+                match editor::check(&transpiled.source) {
+                    Ok(id) => {
+                        let converted = format!("Converted from Pine as {}", id.id());
+                        self.diagnostics = diagnostics;
+                        self.status = Some(if self.diagnostics.iter().any(|d| !d.is_warning) {
+                            Status::Error(format!("{converted}, but some Pine lines were skipped"))
+                        } else {
+                            Status::Success(format!("{converted}. Press Save to keep it."))
+                        });
+                    }
+                    Err(errors) => {
+                        diagnostics.extend(errors);
+                        self.show_errors(diagnostics);
+                    }
+                }
+            }
             Message::Save => {
                 if self.saving {
                     return (Task::none(), None);
@@ -129,6 +218,7 @@ impl IndicatorEditor {
                 self.status = Some(Status::Info("Saving…".to_owned()));
                 let source = self.content.text();
                 let opened = self.origin.installed_id().cloned();
+                let stamp = self.stamp;
                 return (
                     Task::perform(
                         async move {
@@ -145,22 +235,28 @@ impl IndicatorEditor {
                                 }])
                             })
                         },
-                        Message::Saved,
+                        move |result| Message::Saved(stamp, result),
                     ),
                     None,
                 );
             }
-            Message::Saved(result) => {
+            Message::Saved(stamp, result) => {
                 self.saving = false;
-                self.refresh();
+                self.entries = editor::sources();
+                let same_source = stamp.same_source(self.stamp);
                 match result {
                     Ok(saved) => {
-                        let replaced_other = self
-                            .origin
-                            .installed_id()
-                            .is_some_and(|opened| *opened != saved.id);
-                        self.diagnostics.clear();
-                        self.dirty = false;
+                        let replaced_other = same_source
+                            && self
+                                .origin
+                                .installed_id()
+                                .is_some_and(|opened| *opened != saved.id);
+                        if same_source {
+                            self.diagnostics.clear();
+                        }
+                        if stamp.unchanged(self.stamp) {
+                            self.dirty = false;
+                        }
                         self.status = Some(Status::Success(if replaced_other || saved.created {
                             format!(
                                 "Created {} and reloaded indicators{}",
@@ -174,10 +270,18 @@ impl IndicatorEditor {
                         } else {
                             format!("Saved {} and reloaded indicators", saved.path.display())
                         }));
-                        self.origin = Origin::Installed(saved.id.clone());
+                        if same_source {
+                            self.origin = Origin::Installed(saved.id.clone());
+                        }
                         return (Task::none(), Some(Action::Reloaded(saved.id)));
                     }
-                    Err(diagnostics) => self.show_errors(diagnostics),
+                    Err(diagnostics) if same_source => self.show_errors(diagnostics),
+                    // Positions in these diagnostics refer to text that is no longer open.
+                    Err(_) => {
+                        self.status = Some(Status::Error(
+                            "The previous save failed; nothing was saved.".to_owned(),
+                        ));
+                    }
                 }
             }
             Message::JumpTo { line, column } => {
@@ -261,6 +365,9 @@ impl IndicatorEditor {
         self.diagnostics.clear();
         self.status = None;
         self.dirty = false;
+        self.pine = None;
+        self.stamp.loaded += 1;
+        self.stamp.edited += 1;
     }
 
     fn show_errors(&mut self, diagnostics: Vec<SourceDiagnostic>) {
@@ -290,13 +397,15 @@ impl IndicatorEditor {
                 .size(style::text_size::SECTION),
             space::horizontal(),
             text(format!("Ln {}, Col {}", cursor.line + 1, cursor_column + 1)).size(11),
-            button(text("Check")).on_press(Message::Check),
+            button(text("From Pine"))
+                .on_press_maybe((self.pine.is_none()).then_some(Message::FromPine)),
+            button(text("Check")).on_press_maybe(self.pine.is_none().then_some(Message::Check)),
             button(text(if self.saving {
                 "Saving…"
             } else {
                 "Save (⌘S)"
             }))
-            .on_press_maybe((!self.saving).then_some(Message::Save))
+            .on_press_maybe((!self.saving && self.pine.is_none()).then_some(Message::Save))
             .style(button::primary),
         ]
         .spacing(8)
@@ -316,7 +425,31 @@ impl IndicatorEditor {
             .key_binding(key_binding)
             .highlight_with::<ErrorLines>(error_lines, |_, theme| text_editor_format(theme));
 
-        let mut body = column![header, source].spacing(8);
+        let mut body = column![header].spacing(8);
+        if let Some(pine) = &self.pine {
+            body = body
+                .push(
+                    row![
+                        text("Pine Script input").size(12),
+                        space::horizontal(),
+                        button(text("Cancel")).on_press(Message::PineCancel),
+                        button(text("Convert"))
+                            .on_press(Message::PineConvert)
+                            .style(button::primary),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .push(
+                    iced::widget::text_editor(pine)
+                        .on_action(Message::PineEdit)
+                        .font(style::AZERET_MONO)
+                        .size(12)
+                        .height(Length::Fill),
+                );
+        } else {
+            body = body.push(source);
+        }
         if let Some(status) = &self.status {
             let line = match status {
                 Status::Info(message) => text(message.clone()),
@@ -423,6 +556,23 @@ impl IndicatorEditor {
     }
 }
 
+/// Pine translation problems as diagnostics. They carry no editor position because their line
+/// numbers refer to the Pine source, not the converted `.ind` text.
+fn pine_diagnostics(transpiled: &pine::Transpiled) -> Vec<SourceDiagnostic> {
+    let make = |item: &pine::Unsupported, is_warning: bool| SourceDiagnostic {
+        line: None,
+        column: None,
+        message: format!("Pine line {}: {}", item.line, item.reason),
+        is_warning,
+    };
+    transpiled
+        .unsupported
+        .iter()
+        .map(|item| make(item, false))
+        .chain(transpiled.notes.iter().map(|item| make(item, true)))
+        .collect()
+}
+
 fn padding_right() -> iced::Padding {
     iced::Padding::ZERO.right(10)
 }
@@ -516,7 +666,7 @@ impl iced::advanced::text::Highlighter for ErrorLines {
 
 #[cfg(test)]
 mod tests {
-    use super::{byte_column, char_column};
+    use super::{SaveStamp, byte_column, char_column, pine_diagnostics};
 
     #[test]
     fn columns_convert_between_chars_and_bytes() {
@@ -525,5 +675,49 @@ mod tests {
         assert_eq!(char_column(line, line.find('x').unwrap()), 6);
         assert_eq!(byte_column(line, 100), line.len());
         assert_eq!(char_column(line, 0), 0);
+    }
+
+    #[test]
+    fn save_stamp_detects_changes_made_while_saving() {
+        let sent = SaveStamp::default();
+        assert!(sent.same_source(sent) && sent.unchanged(sent));
+
+        let edited = SaveStamp { edited: 1, ..sent };
+        assert!(sent.same_source(edited));
+        assert!(!sent.unchanged(edited));
+
+        let loaded = SaveStamp {
+            loaded: 1,
+            edited: 1,
+        };
+        assert!(!sent.same_source(loaded));
+        assert!(!sent.unchanged(loaded));
+    }
+
+    #[test]
+    fn pine_problems_become_unpositioned_diagnostics() {
+        let transpiled = pine::Transpiled {
+            source: String::new(),
+            id: "pine.x".to_owned(),
+            unsupported: vec![pine::Unsupported {
+                line: 12,
+                reason: "request.security".to_owned(),
+            }],
+            notes: vec![pine::Unsupported {
+                line: 3,
+                reason: "hline became a plot".to_owned(),
+            }],
+        };
+        let diagnostics = pine_diagnostics(&transpiled);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].message, "Pine line 12: request.security");
+        assert!(!diagnostics[0].is_warning);
+        assert_eq!(diagnostics[1].message, "Pine line 3: hline became a plot");
+        assert!(diagnostics[1].is_warning);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.line.is_none() && d.column.is_none())
+        );
     }
 }
