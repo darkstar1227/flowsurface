@@ -8,12 +8,14 @@ use crate::{style, tooltip};
 use data::chart::kline::indicators::manifest;
 use data::layout::MAX_NAME_LENGTH;
 use data::layout::presets::{self, Library as PresetLibrary};
+use data::layout::templates;
 
 use iced::widget::{
     button, center, column, container, row, scrollable, space, text, text_input,
     tooltip::Position as TooltipPosition,
 };
 use iced::{Element, padding, window};
+use std::path::PathBuf;
 use std::vec;
 use uuid::Uuid;
 
@@ -45,6 +47,17 @@ pub enum Message {
     RequestClose(Uuid),
     RequestCloseActive,
     CancelClose,
+    /// Save the active layout as a template file.
+    SaveTemplate,
+    /// Open a template as a new layout, optionally with its main ticker replaced by the
+    /// active layout's main ticker.
+    ApplyTemplate {
+        path: PathBuf,
+        current_ticker: bool,
+    },
+    /// First request arms the delete confirmation; a second one deletes the template file.
+    DeleteTemplate(PathBuf),
+    OpenTemplatesFolder,
 }
 
 pub enum Action {
@@ -55,6 +68,11 @@ pub enum Action {
         select: Uuid,
         remove: Uuid,
     },
+    /// Add a layout built from a template and switch to it.
+    Apply {
+        name: String,
+        dashboard: Box<data::Dashboard>,
+    },
 }
 
 pub struct LayoutManager {
@@ -64,6 +82,11 @@ pub struct LayoutManager {
     pub edit_mode: Editing,
     /// Layout whose tab-bar delete button is awaiting confirmation.
     closing: Option<Uuid>,
+    template_directory: PathBuf,
+    templates: Vec<templates::Entry>,
+    /// Template whose delete button is awaiting confirmation.
+    deleting_template: Option<PathBuf>,
+    template_status: Option<Result<String, String>>,
 }
 
 impl LayoutManager {
@@ -89,6 +112,10 @@ impl LayoutManager {
             active_layout_id: Some(default_layout.unique),
             edit_mode: Editing::None,
             closing: None,
+            template_directory: templates::default_directory(),
+            templates: templates::load_all(&templates::default_directory()),
+            deleting_template: None,
+            template_status: None,
         }
     }
 
@@ -104,9 +131,110 @@ impl LayoutManager {
             active_layout_id: active_layout.map(|l| l.unique),
             edit_mode: Editing::None,
             closing: None,
+            template_directory: templates::default_directory(),
+            templates: templates::load_all(&templates::default_directory()),
+            deleting_template: None,
+            template_status: None,
         };
         manager.ensure_layout();
         manager
+    }
+
+    /// Re-read the templates directory, picking up files copied in from elsewhere.
+    pub fn refresh_templates(&mut self) {
+        self.templates = templates::load_all(&self.template_directory);
+    }
+
+    fn templates_view(&self) -> Element<'_, Message> {
+        let header = row![
+            text("Templates").size(crate::style::text_size::SECTION),
+            space::horizontal(),
+            tooltip(
+                manager_icon_button(style::Icon::Folder, Some(Message::OpenTemplatesFolder)),
+                Some("Open templates folder (copy .json files here to import)"),
+                TooltipPosition::Top,
+            ),
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let mut list = column![header].spacing(4);
+        for entry in &self.templates {
+            let primary = entry
+                .template
+                .primary_ticker()
+                .map(|ticker| ticker.to_string());
+            let open = button(
+                column![
+                    text(entry.template.name.clone()).size(12),
+                    text(primary.clone().unwrap_or_else(|| "No ticker".to_owned())).size(10),
+                ]
+                .spacing(2),
+            )
+            .width(iced::Length::Fill)
+            .style(|theme, status| style::button::transparent(theme, status, false))
+            .on_press(Message::ApplyTemplate {
+                path: entry.path.clone(),
+                current_ticker: false,
+            });
+            let open = tooltip(
+                open,
+                Some("Open as a new layout with its saved tickers"),
+                TooltipPosition::Top,
+            );
+            let current = tooltip(
+                manager_icon_button(
+                    style::Icon::Link,
+                    primary.is_some().then(|| Message::ApplyTemplate {
+                        path: entry.path.clone(),
+                        current_ticker: true,
+                    }),
+                ),
+                Some("Open as a new layout using the active layout's main ticker"),
+                TooltipPosition::Top,
+            );
+            let armed = self.deleting_template.as_ref() == Some(&entry.path);
+            let delete = manager_icon_button(
+                style::Icon::TrashBin,
+                Some(Message::DeleteTemplate(entry.path.clone())),
+            )
+            .style(move |theme, status| {
+                if armed {
+                    style::button::cancel(theme, status, true)
+                } else {
+                    style::button::transparent(theme, status, false)
+                }
+            });
+            let delete = tooltip(
+                delete,
+                Some(if armed {
+                    "Click again to delete"
+                } else {
+                    "Delete template"
+                }),
+                TooltipPosition::Top,
+            );
+            list = list.push(
+                row![open, current, delete]
+                    .spacing(2)
+                    .align_y(iced::Alignment::Center),
+            );
+        }
+        if self.templates.is_empty() {
+            list = list.push(text("No templates yet").size(11));
+        }
+        list = list.push(
+            button(text("Save active layout as template"))
+                .style(move |t, s| style::button::transparent(t, s, true))
+                .width(iced::Length::Fill)
+                .on_press(Message::SaveTemplate),
+        );
+        if let Some(status) = &self.template_status {
+            list = list.push(match status {
+                Ok(message) => text(message.clone()).size(11).style(text::success),
+                Err(message) => text(message.clone()).size(11).style(text::danger),
+            });
+        }
+        list.into()
     }
 
     pub fn chart_resources(&self) -> &SharedChartResources {
@@ -288,7 +416,56 @@ impl LayoutManager {
             self.closing = None;
         }
 
+        if !matches!(message, Message::DeleteTemplate(_)) {
+            self.deleting_template = None;
+        }
         match message {
+            Message::SaveTemplate => {
+                let layout = self.active_layout_id.and_then(|id| self.get(id))?;
+                let template = templates::Template::new(
+                    layout.id.name.clone(),
+                    data::Dashboard::from(&layout.dashboard),
+                );
+                self.template_status = Some(
+                    templates::save(&self.template_directory, &template)
+                        .map(|path| format!("Saved {}", path.display())),
+                );
+                self.templates = templates::load_all(&self.template_directory);
+            }
+            Message::ApplyTemplate {
+                path,
+                current_ticker,
+            } => {
+                let entry = self.templates.iter().find(|entry| entry.path == path)?;
+                let ticker = if current_ticker {
+                    let layout = self.active_layout_id.and_then(|id| self.get(id))?;
+                    templates::primary_ticker(&data::Dashboard::from(&layout.dashboard))
+                } else {
+                    None
+                };
+                return Some(Action::Apply {
+                    name: entry.template.name.clone(),
+                    dashboard: Box::new(entry.template.instantiate(ticker)),
+                });
+            }
+            Message::DeleteTemplate(path) => {
+                if self.deleting_template.as_ref() != Some(&path) {
+                    self.deleting_template = Some(path);
+                    return None;
+                }
+                self.deleting_template = None;
+                self.template_status = Some(
+                    templates::delete(&self.template_directory, &path)
+                        .map(|()| "Template deleted".to_owned()),
+                );
+                self.templates = templates::load_all(&self.template_directory);
+            }
+            Message::OpenTemplatesFolder => {
+                self.template_status = templates::open_directory(&self.template_directory)
+                    .err()
+                    .map(Err);
+                self.refresh_templates();
+            }
             Message::SelectIndex(index) => {
                 let id = self.layouts.get(index)?.id.unique;
                 if Some(id) != self.active_layout_id {
@@ -502,6 +679,8 @@ impl LayoutManager {
                     .on_press(Message::AddLayout),
             );
         };
+
+        content = content.push(self.templates_view());
 
         scrollable::Scrollable::with_direction(
             content,

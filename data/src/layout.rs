@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod drawings;
 pub mod pane;
 pub mod presets;
+pub mod templates;
 
 pub const MAX_NAME_LENGTH: usize = 20;
 
