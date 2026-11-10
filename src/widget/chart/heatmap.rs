@@ -1,3 +1,4 @@
+pub mod drawing;
 mod instance;
 mod layout;
 pub mod scene;
@@ -17,6 +18,7 @@ use crate::widget::chart::PANEL_SPLITTER_HEIGHT;
 use crate::window::PixelRatio;
 use data::chart::axis::PanelYValueRange;
 use data::chart::heatmap::indicators::{HeatmapIndicators, HeatmapPanel};
+use data::chart::value::{PanelValuePrecision, PanelValueScale};
 use enum_map::EnumMap;
 use exchange::TickerInfo;
 use iced::advanced::widget::tree::{self, Tree};
@@ -66,6 +68,10 @@ pub enum Message {
     },
     CursorMoved,
     PauseBtnClicked,
+    Drawing(data::chart::kline::drawing::KlineWidgetDrawingEvent),
+    DrawingUndoRequested,
+    DrawingRedoRequested,
+    DrawingDeleteRequested,
 }
 
 pub struct HeatmapShaderWidget<'a> {
@@ -79,6 +85,7 @@ pub struct HeatmapShaderWidget<'a> {
     ticker_info: TickerInfo,
     indicator_panels: &'a EnumMap<HeatmapPanel, scene::indicator::Panel>,
     pixel_ratio: PixelRatio,
+    drawings: Option<drawing::Layer<'a>>,
 }
 
 impl<'a> HeatmapShaderWidget<'a> {
@@ -103,7 +110,34 @@ impl<'a> HeatmapShaderWidget<'a> {
             overlay,
             y_axis_gutter: DEFAULT_Y_AXIS_GUTTER,
             x_axis_height: DEFAULT_X_AXIS_HEIGHT,
+            drawings: None,
         }
+    }
+
+    /// Shows the drawings shared with the kline chart and lets the user edit them.
+    pub fn with_drawings(mut self, layer: drawing::Layer<'a>) -> Self {
+        self.drawings = Some(layer);
+        self
+    }
+
+    fn drawing_view(&self, plot: Rectangle) -> Option<drawing::View> {
+        let projection = drawing::Projection::new(
+            self.x_axis.time,
+            plot.size(),
+            self.y_axis.base_price?,
+            self.y_axis.step,
+            self.y_axis.row_h,
+        )?;
+        let scale = PanelValueScale::new(
+            Some(PanelValuePrecision::BaseTickerMinTick),
+            Some(self.ticker_info),
+        );
+        Some(drawing::View::new(
+            projection,
+            scale,
+            self.y_axis.label_precision,
+            plot.size(),
+        ))
     }
 
     pub fn with_y_axis_gutter(mut self, width: impl Into<Length>) -> Self {
@@ -133,6 +167,7 @@ struct State {
     // Used to publish one extra cursor event when exiting plot so cursor-dependent
     // labels/tooltips can be cleared without publishing every global mouse move.
     was_cursor_in_plot: bool,
+    drawing_pointer: drawing::PointerState,
 }
 
 enum PanelDrag {
@@ -244,6 +279,37 @@ impl<'a> Widget<Message, Theme, Renderer> for HeatmapShaderWidget<'a> {
             }
 
             state.was_cursor_in_plot = over_stack;
+        }
+
+        // Drawings only take the pointer while a tool is armed or a drawing is hit; every other
+        // event, and every wheel event, falls through to the heatmap's own handling.
+        if self.drawings.is_none() {
+            // Drawings were hidden mid-gesture: forget the gesture.
+            state.drawing_pointer = drawing::PointerState::default();
+        }
+        // Keys already taken by another widget (a focused text input) must not edit drawings.
+        let taken_elsewhere = shell.is_event_captured() && !state.drawing_pointer.is_dragging();
+        if let Some(layer) = self.drawings.as_ref().filter(|_| !taken_elsewhere) {
+            let view = self.drawing_view(plot_bounds);
+            let blocked = state.panel_drag.is_some();
+            let mut messages = Vec::new();
+            let captured = state.drawing_pointer.handle(
+                layer,
+                view.as_ref(),
+                event,
+                plot_bounds,
+                cursor.position_in(plot_bounds),
+                blocked,
+                &mut |message| messages.push(message),
+            );
+            for message in messages {
+                shell.publish(message);
+            }
+            if captured {
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
         }
 
         if matches!(
@@ -552,6 +618,24 @@ impl<'a> Widget<Message, Theme, Renderer> for HeatmapShaderWidget<'a> {
                 });
             });
 
+            // 2b) Drawings shared with the kline chart, above the overlay and below the axes
+            if let Some(layer) = &self.drawings
+                && let Some(view) = self.drawing_view(plot_bounds)
+            {
+                let look = drawing::Look {
+                    palette: theme.extended_palette(),
+                    accents: layer.accents.as_array(),
+                };
+                let mut frame = canvas::Frame::new(renderer, plot_bounds.size());
+                view.draw(&mut frame, &layer.snapshot, &look);
+                renderer.with_layer(plot_bounds, |renderer| {
+                    renderer
+                        .with_translation(Vector::new(plot_bounds.x, plot_bounds.y), |renderer| {
+                            renderer.draw_geometry(frame.into_geometry())
+                        });
+                });
+            }
+
             // 3) Axes canvases
             renderer.with_translation(Vector::new(x_axis_bounds.x, x_axis_bounds.y), |renderer| {
                 for layer in
@@ -724,6 +808,37 @@ impl<'a> Widget<Message, Theme, Renderer> for HeatmapShaderWidget<'a> {
         }
         if geometry.indicator_plot_at(cursor).is_some() {
             return mouse::Interaction::Crosshair;
+        }
+        // While the heatmap's own pan or axis drag is running, its cursor wins over drawing hits.
+        let heatmap_dragging = state.panel_drag.is_some()
+            || matches!(
+                state.x_axis_state.interaction,
+                AxisInteraction::Panning { .. }
+            )
+            || matches!(
+                state.y_axis_state.interaction,
+                AxisInteraction::Panning { .. }
+            )
+            || matches!(
+                state.overlay_state,
+                crate::widget::chart::heatmap::ui::overlay::Interaction::Panning { .. }
+            );
+        if let Some(layer) = &self.drawings
+            && !heatmap_dragging
+            && let Some(local) = cursor.position_in(plot_bounds)
+        {
+            if state.drawing_pointer.is_dragging() {
+                return mouse::Interaction::Grabbing;
+            }
+            if layer.armed() {
+                return mouse::Interaction::Crosshair;
+            }
+            if let Some(hit) = self
+                .drawing_view(plot_bounds)
+                .and_then(|view| view.hit(&layer.snapshot, local))
+            {
+                return hit.cursor();
+            }
         }
         let over_x = cursor.position_over(x_axis_bounds).is_some();
         let over_y = cursor.position_over(y_axis_bounds).is_some();

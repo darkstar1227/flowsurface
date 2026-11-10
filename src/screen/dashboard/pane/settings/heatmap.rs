@@ -343,11 +343,32 @@ pub fn heatmap_shader_cfg_view<'a>(
         );
     }
 
+    let drawings_column = container(
+        column![
+            checkbox(cfg.show_drawings)
+                .label("Show drawings")
+                .on_toggle(move |show| Message::VisualConfigChanged {
+                    config: VisualConfig::Heatmap(heatmap::Config {
+                        show_drawings: show,
+                        ..cfg
+                    }),
+                    sync_all: false,
+                }),
+            text("Shared with the candlestick charts of the same ticker")
+                .size(style::text_size::SMALL),
+        ]
+        .spacing(4),
+    )
+    .padding(8)
+    .width(Length::Fill)
+    .style(style::inspector_control);
+
     let mut content = InspectorContent::new(vec![
         InspectorSection::titled("Size filter", size_filters).with_modal_container(),
         InspectorSection::titled("Trade visualization", trade_viz_column).with_modal_container(),
         InspectorSection::titled("Order quantity colour", depth_color_column)
             .with_modal_container(),
+        InspectorSection::titled("Drawings", drawings_column).with_modal_container(),
         InspectorSection::titled("Indicators", indicator_controls).with_modal_container(),
     ]);
     content.set_footer(row![
