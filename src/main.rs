@@ -88,6 +88,7 @@ struct Flowsurface {
     theme_editor: ThemeEditor,
     indicator_editor: IndicatorEditor,
     network_editor: NetworkEditor,
+    exchange_accounts: modal::exchange_accounts::ExchangeAccounts,
     network_config: data::Network,
     data_sources: Arc<DataSources>,
     audio_stream: AudioStream,
@@ -163,12 +164,25 @@ enum Message {
     ThemeEditor(modal::theme_editor::Message),
     IndicatorEditor(indicator_editor::Message),
     NetworkEditor(modal::network_editor::Message),
+    ExchangeAccounts(modal::exchange_accounts::Message),
     Layouts(modal::layout_manager::Message),
     SharedChartResources(manifest::Message),
     AudioStream(modal::audio::Message),
 }
 
 impl Flowsurface {
+    /// The signed-request client, unless the proxy settings changed since it was built:
+    /// it must not silently keep using (or bypassing) an outdated proxy.
+    fn signed_client_for_current_proxy(&self) -> Result<reqwest::Client, String> {
+        if self.network_config.proxy != self.data_sources.signed_proxy {
+            return Err(
+                "Proxy settings changed since startup; restart Flowsurface before testing accounts"
+                    .to_string(),
+            );
+        }
+        self.data_sources.signed.clone()
+    }
+
     fn new() -> (Self, Task<Message>) {
         let saved_state = layout::load_saved_state();
 
@@ -210,6 +224,9 @@ impl Flowsurface {
             notifications: Notifications::new(),
             network_config: saved_state.network.clone(),
             network_editor: NetworkEditor::new(&saved_state.network, None),
+            exchange_accounts: modal::exchange_accounts::ExchangeAccounts::new(
+                &saved_state.exchange_accounts,
+            ),
             antialiasing: saved_state.antialiasing,
             applied_antialiasing: saved_state.antialiasing,
             restoring_windows: HashSet::new(),
@@ -365,6 +382,7 @@ impl Flowsurface {
                 }
 
                 if self.sidebar.active_menu().is_some() {
+                    self.exchange_accounts.clear_form();
                     self.sidebar.set_menu(None);
                 } else {
                     if self.active_dashboard_mut().go_back(main_window) {
@@ -778,8 +796,48 @@ impl Flowsurface {
                     None => {}
                 }
             }
+            Message::ExchangeAccounts(msg) => {
+                let signed = self.signed_client_for_current_proxy();
+                let (task, action) = self.exchange_accounts.update(msg, &signed);
+                let task = task.map(Message::ExchangeAccounts);
+
+                match action {
+                    Some(modal::exchange_accounts::Action::Exit) => {
+                        self.sidebar.set_menu(Some(sidebar::Menu::Settings));
+                    }
+                    Some(modal::exchange_accounts::Action::Persist) => {
+                        let main_window = self.main_window.id;
+                        let dashboard = self.active_dashboard_mut();
+
+                        let mut active_windows = dashboard
+                            .popout
+                            .keys()
+                            .copied()
+                            .collect::<Vec<window::Id>>();
+                        active_windows.push(main_window);
+
+                        return Task::batch([
+                            task,
+                            window::collect_window_specs(
+                                active_windows,
+                                Message::SaveStateRequested,
+                            ),
+                        ]);
+                    }
+                    None => {}
+                }
+                return task;
+            }
             Message::Sidebar(message) => {
                 let (task, action) = self.sidebar.update(message);
+
+                if let Some(screen::sidebar::Action::MenuChanged(menu)) = &action
+                    && modal::exchange_accounts::should_clear_on_menu_change(menu.as_ref())
+                {
+                    // Closing the modal (or switching away) drops any typed credentials.
+                    // Background ticks yield no action and must not wipe the form.
+                    self.exchange_accounts.clear_form();
+                }
 
                 match action {
                     Some(screen::sidebar::Action::MenuChanged(Some(sidebar::Menu::Network))) => {
@@ -1506,6 +1564,12 @@ impl Flowsurface {
                         screen::sidebar::Message::ToggleSidebarMenu(Some(sidebar::Menu::Network)),
                     ));
 
+                    let toggle_exchange_accounts = button(text("Exchange accounts")).on_press(
+                        Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(Some(
+                            sidebar::Menu::ExchangeAccounts,
+                        ))),
+                    );
+
                     let timezone_picklist = pick_list(
                         [data::UserTimezone::Utc, data::UserTimezone::Local],
                         Some(self.timezone),
@@ -1761,7 +1825,7 @@ impl Flowsurface {
                         column![text("Rendering").size(crate::style::text_size::SECTION), antialiasing_checkbox,].spacing(12),
                         column![
                             text("Experimental").size(crate::style::text_size::SECTION),
-                            column![toggle_theme_editor, toggle_network_editor].spacing(8),
+                            column![toggle_theme_editor, toggle_network_editor, toggle_exchange_accounts].spacing(8),
                         ]
                         .spacing(12),
                         footer,
@@ -1972,6 +2036,21 @@ impl Flowsurface {
                     align_x,
                 )
             }
+            sidebar::Menu::ExchangeAccounts => {
+                let (align_x, padding) = match sidebar_pos {
+                    sidebar::Position::Left => (Alignment::Start, padding::left(44).bottom(4)),
+                    sidebar::Position::Right => (Alignment::End, padding::right(44).bottom(4)),
+                };
+
+                dashboard_modal(
+                    base,
+                    self.exchange_accounts.view().map(Message::ExchangeAccounts),
+                    Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(None)),
+                    padding,
+                    Alignment::End,
+                    align_x,
+                )
+            }
             sidebar::Menu::Network => {
                 let (align_x, padding) = match sidebar_pos {
                     sidebar::Position::Left => (Alignment::Start, padding::left(44).bottom(4)),
@@ -2050,6 +2129,7 @@ impl Flowsurface {
             self.ui_scale_factor,
             audio_cfg,
             self.network_config.for_persistence(),
+            self.exchange_accounts.persisted(),
             self.volume_size_unit,
             self.sidebar.cache_enabled(),
             self.antialiasing,

@@ -14,6 +14,10 @@ pub struct DataSources {
     pub catalog_http: reqwest::Client,
     pub exchange: AdapterHandles,
     pub server: Option<ServerClient>,
+    /// Client for signed (credential-bearing) exchange requests, or why it is unavailable.
+    pub signed: Result<reqwest::Client, String>,
+    /// Proxy the `signed` client was built with, to detect later changes.
+    pub signed_proxy: Option<Proxy>,
 }
 
 impl DataSources {
@@ -36,6 +40,7 @@ impl DataSources {
                 .redirect(reqwest::redirect::Policy::none())
         });
 
+        let signed = signed_client(proxy);
         let server = ServerClient::from_mode(&server_http, network);
         let exchange = AdapterHandles::spawn_venues(&exchange_http, Venue::ALL, proxy);
 
@@ -43,6 +48,8 @@ impl DataSources {
             exchange,
             server,
             catalog_http,
+            signed,
+            signed_proxy: network.proxy.clone(),
         }
     }
 }
@@ -59,9 +66,7 @@ fn http_client(
     proxy_cfg: Option<&Proxy>,
     configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
 ) -> reqwest::Client {
-    let builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10));
+    let builder = base_client_builder();
 
     exchange::adapter::proxy::try_apply_proxy(configure(builder), proxy_cfg)
         .build()
@@ -72,6 +77,29 @@ fn http_client(
             );
             panic!("Failed to build {name} HTTP client: {e}");
         })
+}
+
+fn base_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+}
+
+/// Client for signed exchange requests (API keys in headers or query).
+///
+/// Differs from the other clients on purpose:
+/// - never follows redirects, so `X-MBX-APIKEY` / `OK-ACCESS-*` headers cannot be
+///   forwarded to another host (reqwest only strips the standard auth headers);
+/// - https only;
+/// - fails closed on an unusable proxy instead of connecting directly.
+fn signed_client(proxy_cfg: Option<&Proxy>) -> Result<reqwest::Client, String> {
+    let builder = base_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true);
+
+    exchange::adapter::proxy::apply_proxy_strict(builder, proxy_cfg)?
+        .build()
+        .map_err(|_| "failed to build the HTTP client for signed requests".to_string())
 }
 
 impl std::fmt::Debug for DataSources {

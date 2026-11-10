@@ -752,3 +752,39 @@ pub fn try_apply_proxy(
     log::debug!("Using proxy for REST: {}", cfg.to_log_string());
     builder.proxy(proxy)
 }
+
+/// Fail-closed variant of [`try_apply_proxy`] for requests that carry credentials.
+///
+/// When a proxy is configured but cannot be applied this returns an error instead of
+/// silently falling back to a direct connection. The error text never includes the
+/// proxy URL.
+pub fn apply_proxy_strict(
+    builder: reqwest::ClientBuilder,
+    proxy_cfg: Option<&Proxy>,
+) -> Result<reqwest::ClientBuilder, String> {
+    let Some(cfg) = proxy_cfg else {
+        return Ok(builder);
+    };
+
+    let (scheme, auth) = (cfg.scheme(), cfg.auth());
+
+    let proxy_url = match (scheme, auth) {
+        (ProxyScheme::Socks5 | ProxyScheme::Socks5h, Some(_auth)) => cfg.to_url_string(),
+        _ => cfg.to_url_string_no_auth(),
+    };
+
+    let proxy = reqwest::Proxy::all(proxy_url).map_err(|_| {
+        format!(
+            "invalid proxy configuration (scheme={}); refusing to connect directly",
+            scheme.as_str()
+        )
+    })?;
+    let proxy = match (scheme, auth) {
+        (ProxyScheme::Http | ProxyScheme::Https, Some(auth)) => {
+            proxy.basic_auth(auth.username(), auth.password())
+        }
+        _ => proxy,
+    };
+
+    Ok(builder.proxy(proxy))
+}

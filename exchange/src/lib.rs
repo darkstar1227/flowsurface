@@ -1,3 +1,4 @@
+pub mod account;
 pub mod adapter;
 pub mod depth;
 mod error;
