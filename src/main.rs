@@ -527,6 +527,12 @@ impl Flowsurface {
                             .chain(window_tasks)
                             .chain(self.load_layout(layout, self.main_window.id));
                     }
+                    Some(modal::layout_manager::Action::Apply { name, dashboard }) => {
+                        let unique = self.add_layout_from_config(&name, *dashboard);
+                        return self.update(Message::Layouts(
+                            modal::layout_manager::Message::SelectActive(unique),
+                        ));
+                    }
                     Some(modal::layout_manager::Action::Clone(id)) => {
                         let manager = &mut self.layout_manager;
 
@@ -538,26 +544,7 @@ impl Flowsurface {
                         });
 
                         if let Some((name, ser_dashboard)) = source_data {
-                            let new_uid = uuid::Uuid::new_v4();
-                            let new_layout = LayoutId {
-                                unique: new_uid,
-                                name: manager.ensure_unique_name(&name, new_uid),
-                            };
-
-                            let mut popout_windows = Vec::new();
-
-                            for (pane, window_spec) in &ser_dashboard.popout {
-                                let configuration = configuration(pane.clone());
-                                popout_windows.push((configuration, *window_spec));
-                            }
-
-                            let dashboard = Dashboard::from_config(
-                                configuration(ser_dashboard.pane.clone()),
-                                popout_windows,
-                                ser_dashboard.chart_settings,
-                            );
-
-                            manager.insert_layout(new_layout.clone(), dashboard);
+                            self.add_layout_from_config(&name, ser_dashboard);
                         }
                     }
                     Some(modal::layout_manager::Action::Close { select, remove }) => {
@@ -705,6 +692,9 @@ impl Flowsurface {
                             &self.network_config,
                             self.network_editor.pending_apply().cloned(),
                         );
+                    }
+                    Some(screen::sidebar::Action::MenuChanged(Some(sidebar::Menu::Layout))) => {
+                        self.layout_manager.refresh_templates();
                     }
                     Some(screen::sidebar::Action::MenuChanged(Some(
                         sidebar::Menu::IndicatorEditor,
@@ -931,6 +921,31 @@ impl Flowsurface {
             tick,
             hotkeys,
         ])
+    }
+
+    /// Insert a layout built from a serialized dashboard, named after `name` but unique.
+    fn add_layout_from_config(&mut self, name: &str, ser_dashboard: data::Dashboard) -> uuid::Uuid {
+        let manager = &mut self.layout_manager;
+        let new_uid = uuid::Uuid::new_v4();
+        let new_layout = LayoutId {
+            unique: new_uid,
+            name: manager.ensure_unique_name(name, new_uid),
+        };
+
+        let popout_windows = ser_dashboard
+            .popout
+            .iter()
+            .map(|(pane, window_spec)| (configuration(pane.clone()), *window_spec))
+            .collect();
+
+        let dashboard = Dashboard::from_config(
+            configuration(ser_dashboard.pane),
+            popout_windows,
+            ser_dashboard.chart_settings,
+        );
+
+        manager.insert_layout(new_layout, dashboard);
+        new_uid
     }
 
     fn handle_hotkey(&mut self, hotkey: Hotkey) -> Task<Message> {
