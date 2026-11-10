@@ -181,11 +181,14 @@ impl IndicatorEditor {
                 }
             }
             Message::JumpTo { line, column } => {
+                let line = line.saturating_sub(1);
+                // Diagnostics count characters; the editor cursor is a byte index into the line.
+                let column = self
+                    .content
+                    .line(line)
+                    .map_or(0, |text| byte_column(&text.text, column.saturating_sub(1)));
                 self.content.move_to(Cursor {
-                    position: Position {
-                        line: line.saturating_sub(1),
-                        column: column.saturating_sub(1),
-                    },
+                    position: Position { line, column },
                     selection: None,
                 });
                 return (iced::widget::operation::focus(EDITOR_ID), None);
@@ -278,11 +281,15 @@ impl IndicatorEditor {
             Origin::Bundled(id) => format!("{} (bundled, read-only)", id.id()),
         };
         let cursor = self.content.cursor().position;
+        let cursor_column = self
+            .content
+            .line(cursor.line)
+            .map_or(cursor.column, |line| char_column(&line.text, cursor.column));
         let header = row![
             text(format!("{title}{}", if self.dirty { " •" } else { "" }))
                 .size(style::text_size::SECTION),
             space::horizontal(),
-            text(format!("Ln {}, Col {}", cursor.line + 1, cursor.column + 1)).size(11),
+            text(format!("Ln {}, Col {}", cursor.line + 1, cursor_column + 1)).size(11),
             button(text("Check")).on_press(Message::Check),
             button(text(if self.saving {
                 "Saving…"
@@ -420,6 +427,20 @@ fn padding_right() -> iced::Padding {
     iced::Padding::ZERO.right(10)
 }
 
+/// Byte offset of the `chars`-th character of `line`, clamped to the line end.
+fn byte_column(line: &str, chars: usize) -> usize {
+    line.char_indices()
+        .nth(chars)
+        .map_or(line.len(), |(index, _)| index)
+}
+
+/// Number of characters before byte offset `bytes` of `line`.
+fn char_column(line: &str, bytes: usize) -> usize {
+    line.char_indices()
+        .take_while(|(index, _)| *index < bytes)
+        .count()
+}
+
 const EDITOR_ID: &str = "indicator-editor-source";
 
 fn key_binding(event: KeyPress) -> Option<Binding<Message>> {
@@ -490,5 +511,19 @@ impl iced::advanced::text::Highlighter for ErrorLines {
 
     fn current_line(&self) -> usize {
         self.current
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{byte_column, char_column};
+
+    #[test]
+    fn columns_convert_between_chars_and_bytes() {
+        let line = "// 高低 x";
+        assert_eq!(byte_column(line, 6), line.find('x').unwrap());
+        assert_eq!(char_column(line, line.find('x').unwrap()), 6);
+        assert_eq!(byte_column(line, 100), line.len());
+        assert_eq!(char_column(line, 0), 0);
     }
 }
