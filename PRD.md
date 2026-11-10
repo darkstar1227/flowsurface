@@ -19,9 +19,9 @@
 |---|---|---|---|---|
 | F8 | 幣種切換 | 連動群組 `LinkGroup`、`Dashboard::switch_tickers_in_group`、自選清單與搜尋排序（`data/src/tickers_table.rs`） | 快捷鍵開啟幣種搜尋；各窗格切換的操作入口更直接 | P0 |
 | F9 | 分頁 | 具名 layout 可新增、改名、拖曳排序、複製、刪除，重啟後還原；只能從 `LayoutManager` 彈窗切換 | 在 dashboard 上方加分頁列，直接沿用 layout 的現有操作；快捷鍵 Cmd+T／Cmd+W／Cmd+1～9 | P0 |
-| F1 | 畫線依幣種儲存 | 已有水平線、趨勢線、垂直線、矩形、測量，支援 undo/redo；但畫線存在每個窗格的 `kline::Config.drawings`，**換幣種時會被帶到新幣種** | 畫線改以幣種為 key 儲存，換回原幣種時還原 | P0 |
+| F1 | 畫線依幣種儲存 | 已有水平線、趨勢線、垂直線、矩形、測量，支援 undo/redo；但畫線存在每個窗格的 `kline::Config.drawings`，**換幣種時會被帶到新幣種** | 主價格面板的畫線改為全域依幣種共用：所有窗格、分頁中的同一幣種（交易所＋市場）看到同一組畫線；指標面板上的畫線仍屬於各自窗格 | P0 |
 | F4 | `.ind` 編輯器 | 無編輯器；指標目錄沒有 watch／reload，手動安裝後需重啟 | 指標側欄內編輯，存檔時呼叫引擎 check 並顯示行號錯誤，寫入 `indicators/` 並熱重載 | P0 |
-| F10 | 版面模板 | chart preset 只存單一圖表的 `SettingsSnapshot` | 命名模板（窗格配置、週期、指標、畫線）；載入時可選套用原幣種或目前幣種；匯出匯入 | P1 |
+| F10 | 版面模板 | chart preset 只存單一圖表的 `SettingsSnapshot` | 命名模板（窗格配置、週期、指標；畫線全域依幣種共用，不屬於模板）；載入時可選套用原幣種或目前幣種；匯出匯入 | P1 |
 | F11 | 多視窗 | 窗格 popout 與 `WindowSpec` 已持久化 | 整個分頁拖出成新視窗，記住所在螢幕 | P1 |
 | F5 | Pine 轉譯器 | 無 | 獨立 Rust crate，Pine 文字轉 `.ind`，回傳不支援語法清單，CLI 與 UI 共用 | P1 |
 | F2 | 其他畫圖 | 趨勢線、矩形、垂直線已有 | 只缺 Fib 回撤線 | P1 |
@@ -98,7 +98,7 @@
 
 **狀態模型：**
 - 模板存「形狀」，分頁（layout）存「內容」，模板可套到不同幣種。
-- 畫線以幣種為 key 儲存，切換幣種不會串線。
+- 主面板畫線存在全域的 `layout::drawings::Library`（依幣種），跟著 `saved-state.json` 的 layouts 一起存；切換幣種不會串線。
 - `saved-state.json` 目前沒有版本欄位，靠 serde 的 default 與自訂 deserializer 維持相容；第一次需要不相容的格式變更時再加 `schema_version`。
 - 背景分頁暫停重繪；Heatmap 要錄資料的窗格保持訂閱。
 
