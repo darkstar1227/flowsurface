@@ -49,7 +49,9 @@ impl TriggerPxType {
     }
 }
 
-/// OKX `order-algo` order types the app knows. Only `Conditional` and `Oco` are built.
+/// OKX `order-algo` order types the app knows. Only `Conditional` and `Oco` are built; the
+/// others exist so that cancel-all can find (and report) every kind of pending algo order
+/// (condition 68, review item 15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OkxAlgoType {
     /// One trigger, TP or SL.
@@ -58,9 +60,73 @@ pub enum OkxAlgoType {
     Oco,
     /// Trailing stop: refused (condition 67).
     MoveOrderStop,
+    /// Trigger order (read and cancel only).
+    Trigger,
+    /// Chase order, futures and swaps only (read and cancel only; not named by the docs as
+    /// excluded from `cancel-algos`, not verified on the demo trading environment).
+    Chase,
+    Iceberg,
+    Twap,
+    SmartIceberg,
 }
 
 impl OkxAlgoType {
+    /// Every `ordType` of `orders-algo-pending` (docs copy, `ordType` parameter).
+    pub const ALL_PENDING: [OkxAlgoType; 8] = [
+        OkxAlgoType::Conditional,
+        OkxAlgoType::Oco,
+        OkxAlgoType::Trigger,
+        OkxAlgoType::Chase,
+        OkxAlgoType::MoveOrderStop,
+        OkxAlgoType::Iceberg,
+        OkxAlgoType::Twap,
+        OkxAlgoType::SmartIceberg,
+    ];
+
+    /// The reads that cover `ALL_PENDING`. The docs copy (`ordType` of `orders-algo-pending`)
+    /// says `conditional` and `oco` may be joined with a comma in one request; every other
+    /// type needs its own.
+    pub const PENDING_READS: [&'static [OkxAlgoType]; 7] = [
+        &[OkxAlgoType::Conditional, OkxAlgoType::Oco],
+        &[OkxAlgoType::Trigger],
+        &[OkxAlgoType::Chase],
+        &[OkxAlgoType::MoveOrderStop],
+        &[OkxAlgoType::Iceberg],
+        &[OkxAlgoType::Twap],
+        &[OkxAlgoType::SmartIceberg],
+    ];
+
+    /// The type named by an `ordType` value of a read response.
+    pub(crate) fn from_pending_name(name: &str) -> Option<OkxAlgoType> {
+        Self::ALL_PENDING
+            .into_iter()
+            .find(|t| t.pending_name() == name)
+    }
+
+    /// The `ordType` value in a read query.
+    pub(crate) fn pending_name(self) -> &'static str {
+        match self {
+            OkxAlgoType::Conditional => "conditional",
+            OkxAlgoType::Oco => "oco",
+            OkxAlgoType::Trigger => "trigger",
+            OkxAlgoType::Chase => "chase",
+            OkxAlgoType::MoveOrderStop => "move_order_stop",
+            OkxAlgoType::Iceberg => "iceberg",
+            OkxAlgoType::Twap => "twap",
+            OkxAlgoType::SmartIceberg => "smart_iceberg",
+        }
+    }
+
+    /// Whether `cancel-algos` is the cancel endpoint for this type. The docs example excludes
+    /// iceberg, TWAP and trailing stop; their cancel endpoint is not verified, so cancel-all
+    /// does not try them and lists them as remaining instead.
+    pub fn cancel_algos_supported(self) -> bool {
+        matches!(
+            self,
+            OkxAlgoType::Conditional | OkxAlgoType::Oco | OkxAlgoType::Trigger | OkxAlgoType::Chase
+        )
+    }
+
     /// The type a given TP/SL combination must use.
     pub fn for_legs(has_tp: bool, has_sl: bool) -> Result<OkxAlgoType, TradeError> {
         match (has_tp, has_sl) {
@@ -74,7 +140,7 @@ impl OkxAlgoType {
         match self {
             OkxAlgoType::Conditional => Ok("conditional"),
             OkxAlgoType::Oco => Ok("oco"),
-            OkxAlgoType::MoveOrderStop => Err(TradeError::Unsupported),
+            _ => Err(TradeError::Unsupported),
         }
     }
 }
@@ -449,15 +515,17 @@ pub fn query_order(rules: &SymbolRules, order: &OrderRef) -> Result<OkxRequest, 
 /// Most algo orders `cancel-algos` takes per request.
 pub const MAX_CANCEL_ALGOS: usize = 10;
 
-/// `POST /api/v5/trade/cancel-algos` (an array of up to 10). Not for trailing stops: their
-/// cancel endpoint is not verified, so `MoveOrderStop` is refused.
+/// `POST /api/v5/trade/cancel-algos` (an array of up to 10). Not for trailing stops, iceberg
+/// or TWAP orders: their cancel endpoint is not verified, so those types are refused.
 pub fn cancel_algos(
     rules: &SymbolRules,
     algo_type: OkxAlgoType,
     orders: &[OrderRef],
 ) -> Result<OkxRequest, TradeError> {
     require_okx(rules)?;
-    algo_type.okx()?;
+    if !algo_type.cancel_algos_supported() {
+        return Err(TradeError::Unsupported);
+    }
     if orders.is_empty() || orders.len() > MAX_CANCEL_ALGOS {
         return Err(TradeError::Unsupported);
     }

@@ -21,11 +21,12 @@ pub mod okx;
 pub mod outcome;
 pub mod queries;
 pub mod request;
+pub mod risk;
 pub mod rules;
 pub mod types;
 pub mod unknown;
 
-pub use bulk::{BulkError, BulkReport};
+pub use bulk::{AutoCloseReport, BulkError, BulkReport};
 pub use checks::{DEFAULT_DEVIATION_BPS, deviation_exceeds};
 pub use client::{
     Balance, OpenKind, OpenOrder, Position, ReadError, Submitted, TradeClient, TradeSettings,
@@ -35,10 +36,15 @@ pub use client_id::{ClientId, IdField, Role};
 pub use decimal::{Decimal, DecimalError};
 pub use gate::{
     ApprovedOrder, AutoIntent, AutoPath, ConfirmToken, GateClass, GateRequest, OrderIntent,
-    RiskHook, RiskRefusal, RiskView, SendGate, SingleOrderCap, SubmitError,
+    RiskHook, RiskRefusal, RiskView, SendGate, SubmitError,
 };
 pub use outcome::{ItemRejection, Outcome, RejectKind};
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
+pub use risk::{
+    AutoCloseDecision, AutoCloseGrant, DrawdownAnchor, EquityBasis, EquityFreshness,
+    EquityObservation, EquitySource, EquityTracker, IgnoreReason, Observed, RiskLimits, RiskNotice,
+    RiskNoticeKind, RiskSnapshot, TripReason, local_day,
+};
 pub use rules::{FreshRules, RulesTable, SymbolRules, TradeProduct, ValidSymbol};
 pub use types::{
     Action, Dir, Exec, MarginMode, OrderRef, Protective, ProtectiveKind, Side, Size, TimeInForce,

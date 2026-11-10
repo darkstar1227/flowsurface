@@ -20,8 +20,10 @@ use uuid::Uuid;
 /// While `false`, every order for a `Live` account is refused, whatever else passes.
 ///
 /// Development-order limit: LIVE sending must not exist on `main` before the local risk
-/// controls (segment e, trade-risk) are merged. Segment e removes this switch.
-// TODO(trade-risk): delete once the risk gate (condition 72) is merged.
+/// controls (segment e, trade-risk) are merged. The local risk gate exists now, but it is not
+/// wired in yet: remove this switch only after segment c, with N2, E1–E3, C1–C5 and the
+/// testnet verification done.
+// TODO(trade-risk): delete once the conditions above are met.
 const LIVE_SENDING_ENABLED: bool = false;
 
 /// What the last connection test of an account in this session found.

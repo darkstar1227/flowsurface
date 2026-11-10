@@ -33,6 +33,12 @@ pub fn futures_positions() -> BinanceRequest {
     BinanceRequest::new(Method::Get, "/fapi/v3/positionRisk")
 }
 
+/// USDⓈ-M account information v3: `totalMarginBalance` is the equity figure of the risk
+/// controls (checked against the SDK docs copy, not a testnet response).
+pub fn futures_account() -> BinanceRequest {
+    BinanceRequest::new(Method::Get, "/fapi/v3/account")
+}
+
 pub fn futures_balance() -> BinanceRequest {
     BinanceRequest::new(Method::Get, "/fapi/v3/balance")
 }
@@ -95,17 +101,20 @@ pub fn okx_pending_orders(inst_type: OkxInstType) -> OkxRequest {
     )
 }
 
-/// `GET /api/v5/trade/orders-algo-pending` for conditional and oco orders (`ordType` is
-/// required). Trailing stops are not opened, so `move_order_stop` is not listed.
-pub fn okx_pending_algos(algo_type: OkxAlgoType) -> Result<OkxRequest, TradeError> {
-    let ord_type = match algo_type {
-        OkxAlgoType::Conditional => "conditional",
-        OkxAlgoType::Oco => "oco",
-        OkxAlgoType::MoveOrderStop => return Err(TradeError::Unsupported),
-    };
+/// `GET /api/v5/trade/orders-algo-pending` (`ordType` is required). Cancel-all reads every
+/// type in `OkxAlgoType::ALL_PENDING`, in the groups of `OkxAlgoType::PENDING_READS`, so no
+/// kind of order is missed.
+pub fn okx_pending_algos(algo_types: &[OkxAlgoType]) -> Result<OkxRequest, TradeError> {
+    if algo_types.is_empty() {
+        return Err(TradeError::Unsupported);
+    }
+    let names: Vec<&str> = algo_types.iter().map(|t| t.pending_name()).collect();
     Ok(OkxRequest::new(
         Method::Get,
-        format!("/api/v5/trade/orders-algo-pending?ordType={ord_type}"),
+        format!(
+            "/api/v5/trade/orders-algo-pending?ordType={}",
+            names.join(",")
+        ),
         None,
     ))
 }

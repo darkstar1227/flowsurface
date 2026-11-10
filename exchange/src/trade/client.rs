@@ -19,6 +19,9 @@ use super::locks::{self, Locked};
 use super::outcome::{Outcome, from_binance, from_binance_bulk, from_okx};
 use super::queries;
 use super::request::{BinanceRequest, Exposure, Lookup, LookupKind, Method, OkxRequest};
+use super::risk::{
+    AutoCloseDecision, EquityBasis, EquityObservation, EquitySource, EquityTracker, RiskSnapshot,
+};
 use super::rules::{FreshRules, RulesTable, TradeProduct, ValidSymbol};
 use super::types::{Dir, MarginMode, TradeError};
 use crate::account::{
@@ -487,22 +490,58 @@ impl TradeClient {
 
     /// A signed GET built by one of the builders.
     pub(super) async fn read_binance(&self, req: &BinanceRequest) -> Result<Value, ReadError> {
+        self.read_binance_with(req, Priority::Query).await
+    }
+
+    async fn read_binance_with(
+        &self,
+        req: &BinanceRequest,
+        priority: Priority,
+    ) -> Result<Value, ReadError> {
         debug_assert_eq!(req.exposure(), Exposure::Neutral);
-        Ok(self.call_binance(req, Priority::Query).await.0?)
+        Ok(self.call_binance(req, priority).await.0?)
     }
 
     pub(super) async fn read_okx(&self, req: &OkxRequest) -> Result<Vec<Value>, ReadError> {
-        let (result, _) = self.call_okx(req, Priority::Query).await;
+        self.read_okx_with(req, Priority::Query).await
+    }
+
+    async fn read_okx_with(
+        &self,
+        req: &OkxRequest,
+        priority: Priority,
+    ) -> Result<Vec<Value>, ReadError> {
+        let (result, _) = self.call_okx(req, priority).await;
         okx_data(result?)
     }
 
-    /// Open orders of every category: plain, algo and (spot) order lists.
+    /// Open orders of every category: plain, algo and (spot) order lists. Any failed read
+    /// fails the whole call.
     pub async fn open_orders(&self) -> Result<Vec<OpenOrder>, ReadError> {
+        let read = self.read_open_orders(Priority::Query, false).await?;
+        debug_assert!(read.unknown_algo_types.is_empty());
+        Ok(read.orders)
+    }
+
+    /// The read before a cancel-all: it uses the budget kept for cancels (user decision 6),
+    /// and an OKX algo read that fails does not stop it. What was read is returned, and the
+    /// types that could not be read are listed, so the caller cancels what it knows and marks
+    /// the result as not clean.
+    pub(super) async fn open_orders_for_cancel(&self) -> Result<OpenOrdersRead, ReadError> {
+        self.read_open_orders(Priority::Protective, true).await
+    }
+
+    async fn read_open_orders(
+        &self,
+        priority: Priority,
+        lenient: bool,
+    ) -> Result<OpenOrdersRead, ReadError> {
         let mut out = Vec::new();
+        let mut unknown_algo_types = Vec::new();
         match (self.venue, self.product) {
             (AccountVenue::Binance, AccountProduct::UsdM) => {
                 let v = self
-                    .read_binance(&queries::futures_open_orders(None))
+                    .read_binance_with(&queries::futures_open_orders(None), priority)
                     .await?;
                 out.extend(parse_open(
                     &list_of(&v)?,
@@ -511,7 +550,7 @@ impl TradeClient {
                     OpenKind::Plain,
                 ));
                 let v = self
-                    .read_binance(&queries::futures_open_algo_orders(None))
+                    .read_binance_with(&queries::futures_open_algo_orders(None), priority)
                     .await?;
                 out.extend(parse_open(
                     &list_of(&v)?,
@@ -521,14 +560,18 @@ impl TradeClient {
                 ));
             }
             (AccountVenue::Binance, AccountProduct::Spot) => {
-                let v = self.read_binance(&queries::spot_open_orders(None)).await?;
+                let v = self
+                    .read_binance_with(&queries::spot_open_orders(None), priority)
+                    .await?;
                 out.extend(parse_open(
                     &list_of(&v)?,
                     "symbol",
                     "orderId",
                     OpenKind::Plain,
                 ));
-                let v = self.read_binance(&queries::spot_open_order_lists()).await?;
+                let v = self
+                    .read_binance_with(&queries::spot_open_order_lists(), priority)
+                    .await?;
                 out.extend(parse_open_lists(&list_of(&v)?));
             }
             (AccountVenue::Okx, _) => {
@@ -536,23 +579,42 @@ impl TradeClient {
                     AccountProduct::Spot => queries::OkxInstType::Spot,
                     AccountProduct::UsdM => queries::OkxInstType::Swap,
                 };
-                let data = self.read_okx(&queries::okx_pending_orders(inst)).await?;
+                let data = self
+                    .read_okx_with(&queries::okx_pending_orders(inst), priority)
+                    .await?;
                 out.extend(parse_open(&data, "instId", "ordId", OpenKind::Plain));
-                for t in [
-                    super::okx::OkxAlgoType::Conditional,
-                    super::okx::OkxAlgoType::Oco,
-                ] {
-                    let data = self.read_okx(&queries::okx_pending_algos(t)?).await?;
-                    out.extend(parse_open(
-                        &data,
-                        "instId",
-                        "algoId",
-                        OpenKind::Algo(Some(t)),
-                    ));
+                for group in super::okx::OkxAlgoType::PENDING_READS {
+                    // Chase orders exist on futures and swaps only.
+                    let group: Vec<_> = group
+                        .iter()
+                        .copied()
+                        .filter(|t| {
+                            !(*t == super::okx::OkxAlgoType::Chase
+                                && self.product == AccountProduct::Spot)
+                        })
+                        .collect();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    let data = match self
+                        .read_okx_with(&queries::okx_pending_algos(&group)?, priority)
+                        .await
+                    {
+                        Ok(data) => data,
+                        Err(_) if lenient => {
+                            unknown_algo_types.extend(group);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    out.extend(parse_open_algos(&data, &group));
                 }
             }
         }
-        Ok(out)
+        Ok(OpenOrdersRead {
+            orders: out,
+            unknown_algo_types,
+        })
     }
 
     pub async fn positions(&self) -> Result<Vec<Position>, ReadError> {
@@ -597,6 +659,68 @@ impl TradeClient {
                 Ok(parse_balances(details, "ccy", "availBal"))
             }
         }
+    }
+
+    /// Read the account's equity for the risk controls (REST source).
+    ///
+    /// Binance USDⓈ-M: `totalMarginBalance` of `GET /fapi/v3/account` (weight 5; USDT only in
+    /// single-asset mode, USD-denominated in multi-assets mode). OKX: `totalEq` of
+    /// `GET /api/v5/account/balance` (denominated in USD). Both field names are checked
+    /// against the docs copies, **not** against a testnet or demo response. Binance spot has
+    /// no equity source yet (`Unsupported`).
+    ///
+    /// A missing, empty or unparsable field is `ReadError::Parse`, never zero. The time is the
+    /// client's clock when the response arrived. REST readings cannot say whether the change
+    /// since the last one was a transfer, so `is_transfer` is always `false`: a withdrawal
+    /// reads as a loss until the private stream marks transfers.
+    pub async fn equity(&self) -> Result<EquityObservation, ReadError> {
+        let (raw, basis) = match (self.venue, self.product) {
+            (AccountVenue::Binance, AccountProduct::UsdM) => {
+                let v = self.read_binance(&queries::futures_account()).await?;
+                (
+                    v.get("totalMarginBalance")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    EquityBasis::BinanceTotalMarginBalance,
+                )
+            }
+            (AccountVenue::Okx, _) => {
+                let data = self.read_okx(&queries::okx_balance()).await?;
+                (
+                    data.first()
+                        .and_then(|d| d.get("totalEq"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    EquityBasis::OkxTotalEq,
+                )
+            }
+            (AccountVenue::Binance, AccountProduct::Spot) => {
+                return Err(ReadError::Trade(TradeError::Unsupported));
+            }
+        };
+        let raw = raw.filter(|s| !s.is_empty()).ok_or(ReadError::Parse)?;
+        let equity = Decimal::parse(&raw).map_err(|_| ReadError::Parse)?;
+        Ok(EquityObservation {
+            at_ms: self.now_ms(),
+            equity,
+            basis,
+            source: EquitySource::Rest,
+            is_transfer: false,
+        })
+    }
+
+    /// The risk hook for `tracker` at this client's clock, so callers never supply a time.
+    pub fn risk_snapshot<'a>(&self, tracker: &'a EquityTracker) -> RiskSnapshot<'a> {
+        tracker.snapshot(self.now_ms())
+    }
+
+    /// [`EquityTracker::begin_auto_close`] at this client's clock.
+    pub fn begin_auto_close(
+        &self,
+        tracker: &mut EquityTracker,
+        enabled: bool,
+    ) -> AutoCloseDecision {
+        tracker.begin_auto_close(self.now_ms(), enabled)
     }
 
     /// Leverage and margin mode the exchange has for `symbol` (PRD 3.2: compare with what
@@ -718,7 +842,7 @@ fn binance_weight(path: &str, has_symbol: bool, product: AccountProduct) -> usiz
                 40
             }
         }
-        ("/fapi/v3/positionRisk" | "/fapi/v3/balance", _) => 5,
+        ("/fapi/v3/positionRisk" | "/fapi/v3/balance" | "/fapi/v3/account", _) => 5,
         ("/api/v3/account", _) => 20,
         ("/api/v3/openOrders", _) => {
             if has_symbol {
@@ -783,6 +907,14 @@ pub enum OpenKind {
     Algo(Option<super::okx::OkxAlgoType>),
     /// Binance spot order list (OCO / OTOCO).
     List,
+}
+
+/// Open orders as read before a cancel-all.
+#[derive(Debug)]
+pub(super) struct OpenOrdersRead {
+    pub orders: Vec<OpenOrder>,
+    /// OKX algo types whose read failed: orders of these types may exist and are not listed.
+    pub unknown_algo_types: Vec<super::okx::OkxAlgoType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -883,6 +1015,27 @@ fn parse_open(items: &[Value], sym: &str, id: &str, kind: OpenKind) -> Vec<OpenO
                 id: text(o, id)?,
                 kind: kind.clone(),
             })
+        })
+        .collect()
+}
+
+/// OKX algo rows of one read of `group`. The type comes from each row's `ordType`; a row
+/// whose type is not one of the group's is kept with no type, so it is never cancelled under
+/// the wrong endpoint but still listed as remaining.
+fn parse_open_algos(items: &[Value], group: &[super::okx::OkxAlgoType]) -> Vec<OpenOrder> {
+    items
+        .iter()
+        .flat_map(|o| {
+            let kind = text(o, "ordType")
+                .and_then(|n| super::okx::OkxAlgoType::from_pending_name(&n))
+                .filter(|t| group.contains(t))
+                .or_else(|| (group.len() == 1).then(|| group[0]));
+            parse_open(
+                std::slice::from_ref(o),
+                "instId",
+                "algoId",
+                OpenKind::Algo(kind),
+            )
         })
         .collect()
 }
