@@ -41,6 +41,10 @@ pub enum LogAction {
     AutoCloseFinished,
     /// An order sent on one of the three automatic paths (condition 71).
     AutoPathSend,
+    /// An unresolved send was saved, loaded again at startup, or released by the user.
+    UnknownSaved,
+    UnknownRestored,
+    UnknownReleased,
 }
 
 /// One log line. The fields are private and the constructors take typed values only.
@@ -109,6 +113,7 @@ fn refusal_reason(r: RiskRefusal) -> &'static str {
         RiskRefusal::PositionUnknown => "position_unknown",
         RiskRefusal::EquityUnavailable => "equity_unavailable",
         RiskRefusal::Locked => "locked",
+        RiskRefusal::SettingsInvalid => "settings_invalid",
         RiskRefusal::WrongAccount => "wrong_account",
     }
 }
@@ -202,6 +207,19 @@ impl RiskLogEntry {
     /// An order sent on an automatic path.
     pub fn auto_path_send(meta: &AccountMeta, at_ms: i64, symbol: &str, path: AutoPath) -> Self {
         let mut e = Self::base(meta, at_ms, LogAction::AutoPathSend, path_reason(path));
+        e.symbol = Some(clean_symbol(symbol));
+        e
+    }
+
+    /// An unresolved-send event (saved, restored at startup, released by hand). Carries the
+    /// symbol only: no client id, no order parameters.
+    pub fn unknown_event(meta: &AccountMeta, at_ms: i64, symbol: &str, action: LogAction) -> Self {
+        let reason = match action {
+            LogAction::UnknownSaved => "unknown_saved",
+            LogAction::UnknownRestored => "unknown_restored",
+            _ => "unknown_released_by_user",
+        };
+        let mut e = Self::base(meta, at_ms, action, reason);
         e.symbol = Some(clean_symbol(symbol));
         e
     }

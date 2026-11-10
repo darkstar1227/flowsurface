@@ -18,7 +18,7 @@ use crate::account::PositionMode;
 
 const PRODUCT: TradeProduct = TradeProduct::BinanceUsdM;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct FuturesEntry<'a> {
     pub rules: &'a SymbolRules,
     /// The position mode the exchange reported. `None` refuses the order (condition 58).
@@ -28,7 +28,24 @@ pub struct FuturesEntry<'a> {
     pub exec: Exec,
     /// Last or mark price; needed for the notional check of a market order.
     pub ref_price: Option<Decimal>,
-    pub client_id: &'a ClientId,
+    /// Owned: one id belongs to one request (condition 61).
+    pub client_id: ClientId,
+}
+
+#[cfg(test)]
+impl FuturesEntry<'_> {
+    /// Tests build the same order several times; production code cannot (condition 61).
+    pub(crate) fn duplicate(&self) -> FuturesEntry<'_> {
+        FuturesEntry {
+            rules: self.rules,
+            mode: self.mode,
+            action: self.action,
+            qty: self.qty,
+            exec: self.exec,
+            ref_price: self.ref_price,
+            client_id: ClientId::parse(self.client_id.as_str()).unwrap(),
+        }
+    }
 }
 
 fn position_side(dir: super::types::Dir) -> &'static str {
@@ -39,7 +56,7 @@ fn position_side(dir: super::types::Dir) -> &'static str {
 }
 
 /// `POST /fapi/v1/order`.
-pub fn new_order(i: &FuturesEntry<'_>) -> Result<BinanceRequest, TradeError> {
+pub fn new_order(i: FuturesEntry<'_>) -> Result<BinanceRequest, TradeError> {
     i.rules.require_product(PRODUCT)?;
     let mode = i.mode.ok_or(TradeError::PositionModeUnknown)?;
     let id = i.client_id.check(IdField::BinanceFutures)?;
@@ -104,7 +121,7 @@ fn algo_type(kind: ProtectiveKind) -> &'static str {
 pub fn new_algo_order(
     rules: &SymbolRules,
     mode: Option<PositionMode>,
-    p: &Protective<'_>,
+    p: Protective,
 ) -> Result<BinanceRequest, TradeError> {
     rules.require_product(PRODUCT)?;
     let mode = mode.ok_or(TradeError::PositionModeUnknown)?;
@@ -272,6 +289,24 @@ mod tests {
         ClientId::parse(s).unwrap()
     }
 
+    // The builders consume their input (one id, one request). These wrappers let a test build
+    // the same input again, with a copy of the id.
+    fn new_order(i: &FuturesEntry<'_>) -> Result<BinanceRequest, TradeError> {
+        super::new_order(i.duplicate())
+    }
+
+    fn new_algo_order(
+        rules: &SymbolRules,
+        mode: Option<PositionMode>,
+        p: &Protective,
+    ) -> Result<BinanceRequest, TradeError> {
+        super::new_algo_order(rules, mode, p.duplicate())
+    }
+
+    fn dup(c: &ClientId) -> ClientId {
+        id(c.as_str())
+    }
+
     /// The signed string, which the golden strings are compared to.
     fn signed(r: &BinanceRequest) -> String {
         let s = r.signed(SECRET, 5000, TS).unwrap();
@@ -302,11 +337,11 @@ mod tests {
             qty: d("0.0029"),
             exec,
             ref_price: Some(d("60000")),
-            client_id: cid,
+            client_id: dup(cid),
         }
     }
 
-    fn prot<'a>(kind: ProtectiveKind, dir: Dir, size: Size, cid: &'a ClientId) -> Protective<'a> {
+    fn prot(kind: ProtectiveKind, dir: Dir, size: Size, cid: &ClientId) -> Protective {
         Protective {
             kind,
             dir,
@@ -317,7 +352,7 @@ mod tests {
             working_type: WorkingType::MarkPrice,
             trailing: None,
             ref_price: d("60000"),
-            client_id: cid,
+            client_id: dup(cid),
         }
     }
 
@@ -767,7 +802,7 @@ mod tests {
             qty: d("1"),
             exec: Exec::Market,
             ref_price: Some(d("1")),
-            client_id: &cid,
+            client_id: dup(&cid),
         };
         assert_eq!(new_order(&e).unwrap_err(), TradeError::ProductMismatch);
     }

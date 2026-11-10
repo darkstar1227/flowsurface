@@ -15,15 +15,15 @@ use super::gate::{
     ApprovedOrder, AutoIntent, ConfirmToken, OrderIntent, Prepared, RiskHook, SendGate, Spent,
     SubmitError, Target, approve,
 };
-use super::locks::{self, Locked};
+use super::journal::UnknownJournal;
+use super::locks;
 use super::outcome::{Outcome, from_binance, from_binance_bulk, from_okx};
 use super::queries;
 use super::request::{BinanceRequest, Exposure, Lookup, LookupKind, Method, OkxRequest};
-use super::risk::{
-    AutoCloseDecision, EquityBasis, EquityObservation, EquitySource, EquityTracker, RiskSnapshot,
-};
+use super::risk::{AutoCloseDecision, EquityBasis, EquityObservation, EquityTracker, RiskSnapshot};
 use super::rules::{FreshRules, RulesTable, TradeProduct, ValidSymbol};
 use super::types::{Dir, MarginMode, TradeError};
+use super::unknown::UnknownRecord;
 use crate::account::{
     AccountEnv, AccountError, AccountKey, AccountProduct, AccountVenue, ApiCredentials, ProxyState,
     binance_hosts, check_proxy_snapshot, https_endpoint, okx_headers, okx_timestamp,
@@ -71,6 +71,14 @@ impl From<TradeError> for ReadError {
     fn from(e: TradeError) -> Self {
         ReadError::Trade(e)
     }
+}
+
+/// Why an approved order was not sent.
+pub(crate) enum NotSent {
+    /// An earlier send for this account and symbol is unresolved or in flight.
+    Locked,
+    /// The write-ahead record could not be made.
+    Journal,
 }
 
 /// What a send returned, plus the follow-up an `Unknown` outcome needs.
@@ -404,14 +412,21 @@ impl TradeClient {
     // ── The gate ────────────────────────────────────────────────────────
 
     /// Run the single gate and send. `token` is the user's confirmation, spent here.
+    ///
+    /// `journal` records a send that may end `Unknown` before it goes out (see [`journal`]); if
+    /// that fails, nothing is sent.
+    ///
+    /// [`journal`]: super::journal
     pub async fn submit<G: SendGate>(
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         token: ConfirmToken,
         intent: OrderIntent,
     ) -> Result<Submitted, SubmitError<G::Refusal>> {
-        self.submit_spent(gate, risk, token.spend(), intent).await
+        self.submit_spent(gate, risk, journal, token.spend(), intent)
+            .await
     }
 
     /// An automatic path (condition 71): pre-authorised, and only ever reducing.
@@ -419,10 +434,11 @@ impl TradeClient {
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         auto: AutoIntent,
     ) -> Result<Submitted, SubmitError<G::Refusal>> {
         log::info!("auto order path {:?}", auto.path);
-        self.submit_spent(gate, risk, Spent::pre_authorised(), auto.intent)
+        self.submit_spent(gate, risk, journal, Spent::pre_authorised(), auto.intent)
             .await
     }
 
@@ -430,6 +446,7 @@ impl TradeClient {
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         spent: Spent,
         intent: OrderIntent,
     ) -> Result<Submitted, SubmitError<G::Refusal>> {
@@ -440,14 +457,21 @@ impl TradeClient {
             return Err(SubmitError::Locked);
         }
         let approved = approve(gate, risk, spent, intent, self.now_ms(), self.target())?;
-        self.send_approved(approved)
+        self.send_approved(approved, journal)
             .await
-            .map_err(|Locked| SubmitError::Locked)
+            .map_err(|e| match e {
+                NotSent::Locked => SubmitError::Locked,
+                NotSent::Journal => SubmitError::JournalUnavailable,
+            })
     }
 
     /// The only function that sends an order, cancel or close. Crate-private: it takes an
     /// [`ApprovedOrder`], which only the gate can make.
-    pub(crate) async fn send_approved(&self, approved: ApprovedOrder) -> Result<Submitted, Locked> {
+    pub(crate) async fn send_approved(
+        &self,
+        approved: ApprovedOrder,
+        journal: &dyn UnknownJournal,
+    ) -> Result<Submitted, NotSent> {
         let ApprovedOrder { intent, priority } = approved;
         // An entry is marked in flight before it goes out (F2): a second entry on the same
         // symbol is refused until this one returns, and a send that is dropped half way
@@ -457,13 +481,38 @@ impl TradeClient {
             Prepared::Okx(r) => r.lookup(),
         };
         let client_id = lookup.as_ref().map(|l| l.client_id.clone());
-        let inflight = match intent.exposure() {
-            Exposure::Adds { .. } => Some(locks::reserve(
-                self.account,
-                &intent.symbol,
-                client_id.as_deref(),
-            )?),
-            Exposure::Reduces | Exposure::Neutral => None,
+        let adds = matches!(intent.exposure(), Exposure::Adds { .. });
+        let inflight = if adds {
+            Some(
+                locks::reserve(self.account, &intent.symbol, client_id.as_deref())
+                    .map_err(|_| NotSent::Locked)?,
+            )
+        } else {
+            None
+        };
+        // Write ahead (review B4). Only a new entry is refused when the write fails (B5):
+        // reducing, closing and protective sends always go out (conditions 60 and 72), so a
+        // full disk or a corrupt file can never stop a position from being cut. For those the
+        // write is best effort, and an in-memory lock still covers an Unknown outcome.
+        let journaled = match &lookup {
+            Some(l) => {
+                let record =
+                    UnknownRecord::for_send(self.account, &intent.symbol, l, self.now_ms());
+                if journal.record(&record).is_ok() {
+                    true
+                } else if adds {
+                    // Nothing was sent: release the in-flight mark cleanly. Dropping the armed
+                    // guard would lock the symbol as Unknown.
+                    if let Some(g) = inflight {
+                        g.finish(false, None);
+                    }
+                    return Err(NotSent::Journal);
+                } else {
+                    log::error!("could not write ahead a non-entry send: sending anyway");
+                    false
+                }
+            }
+            None => false,
         };
         let outcome = match &intent.prepared {
             Prepared::Binance(r) => {
@@ -480,11 +529,8 @@ impl TradeClient {
                 from_okx(result, status, client_id.as_deref(), require_id)
             }
         };
-        let unknown = lock_on_unknown(
-            matches!(outcome, Outcome::Unknown { .. }),
-            inflight.is_some(),
-            lookup.is_some(),
-        );
+        let is_unknown = matches!(outcome, Outcome::Unknown { .. });
+        let unknown = lock_on_unknown(is_unknown, inflight.is_some(), lookup.is_some());
         match inflight {
             Some(g) => g.finish(unknown, client_id.as_deref()),
             None if unknown => {
@@ -492,8 +538,18 @@ impl TradeClient {
             }
             None => {}
         }
+        // The outcome is known: the record is no longer needed. An `Unknown` keeps it until the
+        // lookup (or the user) resolves it. A failed clear leaves it behind, which is safe.
+        if journaled
+            && !is_unknown
+            && let Some(id) = client_id.as_deref()
+            && journal.clear(self.account, id).is_err()
+        {
+            log::warn!("could not clear the journal record of a settled send");
+        }
         let pending = match (&outcome, lookup) {
             (Outcome::Unknown { .. }, Some(lookup)) => Some(super::unknown::PendingUnknown {
+                account: self.account,
                 symbol: intent.symbol.clone(),
                 lookup,
                 rules: intent.rules.clone(),
@@ -513,8 +569,8 @@ impl TradeClient {
     }
 
     /// Release the lock of a resolved send, by its client id (see `locks::resolve_client_id`).
-    pub(super) fn unlock(&self, symbol: &str, client_id: &str) {
-        locks::resolve_client_id(self.account, symbol, client_id);
+    pub(super) fn unlock(&self, symbol: &str, client_id: &str) -> bool {
+        locks::resolve_client_id(self.account, symbol, client_id)
     }
 
     /// Look one order up by its client id. `Ok(true)` when the exchange knows it, `Ok(false)`
@@ -749,13 +805,7 @@ impl TradeClient {
         };
         let raw = raw.filter(|s| !s.is_empty()).ok_or(ReadError::Parse)?;
         let equity = Decimal::parse(&raw).map_err(|_| ReadError::Parse)?;
-        Ok(EquityObservation {
-            at_ms: self.now_ms(),
-            equity,
-            basis,
-            source: EquitySource::Rest,
-            is_transfer: false,
-        })
+        Ok(EquityObservation::rest(self.now_ms(), equity, basis))
     }
 
     /// The risk hook for `tracker` at this client's clock, so callers never supply a time.

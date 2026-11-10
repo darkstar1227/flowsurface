@@ -32,7 +32,8 @@
 use super::decimal::Decimal;
 use super::gate::{RiskHook, RiskRefusal, RiskView};
 use super::request::Exposure;
-use crate::account::AccountKey;
+use super::stream::{PrivateEvent, StreamKey};
+use crate::account::{AccountKey, AccountProduct, AccountVenue};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -50,21 +51,149 @@ pub enum EquityBasis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EquitySource {
     Rest,
-    /// The private stream (segment b/c wiring).
+    /// The private stream, from a venue whose stream tells transfers apart (Binance
+    /// `ACCOUNT_UPDATE` reasons). Only [`StreamEquityFeed`] makes these, and only the tracker
+    /// fed by them may start an automatic close (E1).
     PrivateStream,
+    /// The private stream, from a venue whose equity push carries no transfer information
+    /// (OKX `account` channel). It is as blind to a withdrawal as a REST read.
+    StreamWithoutTransferFlags,
 }
 
 /// One reading of the account's equity, in the quote currency of the account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The fields are crate-private: a caller outside `exchange` cannot claim that a reading came
+/// from the private stream or that it was a transfer. REST readings come from
+/// [`EquityObservation::rest`]; stream readings only from [`StreamEquityFeed`].
+///
+/// ```compile_fail,E0451
+/// use flowsurface_exchange::trade::{EquityBasis, EquityObservation, EquitySource, Decimal};
+/// // No struct literal outside the crate: a reading cannot claim to be from the stream.
+/// fn forge(d: Decimal) -> EquityObservation {
+///     EquityObservation { at_ms: 0, equity: d, basis: EquityBasis::OkxTotalEq,
+///         source: EquitySource::PrivateStream, is_transfer: false }
+/// }
+/// ```
+///
+/// ```compile_fail,E0639
+/// use flowsurface_exchange::trade::stream::EquityUpdate;
+/// use flowsurface_exchange::trade::Decimal;
+/// // `EquityUpdate` is non_exhaustive: only the stream parsers build one.
+/// fn forge(d: Decimal) -> EquityUpdate { EquityUpdate { total_equity: d, transfer_flags: true } }
+/// ```
 pub struct EquityObservation {
-    pub at_ms: i64,
-    pub equity: Decimal,
-    pub basis: EquityBasis,
-    pub source: EquitySource,
+    pub(crate) at_ms: i64,
+    pub(crate) equity: Decimal,
+    pub(crate) basis: EquityBasis,
+    pub(crate) source: EquitySource,
     /// The change since the previous observation came from a deposit or withdrawal
     /// (`ACCOUNT_UPDATE` reason, or an OKX funding bill). It re-bases the day start and the
     /// peak and is not counted as a loss or a recovery.
-    pub is_transfer: bool,
+    pub(crate) is_transfer: bool,
+}
+
+impl EquityObservation {
+    /// A REST reading: it cannot flag transfers.
+    pub fn rest(at_ms: i64, equity: Decimal, basis: EquityBasis) -> Self {
+        Self {
+            at_ms,
+            equity,
+            basis,
+            source: EquitySource::Rest,
+            is_transfer: false,
+        }
+    }
+
+    pub fn at_ms(&self) -> i64 {
+        self.at_ms
+    }
+
+    pub fn equity(&self) -> Decimal {
+        self.equity
+    }
+
+    pub fn basis(&self) -> EquityBasis {
+        self.basis
+    }
+
+    pub fn source(&self) -> EquitySource {
+        self.source
+    }
+
+    pub fn is_transfer(&self) -> bool {
+        self.is_transfer
+    }
+}
+
+/// Turns private-stream events into equity readings for one account (review item 16).
+///
+/// An `Account(reason)` event marks the next equity reading as a transfer when the reason is
+/// a deposit, withdrawal or transfer; an `Equity` event then yields one observation. Venues
+/// whose equity push has no transfer information (OKX) yield
+/// [`EquitySource::StreamWithoutTransferFlags`], so they never make the tracker
+/// transfer-aware (E1 stays true). Positions are not read from here: they come from
+/// `Position` events and the snapshot only.
+///
+/// What a reading means is not up to the caller (review B2): the basis follows from the stream's
+/// venue and product, and whether the venue tells transfers apart is set by the parser on each
+/// event. There is no argument to claim otherwise.
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::{EquityBasis, StreamEquityFeed};
+/// // The old two-argument form, with a caller-chosen transfer flag, no longer exists.
+/// fn claim() -> StreamEquityFeed { StreamEquityFeed::new(EquityBasis::OkxTotalEq, true) }
+/// ```
+#[derive(Debug)]
+pub struct StreamEquityFeed {
+    basis: EquityBasis,
+    /// OKX never tells a transfer apart, whatever an event says.
+    venue_flags_transfers: bool,
+    transfer_pending: bool,
+}
+
+impl StreamEquityFeed {
+    /// The feed for the private stream `key` names.
+    pub fn new(key: &StreamKey) -> Self {
+        Self {
+            basis: match (key.venue, key.product) {
+                (AccountVenue::Okx, _) => EquityBasis::OkxTotalEq,
+                (AccountVenue::Binance, AccountProduct::UsdM) => {
+                    EquityBasis::BinanceTotalMarginBalance
+                }
+                (AccountVenue::Binance, AccountProduct::Spot) => EquityBasis::SpotMarkValued,
+            },
+            venue_flags_transfers: key.venue != AccountVenue::Okx,
+            transfer_pending: false,
+        }
+    }
+
+    /// Feed one private event; `at_ms` is the client's clock at receipt.
+    pub fn on_event(&mut self, event: &PrivateEvent, at_ms: i64) -> Option<EquityObservation> {
+        match event {
+            PrivateEvent::Account(reason) => {
+                if reason.is_transfer() {
+                    self.transfer_pending = true;
+                }
+                None
+            }
+            PrivateEvent::Equity(update) => {
+                let is_transfer = std::mem::take(&mut self.transfer_pending);
+                Some(EquityObservation {
+                    at_ms,
+                    equity: update.total_equity(),
+                    basis: self.basis,
+                    source: if update.transfer_flags && self.venue_flags_transfers {
+                        EquitySource::PrivateStream
+                    } else {
+                        EquitySource::StreamWithoutTransferFlags
+                    },
+                    is_transfer,
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Where the drawdown peak is taken from.
@@ -303,6 +432,9 @@ pub struct EquityTracker {
     /// The latest reading could not be used; equity counts as stale until a good one arrives.
     degraded: bool,
     positions: Option<PositionBook>,
+    /// The saved risk settings could not be turned into limits: new entries are refused until
+    /// valid limits are set (a bad setting never means "no limits").
+    settings_invalid: bool,
 }
 
 impl EquityTracker {
@@ -322,7 +454,29 @@ impl EquityTracker {
             transfer_aware: false,
             degraded: false,
             positions: None,
+            settings_invalid: false,
         }
+    }
+
+    /// A tracker for an account whose saved risk settings are invalid. It has no limits, but
+    /// it refuses every new entry ([`RiskRefusal::SettingsInvalid`]) until
+    /// [`EquityTracker::set_limits`] is given valid ones. Reducing and cancelling still pass.
+    pub fn with_invalid_settings(account: AccountKey, basis: EquityBasis) -> Self {
+        let mut t = Self::new(account, basis, RiskLimits::default());
+        t.settings_invalid = true;
+        t
+    }
+
+    pub fn settings_invalid(&self) -> bool {
+        self.settings_invalid
+    }
+
+    /// The private stream delivered a REST snapshot (a reconnect and resync). The snapshot
+    /// carries no equity, so the equity reference is not trusted until a new reading
+    /// arrives: the tracker counts as stale (new entries under an equity limit are refused
+    /// and no automatic close starts) until the caller reads the equity again and feeds it.
+    pub fn snapshot_applied(&mut self) {
+        self.degraded = true;
     }
 
     pub fn limits(&self) -> &RiskLimits {
@@ -337,6 +491,7 @@ impl EquityTracker {
     /// anchor changes. A trip stays until it clears by
     /// itself or [`EquityTracker::acknowledge_trip`].
     pub fn set_limits(&mut self, limits: RiskLimits) {
+        self.settings_invalid = false;
         // A different anchor means a different peak: start again from the latest reading,
         // or a new custom start would still be measured from an earlier high.
         if limits.anchor != self.limits.anchor {
@@ -374,14 +529,32 @@ impl EquityTracker {
 
     /// Record the position values (quote currency, absolute, long and short of a symbol
     /// summed) read from the exchange at `as_of_ms`, for the per-symbol cap.
+    ///
+    /// Keys are the exchange's own symbols (`BTCUSDT`, `BTC-USDT-SWAP`), the same format as
+    /// `RiskView.symbol` and `Position.symbol`. A key that is not a valid symbol means the
+    /// reading cannot be matched to orders: the whole book is dropped and the position counts
+    /// as unknown (entries under a per-symbol cap are refused) instead of silently missing.
+    ///
+    /// The cap counts the held position plus the new order only. Resting entry orders that
+    /// have not filled yet are not counted (decision on review item L10): the tracker has no
+    /// price for them, and counting them with a guess would be worse than the plain rule.
+    /// Residual risk: several resting entries can together exceed the cap once they fill.
     pub fn set_positions(
         &mut self,
         as_of_ms: i64,
         notionals: impl IntoIterator<Item = (String, Decimal)>,
     ) {
+        let notionals: HashMap<String, Decimal> = notionals.into_iter().collect();
+        if notionals
+            .keys()
+            .any(|k| crate::signing::validate_symbol(k).is_err())
+        {
+            self.positions = None;
+            return;
+        }
         self.positions = Some(PositionBook {
             as_of_ms,
-            notionals: notionals.into_iter().collect(),
+            notionals,
         });
     }
 
@@ -599,6 +772,8 @@ pub struct RiskSnapshot<'a> {
     now_ms: i64,
 }
 
+impl super::gate::sealed::Sealed for RiskSnapshot<'_> {}
+
 impl RiskHook for RiskSnapshot<'_> {
     fn check(&self, view: &RiskView<'_>) -> Result<(), RiskRefusal> {
         let t = self.tracker;
@@ -609,6 +784,9 @@ impl RiskHook for RiskSnapshot<'_> {
         let Exposure::Adds { notional } = view.exposure else {
             return Ok(());
         };
+        if t.settings_invalid {
+            return Err(RiskRefusal::SettingsInvalid);
+        }
         if t.trip.is_some() {
             return Err(RiskRefusal::Locked);
         }
@@ -1204,6 +1382,142 @@ mod tests {
         );
         // Reducing is never judged by the cap.
         assert_eq!(verdict(&t, T0 + 10 * MIN, Exposure::Reduces), Ok(()));
+    }
+
+    #[test]
+    fn position_keys_use_the_symbol_format_of_the_order_and_a_bad_key_means_unknown() {
+        let mut t = tracker(RiskLimits {
+            max_symbol_notional: Some(d("5000")),
+            ..RiskLimits::default()
+        });
+        let entry = |symbol| RiskView {
+            account: ACCT,
+            symbol,
+            exposure: Exposure::Adds {
+                notional: Some(d("500")),
+            },
+        };
+        // Binance and OKX symbols as `Position.symbol` and `OrderIntent::symbol` carry them.
+        t.set_positions(
+            T0,
+            [
+                ("BTCUSDT".to_string(), d("4600")),
+                ("BTC-USDT-SWAP".to_string(), d("4600")),
+            ],
+        );
+        for sym in ["BTCUSDT", "BTC-USDT-SWAP"] {
+            assert_eq!(
+                t.snapshot(T0).check(&entry(sym)),
+                Err(RiskRefusal::SymbolCapExceeded),
+                "{sym}"
+            );
+        }
+        // A key in another format cannot be matched: the book is dropped, not half used.
+        t.set_positions(T0, [("btc/usdt".to_string(), d("4600"))]);
+        assert_eq!(
+            t.snapshot(T0).check(&entry("BTCUSDT")),
+            Err(RiskRefusal::PositionUnknown)
+        );
+    }
+
+    fn equity_event(v: &str) -> PrivateEvent {
+        PrivateEvent::Equity(super::super::stream::EquityUpdate::new(d(v), false))
+    }
+
+    fn equity_event_flagged(v: &str) -> PrivateEvent {
+        PrivateEvent::Equity(super::super::stream::EquityUpdate::new(d(v), true))
+    }
+
+    use crate::account::AccountEnv;
+
+    fn key_of(venue: AccountVenue, product: AccountProduct) -> StreamKey {
+        StreamKey {
+            account: AccountKey::from_bytes([9; 16]),
+            venue,
+            env: AccountEnv::Live,
+            product,
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn stream_feed_flags_a_transfer_once_and_only_where_the_venue_reports_reasons() {
+        use super::super::stream::AccountReason;
+        let mut binance =
+            StreamEquityFeed::new(&key_of(AccountVenue::Binance, AccountProduct::UsdM));
+        // Other events yield nothing.
+        assert!(
+            binance
+                .on_event(&PrivateEvent::Account(AccountReason::Order), 1)
+                .is_none()
+        );
+        let plain = binance.on_event(&equity_event_flagged("100"), 2).unwrap();
+        assert_eq!(plain.source(), EquitySource::PrivateStream);
+        assert!(!plain.is_transfer());
+        binance.on_event(&PrivateEvent::Account(AccountReason::Withdraw), 3);
+        let moved = binance.on_event(&equity_event_flagged("60"), 4).unwrap();
+        assert!(moved.is_transfer());
+        // The flag is used up by one reading.
+        assert!(
+            !binance
+                .on_event(&equity_event_flagged("61"), 5)
+                .unwrap()
+                .is_transfer()
+        );
+
+        // OKX: no transfer information, so the reading is not "private stream" for E1.
+        let mut okx = StreamEquityFeed::new(&key_of(AccountVenue::Okx, AccountProduct::UsdM));
+        let o = okx.on_event(&equity_event("100"), 6).unwrap();
+        assert_eq!(o.source(), EquitySource::StreamWithoutTransferFlags);
+        assert_eq!(o.basis(), EquityBasis::OkxTotalEq);
+        // Even an update that claimed flags would not make an OKX reading transfer-aware.
+        let claimed = okx.on_event(&equity_event_flagged("100"), 7).unwrap();
+        assert_eq!(claimed.source(), EquitySource::StreamWithoutTransferFlags);
+        assert_eq!(
+            StreamEquityFeed::new(&key_of(AccountVenue::Binance, AccountProduct::Spot)).basis,
+            EquityBasis::SpotMarkValued
+        );
+    }
+
+    #[test]
+    fn e1_an_okx_stream_reading_never_makes_the_tracker_transfer_aware() {
+        let mut t = tracker(RiskLimits::default());
+        let mut okx = StreamEquityFeed::new(&key_of(AccountVenue::Okx, AccountProduct::UsdM));
+        let o = okx.on_event(&equity_event("100"), T0).unwrap();
+        t.observe(o);
+        t.observe(obs(T0 + MIN, "99"));
+        assert_eq!(
+            t.begin_auto_close(T0 + MIN, true),
+            AutoCloseDecision::NotTripped,
+            "nothing tripped, so nothing to close"
+        );
+        // A trip on this source is still refused for the automatic close.
+        let mut t = tracker(RiskLimits {
+            daily_loss_limit: Some(d("10")),
+            ..RiskLimits::default()
+        });
+        t.observe(okx.on_event(&equity_event("100"), T0).unwrap());
+        for n in 1..=10 {
+            t.observe(okx.on_event(&equity_event("50"), T0 + n * MIN).unwrap());
+        }
+        assert_eq!(
+            t.begin_auto_close(T0 + 10 * MIN, true),
+            AutoCloseDecision::TransferBlind
+        );
+    }
+
+    #[test]
+    fn a_snapshot_makes_equity_stale_until_a_new_reading() {
+        let mut t = tracker(RiskLimits {
+            daily_loss_limit: Some(d("500")),
+            ..RiskLimits::default()
+        });
+        t.observe(obs(T0, "1000"));
+        assert_eq!(t.freshness(T0 + 1), EquityFreshness::Fresh);
+        t.snapshot_applied();
+        assert_eq!(t.freshness(T0 + 1), EquityFreshness::Stale);
+        t.observe(obs(T0 + MIN, "1000"));
+        assert_eq!(t.freshness(T0 + MIN), EquityFreshness::Fresh);
     }
 
     #[test]

@@ -20,9 +20,10 @@ use uuid::Uuid;
 /// While `false`, every order for a `Live` account is refused, whatever else passes.
 ///
 /// Development-order limit: LIVE sending must not exist on `main` before the local risk
-/// controls (segment e, trade-risk) are merged. The local risk gate exists now, but it is not
-/// wired in yet: remove this switch only after segment c, with N2, E1–E3, C1–C5 and the
-/// testnet verification done.
+/// controls (segment e, trade-risk) are merged. The local risk hook is part of the exchange
+/// crate's submit path now, but the GUI does not build the risk snapshot or call `submit` yet:
+/// remove this switch only after segment c, with N2, E1–E3, C1–C5 and the testnet
+/// verification done.
 // TODO(trade-risk): delete once the conditions above are met.
 const LIVE_SENDING_ENABLED: bool = false;
 
@@ -61,8 +62,8 @@ impl TradeSession {
         );
     }
 
-    /// Forget an account's verdict: it was edited, deleted, failed a test, or its private
-    /// stream lost authentication.
+    /// Forget an account's verdict: it was edited, deleted, failed a test, or the exchange
+    /// stream refused its login.
     pub fn invalidate(&mut self, id: Uuid) {
         self.entries.remove(&id);
     }
@@ -70,22 +71,6 @@ impl TradeSession {
     pub fn get(&self, id: Uuid) -> Option<&SessionEntry> {
         self.entries.get(&id)
     }
-}
-
-/// State of the account's private stream (segment b). Segment a has no stream yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamState {
-    NotStarted,
-    Connected,
-    /// Login was refused: the session verdict is void.
-    AuthFailed,
-}
-
-/// Local risk state (segment e). `Locked` refuses new entries; reducing is always allowed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RiskState {
-    Clear,
-    Locked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,10 +109,8 @@ pub enum GateRejection {
     NotUsable,
     /// The key lacks the product's trading permission (or Live could not confirm it).
     NoTradePermission,
-    StreamAuthFailed,
     /// Contract order while the exchange's position mode is unknown.
     PositionModeUnknown,
-    RiskLocked,
 }
 
 /// Decide whether an order may be sent.
@@ -141,8 +124,6 @@ pub fn can_send(
     keychain: &Result<StoredIdentity, StoreError>,
     saved: &AccountMeta,
     proxy_ok: bool,
-    stream: StreamState,
-    risk: RiskState,
     order: OrderRequest,
 ) -> Result<(), GateRejection> {
     can_send_with(
@@ -151,14 +132,12 @@ pub fn can_send(
         keychain,
         saved,
         proxy_ok,
-        stream,
-        risk,
         order,
     )
 }
 
 /// The F2 gate as seen by `exchange::trade::TradeClient::submit`: one account's session,
-/// Keychain, proxy, stream and risk state, checked by [`can_send`]. Build one per order, after
+/// Keychain and proxy, checked by [`can_send`]. Build one per order, after
 /// re-reading the Keychain item. The Live switch stays [`LIVE_SENDING_ENABLED`].
 ///
 /// This is the only implementation of `SendGate` the app may use. The exchange crate cannot
@@ -168,8 +147,6 @@ pub struct SessionGate<'a> {
     pub keychain: &'a Result<StoredIdentity, StoreError>,
     pub saved: &'a AccountMeta,
     pub proxy_ok: bool,
-    pub stream: StreamState,
-    pub risk: RiskState,
 }
 
 impl SendGate for SessionGate<'_> {
@@ -193,8 +170,6 @@ impl SendGate for SessionGate<'_> {
             self.keychain,
             self.saved,
             self.proxy_ok,
-            self.stream,
-            self.risk,
             OrderRequest {
                 kind: match request.class {
                     GateClass::Entry => OrderKind::Entry,
@@ -214,8 +189,6 @@ fn can_send_with(
     keychain: &Result<StoredIdentity, StoreError>,
     saved: &AccountMeta,
     proxy_ok: bool,
-    stream: StreamState,
-    risk: RiskState,
     order: OrderRequest,
 ) -> Result<(), GateRejection> {
     use GateRejection::*;
@@ -251,16 +224,10 @@ fn can_send_with(
     if !permission_ok {
         return Err(NoTradePermission);
     }
-    if stream == StreamState::AuthFailed {
-        return Err(StreamAuthFailed);
-    }
     // The builder reads the exchange-reported mode; without it the order parameters
     // (positionSide / reduceOnly) cannot be chosen correctly.
     if order.contract && entry.actual_mode.is_none() {
         return Err(PositionModeUnknown);
-    }
-    if order.kind == OrderKind::Entry && risk == RiskState::Locked {
-        return Err(RiskLocked);
     }
     Ok(())
 }
@@ -306,16 +273,7 @@ mod tests {
         m: &AccountMeta,
         session: Option<&SessionEntry>,
     ) -> Result<(), GateRejection> {
-        can_send_with(
-            live_enabled,
-            session,
-            &Ok(m.identity()),
-            m,
-            true,
-            StreamState::Connected,
-            RiskState::Clear,
-            ENTRY,
-        )
+        can_send_with(live_enabled, session, &Ok(m.identity()), m, true, ENTRY)
     }
 
     #[test]
@@ -340,15 +298,7 @@ mod tests {
             AccountProduct::UsdM,
         );
         // Even a perfect session is refused through the public entry point.
-        let r = can_send(
-            Some(&good(&m)),
-            &Ok(m.identity()),
-            &m,
-            true,
-            StreamState::Connected,
-            RiskState::Clear,
-            ENTRY,
-        );
+        let r = can_send(Some(&good(&m)), &Ok(m.identity()), &m, true, ENTRY);
         assert_eq!(r, Err(GateRejection::LiveTradingNotYetEnabled));
         // With the switch on, the same session passes: the rest of the table is live.
         assert_eq!(run(true, &m, Some(&good(&m))), Ok(()));
@@ -431,16 +381,7 @@ mod tests {
         );
         let s = good(&m);
         let ask = |keychain: Result<StoredIdentity, StoreError>| {
-            can_send_with(
-                true,
-                Some(&s),
-                &keychain,
-                &m,
-                true,
-                StreamState::Connected,
-                RiskState::Clear,
-                ENTRY,
-            )
+            can_send_with(true, Some(&s), &keychain, &m, true, ENTRY)
         };
         assert_eq!(ask(Ok(m.identity())), Ok(()));
         for other in [
@@ -481,28 +422,10 @@ mod tests {
             env: AccountEnv::Live,
             ..m.clone()
         };
-        let r = can_send_with(
-            true,
-            Some(&s),
-            &Ok(m.identity()),
-            &edited,
-            true,
-            StreamState::Connected,
-            RiskState::Clear,
-            ENTRY,
-        );
+        let r = can_send_with(true, Some(&s), &Ok(m.identity()), &edited, true, ENTRY);
         assert_eq!(r, Err(GateRejection::IdentityMismatch));
         // Same edit with a Keychain item that agrees: the old session verdict is stale.
-        let r = can_send_with(
-            true,
-            Some(&s),
-            &Ok(edited.identity()),
-            &edited,
-            true,
-            StreamState::Connected,
-            RiskState::Clear,
-            ENTRY,
-        );
+        let r = can_send_with(true, Some(&s), &Ok(edited.identity()), &edited, true, ENTRY);
         assert_eq!(r, Err(GateRejection::SessionStale));
     }
 
@@ -530,51 +453,25 @@ mod tests {
     }
 
     #[test]
-    fn proxy_stream_and_risk_conditions() {
+    fn the_proxy_condition_and_reduce_orders() {
         let m = meta(
             AccountVenue::Binance,
             AccountEnv::Testnet,
             AccountProduct::UsdM,
         );
         let s = good(&m);
-        let ask = |proxy_ok, stream, risk, order| {
-            can_send_with(
-                true,
-                Some(&s),
-                &Ok(m.identity()),
-                &m,
-                proxy_ok,
-                stream,
-                risk,
-                order,
-            )
-        };
+        let ask =
+            |proxy_ok, order| can_send_with(true, Some(&s), &Ok(m.identity()), &m, proxy_ok, order);
         let reduce = OrderRequest {
             kind: OrderKind::Reduce,
             contract: true,
         };
-        assert_eq!(
-            ask(false, StreamState::Connected, RiskState::Clear, ENTRY),
-            Err(GateRejection::ProxyNotOk)
-        );
-        assert_eq!(
-            ask(true, StreamState::AuthFailed, RiskState::Clear, ENTRY),
-            Err(GateRejection::StreamAuthFailed)
-        );
-        // No stream yet (segment a) is fine.
-        assert_eq!(
-            ask(true, StreamState::NotStarted, RiskState::Clear, ENTRY),
-            Ok(())
-        );
-        // Risk lock refuses entries only; reducing still goes through.
-        assert_eq!(
-            ask(true, StreamState::Connected, RiskState::Locked, ENTRY),
-            Err(GateRejection::RiskLocked)
-        );
-        assert_eq!(
-            ask(true, StreamState::Connected, RiskState::Locked, reduce),
-            Ok(())
-        );
+        assert_eq!(ask(false, ENTRY), Err(GateRejection::ProxyNotOk));
+        assert_eq!(ask(true, ENTRY), Ok(()));
+        // The private stream state is not judged here: the exchange crate reads it from its
+        // per-account registry inside `approve`, the only place it is looked at. Local risk is
+        // not judged here either (one source of truth: the risk hook).
+        assert_eq!(ask(true, reduce), Ok(()));
     }
 
     #[test]
@@ -591,8 +488,6 @@ mod tests {
                 &Ok(m.identity()),
                 &m,
                 true,
-                StreamState::Connected,
-                RiskState::Clear,
                 OrderRequest {
                     kind: OrderKind::Entry,
                     contract,
@@ -627,8 +522,6 @@ mod tests {
             keychain: &kc,
             saved: &live,
             proxy_ok: true,
-            stream: StreamState::Connected,
-            risk: RiskState::Clear,
         };
         let req = GateRequest {
             account: AccountKey::from_bytes(*live.id.as_bytes()),
@@ -668,8 +561,6 @@ mod tests {
             keychain: &kc,
             saved: &test,
             proxy_ok: true,
-            stream: StreamState::Connected,
-            risk: RiskState::Clear,
         };
         let req = GateRequest {
             account: AccountKey::from_bytes(*test.id.as_bytes()),
@@ -695,17 +586,141 @@ mod tests {
         ] {
             assert_eq!(gate.check(wrong), Err(GateRejection::IdentityMismatch));
         }
-        let locked = SessionGate {
-            risk: RiskState::Locked,
-            ..gate
+    }
+
+    /// The source of a file without its `#[cfg(test)] mod ... {` block. Same algorithm as the
+    /// exchange crate's `source_rules_tests`: braces in string and char literals do not count.
+    fn production_part(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let is_test_mod = lines[i].trim() == "#[cfg(test)]"
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|l| l.trim_start().starts_with("mod ") || l.contains(" mod "));
+            if is_test_mod {
+                let mut depth = 0i32;
+                let mut seen = false;
+                i += 1;
+                while i < lines.len() {
+                    let mut in_str = false;
+                    let mut prev = ' ';
+                    for c in lines[i].chars() {
+                        if in_str {
+                            if c == '"' && prev != '\\' {
+                                in_str = false;
+                            }
+                        } else {
+                            match c {
+                                '"' => in_str = true,
+                                '{' if prev != '\'' => {
+                                    depth += 1;
+                                    seen = true;
+                                }
+                                '}' if prev != '\'' => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        prev = c;
+                    }
+                    i += 1;
+                    if (seen && depth <= 0) || (!seen && lines[i - 1].trim_end().ends_with(';')) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(lines[i]);
+            i += 1;
+        }
+        out.join("\n")
+    }
+
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
         };
-        assert_eq!(locked.check(req), Err(GateRejection::RiskLocked));
-        assert_eq!(
-            locked.check(GateRequest {
-                class: GateClass::Reduce,
-                ..req
-            }),
-            Ok(())
-        );
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rust_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    #[test]
+    fn the_scan_helper_skips_test_modules_and_braces_in_strings() {
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    const S: &str = \"}\";\n    impl SendGate for X {}\n}\nfn b() {}\n";
+        let prod = production_part(src);
+        assert!(prod.contains("fn a()") && prod.contains("fn b()"), "{prod}");
+        assert!(!prod.contains("SendGate for"), "{prod}");
+    }
+
+    /// Review item C3: `SessionGate` is the only `SendGate` in the app. A trait cannot stop
+    /// another implementation, so this reads the production source of the app and of `data`.
+    /// A source directory that cannot be found fails the scan instead of passing it.
+    #[test]
+    fn session_gate_is_the_only_send_gate_implementation() {
+        let data_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&data_src, &mut files);
+        assert!(files.len() > 10, "data sources not found: {}", files.len());
+        // The GUI crate sits next to `data/` in the workspace; a packaged crate has no
+        // workspace above it, and only then may it be missing.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let in_workspace = std::fs::read_to_string(root.join("Cargo.toml"))
+            .is_ok_and(|t| t.contains("[workspace]"));
+        let before = files.len();
+        rust_files(&root.join("src"), &mut files);
+        if in_workspace {
+            assert!(files.len() > before, "GUI sources not found");
+        }
+        let mut found = Vec::new();
+        for f in files {
+            let Ok(src) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            for (n, line) in production_part(&src).lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains("SendGate for") {
+                    found.push(format!("{}:{}", f.display(), n + 1));
+                }
+            }
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("trade_gate.rs"), "{found:?}");
+    }
+
+    /// Review N3: `UnknownStore` is the only `UnknownJournal` in the app. The trait cannot be
+    /// sealed (data must implement it), so a no-op implementation is caught here instead.
+    #[test]
+    fn the_unknown_store_is_the_only_journal_implementation() {
+        let data_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&data_src, &mut files);
+        assert!(files.len() > 10, "data sources not found: {}", files.len());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let in_workspace = std::fs::read_to_string(root.join("Cargo.toml"))
+            .is_ok_and(|t| t.contains("[workspace]"));
+        let before = files.len();
+        rust_files(&root.join("src"), &mut files);
+        if in_workspace {
+            assert!(files.len() > before, "GUI sources not found");
+        }
+        let mut found = Vec::new();
+        for f in files {
+            let Ok(src) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            for (n, line) in production_part(&src).lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains("UnknownJournal for") {
+                    found.push(format!("{}:{}", f.display(), n + 1));
+                }
+            }
+        }
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("unknown_store.rs"), "{found:?}");
     }
 }

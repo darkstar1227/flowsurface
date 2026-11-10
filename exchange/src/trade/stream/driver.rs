@@ -14,8 +14,10 @@ use super::okx::{
     subscribe_frame, ws_url,
 };
 use super::secret::StreamKey;
+use super::status;
 use crate::account::{
-    AccountError, AccountProduct, AccountVenue, ApiCredentials, ProxyState, check_proxy_snapshot,
+    AccountError, AccountKey, AccountProduct, AccountVenue, ApiCredentials, ProxyState,
+    check_proxy_snapshot,
 };
 use crate::adapter::ws::{HeartbeatPolicy, WsTransport};
 use crate::rate_limit::{Denied, Priority, WindowBucket};
@@ -95,6 +97,9 @@ pub struct PrivateStream {
     task: JoinHandle<()>,
     ctl: UnboundedSender<Msg>,
     unread: Arc<AtomicUsize>,
+    /// The entry this stream owns in the status table (see `status`).
+    account: AccountKey,
+    status_token: u64,
 }
 
 impl PrivateStream {
@@ -130,6 +135,10 @@ impl futures::Stream for PrivateStream {
 impl Drop for PrivateStream {
     fn drop(&mut self) {
         self.task.abort();
+        // Here, not in the task: an aborted task may still run once more. Removing the entry
+        // also fences off any write it makes after this (tokens are checked), so a stream
+        // that is gone never leaves the account looking connected.
+        status::retire(self.account, self.status_token);
     }
 }
 
@@ -150,6 +159,9 @@ struct Shared {
     clock_offset_ms: AtomicI64,
     /// `Msg::LegEvents` sent by connections and not yet taken by the supervisor.
     pending_legs: AtomicUsize,
+    /// The token that lets this stream write its state to the status table; `None` when the
+    /// stream is not registered (tests of the pieces).
+    status_token: Option<u64>,
 }
 
 impl Shared {
@@ -159,6 +171,7 @@ impl Shared {
             key_created: AtomicBool::new(false),
             clock_offset_ms: AtomicI64::new(0),
             pending_legs: AtomicUsize::new(0),
+            status_token: None,
         }
     }
 }
@@ -203,8 +216,12 @@ pub fn run(ctx: StreamContext) -> PrivateStream {
     let (out_tx, rx) = unbounded();
     let (msg_tx, msg_rx) = unbounded();
     let unread = Arc::new(AtomicUsize::new(0));
+    let account = ctx.key.account;
+    let status_token = status::register(account);
+    let mut shared = Shared::new(ctx);
+    shared.status_token = Some(status_token);
     let task = tokio::spawn(supervise(
-        Arc::new(Shared::new(ctx)),
+        Arc::new(shared),
         msg_tx.clone(),
         msg_rx,
         out_tx,
@@ -215,6 +232,8 @@ pub fn run(ctx: StreamContext) -> PrivateStream {
         task,
         ctl: msg_tx,
         unread,
+        account,
+        status_token,
     }
 }
 
@@ -263,6 +282,22 @@ struct Supervisor {
     stopped: bool,
 }
 
+/// Marks the account as not connected when `supervise` ends for any reason, including a panic
+/// that unwinds the task (review N2). Without it the status table would keep saying `Connected`
+/// until the owner dropped the stream. Only the stream's own token can write.
+struct ReconnectingOnExit {
+    account: AccountKey,
+    token: Option<u64>,
+}
+
+impl Drop for ReconnectingOnExit {
+    fn drop(&mut self) {
+        if let Some(token) = self.token {
+            status::publish(self.account, token, StreamState::Reconnecting);
+        }
+    }
+}
+
 async fn supervise(
     shared: Arc<Shared>,
     msg_tx: UnboundedSender<Msg>,
@@ -270,6 +305,10 @@ async fn supervise(
     out: UnboundedSender<StreamOutput>,
     unread: Arc<AtomicUsize>,
 ) {
+    let _guard = ReconnectingOnExit {
+        account: shared.ctx.key.account,
+        token: shared.status_token,
+    };
     let legs = leg_count(&shared.ctx.key);
     let (machine, first) = Machine::start(legs, uses_listen_key(&shared.ctx.key));
     let mut sup = Supervisor::new(shared, machine, msg_tx, out, unread);
@@ -347,6 +386,11 @@ impl Supervisor {
 
     /// `false` when the consumer is gone.
     fn send(&self, output: StreamOutput) -> bool {
+        // The one place a state leaves the supervisor, so the table and the consumer cannot
+        // disagree about what was reported.
+        if let (StreamOutput::State(state), Some(token)) = (&output, self.shared.status_token) {
+            status::publish(self.shared.ctx.key.account, token, *state);
+        }
         self.unread.fetch_add(1, Ordering::Relaxed);
         self.out.unbounded_send(output).is_ok()
     }
@@ -1348,6 +1392,76 @@ mod tests {
             Err(CredentialsUnavailable)
         });
         ctx
+    }
+
+    fn unique_ctx(byte: u8) -> StreamContext {
+        let mut ctx = context(AccountVenue::Binance, AccountProduct::UsdM);
+        ctx.key.account = AccountKey::from_bytes([byte; 16]);
+        ctx
+    }
+
+    #[test]
+    fn a_dropped_stream_leaves_the_account_refusing_entries() {
+        runtime().block_on(async {
+            let ctx = unique_ctx(0xB1);
+            let account = ctx.key.account;
+            let stream = run(ctx);
+            let token = stream.status_token;
+            status::publish(account, token, StreamState::Connected);
+            assert_eq!(status::stream_state(account), StreamState::Connected);
+            drop(stream);
+            // Nothing is registered any more, which reads as "not connected".
+            assert_eq!(status::stream_state(account), StreamState::Reconnecting);
+            status::publish(account, token, StreamState::Connected);
+            assert_eq!(status::stream_state(account), StreamState::Reconnecting);
+        });
+    }
+
+    #[test]
+    fn a_panic_in_the_supervisor_leaves_the_account_refusing_entries() {
+        let account = AccountKey::from_bytes([0xB3; 16]);
+        let token = status::register(account);
+        status::publish(account, token, StreamState::Connected);
+        let crashed = std::panic::catch_unwind(|| {
+            let _guard = ReconnectingOnExit {
+                account,
+                token: Some(token),
+            };
+            panic!("supervisor failed");
+        });
+        assert!(crashed.is_err());
+        assert_eq!(status::stream_state(account), StreamState::Reconnecting);
+        // A newer stream of the same account is not touched by an older guard.
+        let newer = status::register(account);
+        status::publish(account, newer, StreamState::Connected);
+        drop(ReconnectingOnExit {
+            account,
+            token: Some(token),
+        });
+        assert_eq!(status::stream_state(account), StreamState::Connected);
+        status::retire(account, newer);
+    }
+
+    #[test]
+    fn the_state_survives_a_client_rebuilt_for_every_send() {
+        runtime().block_on(async {
+            let ctx = unique_ctx(0xB2);
+            let account = ctx.key.account;
+            let (mut sup, _rx) = supervisor_with(ctx);
+            let token = status::register(account);
+            let mut shared = Shared::new(sup.shared.ctx.clone());
+            shared.status_token = Some(token);
+            sup.shared = Arc::new(shared);
+            assert!(sup.send(StreamOutput::State(StreamState::Connected)));
+            // Whoever asks, a fresh client included, reads the same registry entry.
+            for _ in 0..3 {
+                assert_eq!(
+                    status::stream_state_for(account, AccountVenue::Binance, AccountProduct::UsdM),
+                    StreamState::Connected
+                );
+            }
+            status::retire(account, token);
+        });
     }
 
     #[test]

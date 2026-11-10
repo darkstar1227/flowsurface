@@ -9,6 +9,7 @@ mod listen_key;
 pub mod machine;
 pub mod okx;
 mod secret;
+pub mod status;
 
 pub use driver::{
     CredentialLoader, CredentialsUnavailable, PrivateStream, Snapshot, StreamContext, StreamOutput,
@@ -23,3 +24,4 @@ pub use machine::{
     one_cancels_other_paused,
 };
 pub use secret::{ListenKey, StreamKey};
+pub use status::{stream_state, stream_state_for};

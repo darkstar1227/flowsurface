@@ -1,0 +1,581 @@
+//! Unresolved sends that survive a restart (review N2, conditions 60 and 61).
+//!
+//! A send whose outcome is `Unknown` locks new entries for its (account, symbol). That lock
+//! lives in memory, so without this file a restart would silently unlock it. The file holds
+//! only what is needed to look the order up again: account id, symbol, client id, lookup kind
+//! and a time. No order parameters (so a release cannot rebuild the order), no keys, no
+//! secrets.
+//!
+//! - The path is a constant file name inside the data directory; no outside text becomes a
+//!   path. The file is written with mode 0600 through a temporary file (a random name, created
+//!   with `create_new`) and a rename. A symbolic link at the path is refused, also when it
+//!   appears between the check and the open, and the file is read with a size cap.
+//! - Every change is a read-modify-write under one process-wide lock, so two threads (the send
+//!   path and the resolver) cannot overwrite each other's change.
+//! - Loading checks every field again (alphabet, length, entry count). A bad entry is not
+//!   skipped quietly: loading fails, so the app can refuse to trade until the file is looked at.
+//! - `UnknownStore` is the exchange crate's write-ahead journal (`UnknownJournal`): the record
+//!   is written before a send goes out and removed once its outcome is known.
+//! - Releasing an entry by hand is the exchange crate's two-step confirmation
+//!   (`PendingUnknown::begin_manual_release`, then the typed phrase); this store only removes
+//!   the saved line afterwards. Saving, loading and releasing are logged with
+//!   [`RiskLogEntry::unknown_event`].
+//!
+//! Nothing here reads a clock: the time is the caller's.
+
+use exchange::account::AccountKey;
+use exchange::trade::UnknownRecord;
+use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use uuid::Uuid;
+
+const FILE_NAME: &str = "unresolved-orders.json";
+/// More than this many unresolved sends is not a state the app should be in.
+const MAX_ENTRIES: usize = 256;
+const MAX_FIELD: usize = 64;
+/// 256 entries of a few hundred bytes each; anything larger is not this program's file.
+const MAX_FILE_BYTES: u64 = 256 * 1024;
+const VERSION: u32 = 1;
+
+/// Serialises every read-modify-write of the file. A process-wide lock, not one per value:
+/// `UnknownStore` is `Clone` and several values can point at the same file.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    // A panic while holding the lock leaves the file as the last complete rename wrote it.
+    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Line {
+    account: Uuid,
+    symbol: String,
+    client_id: String,
+    kind: String,
+    recorded_at_ms: i64,
+}
+
+/// No `serde(default)`: a file without a version or entries is not ours, and loading it as an
+/// empty list would silently unlock everything. (The file is new on this branch, so there is no
+/// older shape to stay compatible with.)
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct File {
+    version: u32,
+    entries: Vec<Line>,
+}
+
+#[derive(Debug)]
+pub enum StoreError {
+    Io(io::Error),
+    /// The file is not what this program wrote; nothing was loaded.
+    Corrupt(&'static str),
+}
+
+impl From<io::Error> for StoreError {
+    fn from(e: io::Error) -> Self {
+        StoreError::Io(e)
+    }
+}
+
+impl StoreError {
+    /// A short fixed description, safe to log (no path, no client id).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            StoreError::Io(_) => "file system error",
+            StoreError::Corrupt(what) => what,
+        }
+    }
+}
+
+fn plain(s: &str, allow: impl Fn(u8) -> bool) -> bool {
+    !s.is_empty() && s.len() <= MAX_FIELD && s.bytes().all(allow)
+}
+
+impl std::fmt::Debug for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Line")
+            .field("symbol", &self.symbol)
+            .field("client_id", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Line {
+    fn check(&self) -> Result<(), StoreError> {
+        let symbol = plain(&self.symbol, |b| {
+            b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-'
+        });
+        let id = plain(&self.client_id, |b| {
+            b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+        });
+        let kind = plain(&self.kind, |b| {
+            b.is_ascii_lowercase() || b == b'_' || b == b':'
+        });
+        if !symbol {
+            return Err(StoreError::Corrupt("symbol"));
+        }
+        if !id {
+            return Err(StoreError::Corrupt("client id"));
+        }
+        if !kind {
+            return Err(StoreError::Corrupt("kind"));
+        }
+        Ok(())
+    }
+
+    fn same_order(&self, account: Uuid, client_id: &str) -> bool {
+        self.account == account && self.client_id == client_id
+    }
+
+    fn from_record(r: &UnknownRecord) -> Self {
+        Line {
+            account: Uuid::from_bytes(r.account.to_bytes()),
+            symbol: r.symbol.clone(),
+            client_id: r.client_id.clone(),
+            kind: r.kind.clone(),
+            recorded_at_ms: r.recorded_at_ms,
+        }
+    }
+
+    fn to_record(&self) -> UnknownRecord {
+        UnknownRecord {
+            account: AccountKey::from_bytes(*self.account.as_bytes()),
+            symbol: self.symbol.clone(),
+            client_id: self.client_id.clone(),
+            kind: self.kind.clone(),
+            recorded_at_ms: self.recorded_at_ms,
+        }
+    }
+}
+
+/// The saved list of unresolved sends.
+#[derive(Debug, Clone)]
+pub struct UnknownStore {
+    dir: PathBuf,
+}
+
+impl UnknownStore {
+    /// The store in the data directory (`FLOWSURFACE_DATA_PATH` or the platform default).
+    pub fn in_data_dir() -> Self {
+        Self::in_dir(crate::data_path(None))
+    }
+
+    /// A store in `dir`, a directory the program chose (not text from outside).
+    pub fn in_dir(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.dir.join(FILE_NAME)
+    }
+
+    /// Every saved record, to be handed to `TradeClient::restore_unknown` at startup. A
+    /// missing file is an empty list; a damaged one is an error and nothing is returned.
+    pub fn load(&self) -> Result<Vec<UnknownRecord>, StoreError> {
+        // Under the same lock as the writers: a rename between the open and the identity check
+        // would otherwise look like a swapped file.
+        let _guard = lock();
+        self.load_unlocked()
+    }
+
+    /// `load` for callers that already hold the lock (the mutex is not reentrant).
+    fn load_unlocked(&self) -> Result<Vec<UnknownRecord>, StoreError> {
+        let path = self.path();
+        let text = match read_capped(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let file: File =
+            serde_json::from_str(&text).map_err(|_| StoreError::Corrupt("not valid json"))?;
+        if file.version != VERSION {
+            return Err(StoreError::Corrupt("version"));
+        }
+        if file.entries.len() > MAX_ENTRIES {
+            return Err(StoreError::Corrupt("too many entries"));
+        }
+        for l in &file.entries {
+            l.check()?;
+        }
+        Ok(file.entries.iter().map(Line::to_record).collect())
+    }
+
+    /// Save one more unresolved send (called before the send goes out, see `UnknownJournal`).
+    /// The same (account, client id) is never saved twice; a client id is only unique within
+    /// its account.
+    pub fn add(&self, record: &UnknownRecord) -> Result<(), StoreError> {
+        let _guard = lock();
+        let mut file = self.read_file()?;
+        let line = Line::from_record(record);
+        line.check()?;
+        if file
+            .entries
+            .iter()
+            .any(|l| l.same_order(line.account, &line.client_id))
+        {
+            return Ok(());
+        }
+        if file.entries.len() >= MAX_ENTRIES {
+            return Err(StoreError::Corrupt("too many entries"));
+        }
+        file.entries.push(line);
+        self.write_file(&file)
+    }
+
+    /// Forget one entry: after a lookup resolved it, or after the user's two-step release.
+    /// Returns whether it was there.
+    pub fn remove(&self, account: AccountKey, client_id: &str) -> Result<bool, StoreError> {
+        let _guard = lock();
+        let mut file = self.read_file()?;
+        let id = Uuid::from_bytes(account.to_bytes());
+        let before = file.entries.len();
+        file.entries.retain(|l| !l.same_order(id, client_id));
+        let removed = file.entries.len() != before;
+        if removed {
+            self.write_file(&file)?;
+        }
+        Ok(removed)
+    }
+
+    fn read_file(&self) -> Result<File, StoreError> {
+        // Same checks as `load`, so a damaged file is never overwritten by an `add`.
+        let records = self.load_unlocked()?;
+        Ok(File {
+            version: VERSION,
+            entries: records.iter().map(Line::from_record).collect(),
+        })
+    }
+
+    fn write_file(&self, file: &File) -> Result<(), StoreError> {
+        fs::create_dir_all(&self.dir)?;
+        let path = self.path();
+        refuse_symlink(&path)?;
+        // A random name, created with `create_new` (which never follows a link): nobody can
+        // plant a file or a link at a name this process has not chosen yet.
+        let tmp = self.dir.join(format!("{FILE_NAME}.{}.tmp", Uuid::new_v4()));
+        let text = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
+        let written = (|| {
+            let mut f = open_private(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            fs::rename(&tmp, &path)
+        })();
+        if written.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        written?;
+        Ok(())
+    }
+}
+
+/// Read the file as text, refusing a link, a non-regular file and anything over the cap.
+fn read_capped(path: &Path) -> io::Result<String> {
+    let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidInput, m);
+    refuse_symlink(path)?;
+    let mut f = open_read(path)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(bad("unresolved orders path is not a regular file"));
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(bad("unresolved orders file is too large"));
+    }
+    // A link swapped in after the first check: the opened file is no longer the one at the path.
+    let now = fs::symlink_metadata(path)?;
+    if now.file_type().is_symlink() || !same_file(&meta, &now) {
+        return Err(bad("unresolved orders path changed while it was opened"));
+    }
+    let mut text = String::new();
+    // The file can grow after the check: read at most one byte past the cap.
+    (&mut f)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return Err(bad("unresolved orders file is too large"));
+    }
+    Ok(text)
+}
+
+fn open_read(path: &Path) -> io::Result<fs::File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(unix)]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// No stable file id in `std` on other platforms; the link check above is all there is.
+#[cfg(not(unix))]
+fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    true
+}
+
+fn refuse_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unresolved orders path is a symbolic link",
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn open_private(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+/// Windows keeps the per-user ACL of the data directory; there is no mode to set.
+#[cfg(not(unix))]
+fn open_private(path: &Path) -> io::Result<fs::File> {
+    OpenOptions::new().create_new(true).write(true).open(path)
+}
+
+impl exchange::trade::UnknownJournal for UnknownStore {
+    fn record(&self, record: &UnknownRecord) -> Result<(), exchange::trade::JournalError> {
+        self.add(record).map_err(|e| {
+            // The error text can name a path: log the kind only.
+            log::error!("unresolved order journal write failed: {}", e.reason());
+            exchange::trade::JournalError
+        })
+    }
+
+    fn clear(
+        &self,
+        account: AccountKey,
+        client_id: &str,
+    ) -> Result<(), exchange::trade::JournalError> {
+        self.remove(account, client_id).map(|_| ()).map_err(|e| {
+            log::error!("unresolved order journal clear failed: {}", e.reason());
+            exchange::trade::JournalError
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("flowsurface-unknown-{}", Uuid::new_v4()));
+            fs::create_dir_all(&dir).expect("scratch dir");
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record(id: &str) -> UnknownRecord {
+        UnknownRecord {
+            account: AccountKey::from_bytes([5; 16]),
+            symbol: "BTC-USDT-SWAP".into(),
+            client_id: id.into(),
+            kind: "okx_order".into(),
+            recorded_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn saved_records_load_again_and_a_missing_file_is_empty() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        assert!(store.load().unwrap().is_empty());
+        store.add(&record("eAAAA1")).unwrap();
+        store.add(&record("eBBBB2")).unwrap();
+        // The same id twice is one line.
+        store.add(&record("eAAAA1")).unwrap();
+        assert_eq!(store.load().unwrap().len(), 2);
+        assert_eq!(store.load().unwrap()[0], record("eAAAA1"));
+    }
+
+    #[test]
+    fn remove_drops_only_the_named_entry() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        store.add(&record("eAAAA1")).unwrap();
+        store.add(&record("eBBBB2")).unwrap();
+        let other = AccountKey::from_bytes([6; 16]);
+        assert!(!store.remove(other, "eAAAA1").unwrap());
+        assert!(store.remove(record("x").account, "eAAAA1").unwrap());
+        let left = store.load().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].client_id, "eBBBB2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_private_and_holds_no_secret_or_order_parameters() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        store.add(&record("eAAAA1")).unwrap();
+        let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let text = fs::read_to_string(store.path()).unwrap();
+        for forbidden in ["secret", "key", "price", "quantity", "size", "side"] {
+            assert!(!text.contains(forbidden), "{forbidden}: {text}");
+        }
+        // No temporary file is left behind.
+        let left: Vec<_> = fs::read_dir(&dir.0).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+    }
+
+    #[test]
+    fn a_damaged_or_hostile_file_fails_loudly_and_is_not_overwritten() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        fs::write(store.path(), "not json").unwrap();
+        assert!(matches!(store.load(), Err(StoreError::Corrupt(_))));
+        assert!(store.add(&record("eAAAA1")).is_err());
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), "not json");
+        // An entry with a symbol that could reach a request is refused too.
+        let evil = r#"{"version":1,"entries":[{"account":"00000000-0000-0000-0000-000000000001","symbol":"BTC&x=1","client_id":"eAAAA1","kind":"okx_order","recorded_at_ms":0}]}"#;
+        fs::write(store.path(), evil).unwrap();
+        assert!(matches!(store.load(), Err(StoreError::Corrupt("symbol"))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_at_the_path_is_refused() {
+        let dir = Scratch::new();
+        let target = dir.0.join("elsewhere");
+        fs::write(&target, "{}").unwrap();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        std::os::unix::fs::symlink(&target, store.path()).unwrap();
+        assert!(store.load().is_err());
+        assert!(store.add(&record("eAAAA1")).is_err());
+    }
+    #[test]
+    fn the_same_id_of_two_accounts_is_two_entries() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        let mut other = record("eAAAA1");
+        other.account = AccountKey::from_bytes([6; 16]);
+        store.add(&record("eAAAA1")).unwrap();
+        store.add(&other).unwrap();
+        store.add(&other).unwrap();
+        assert_eq!(store.load().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_file_that_is_not_ours_fails_instead_of_loading_empty() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        for text in [
+            "{}",
+            r#"{"entries":[]}"#,
+            r#"{"version":2,"entries":[]}"#,
+            r#"{"version":1}"#,
+            r#"{"version":1,"entries":[],"extra":1}"#,
+            r#"{"version":1,"entries":[{"account":"00000000-0000-0000-0000-000000000001","symbol":"BTC","client_id":"eAAAA1","kind":"okx_order","recorded_at_ms":0,"price":"1"}]}"#,
+        ] {
+            fs::write(store.path(), text).unwrap();
+            assert!(
+                matches!(store.load(), Err(StoreError::Corrupt(_))),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_over_the_size_cap_is_refused_and_a_directory_is_not_a_file() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        fs::write(store.path(), vec![b' '; MAX_FILE_BYTES as usize + 1]).unwrap();
+        assert!(store.load().is_err());
+        fs::remove_file(store.path()).unwrap();
+        fs::create_dir(store.path()).unwrap();
+        assert!(store.load().is_err());
+    }
+
+    #[test]
+    fn parallel_adds_and_removes_lose_no_entry() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..5 {
+                        let id = format!("e{t}x{i}");
+                        store.add(&record(&id)).unwrap();
+                        if i % 2 == 0 {
+                            assert!(store.remove(record(&id).account, &id).unwrap());
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // 8 threads x (5 added - 3 removed)
+        assert_eq!(store.load().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn the_store_is_a_journal_that_writes_ahead_and_clears() {
+        use exchange::trade::UnknownJournal;
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        let r = record("eAAAA1");
+        store.record(&r).unwrap();
+        assert_eq!(store.load().unwrap(), vec![r.clone()]);
+        store.clear(r.account, &r.client_id).unwrap();
+        assert!(store.load().unwrap().is_empty());
+        // A broken file makes the journal fail, so the send is not made.
+        fs::write(store.path(), "not json").unwrap();
+        assert!(store.record(&r).is_err());
+    }
+
+    #[test]
+    fn debug_output_hides_the_client_id() {
+        let line = Line::from_record(&record("eAAAA1"));
+        assert!(!format!("{line:?}").contains("eAAAA1"));
+    }
+
+    #[test]
+    fn load_never_fails_while_another_thread_writes() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        store.add(&record("eKEEP1")).unwrap();
+        let writer = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                for i in 0..200 {
+                    let id = format!("eW{i}");
+                    store.add(&record(&id)).unwrap();
+                    store.remove(record(&id).account, &id).unwrap();
+                }
+            })
+        };
+        for _ in 0..200 {
+            let loaded = store.load().expect("a write in progress is not corruption");
+            assert!(loaded.iter().any(|r| r.client_id == "eKEEP1"));
+        }
+        writer.join().unwrap();
+    }
+}

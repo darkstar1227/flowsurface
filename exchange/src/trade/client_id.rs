@@ -61,9 +61,92 @@ pub fn validate_client_id(id: &str, field: IdField) -> Result<(), TradeError> {
 }
 
 /// A client id that already satisfies the strictest pattern (`[A-Za-z0-9]{1,32}`).
-/// No `Default`, `From<String>` or `Deserialize`: the only ways in are [`ClientId::generate`]
-/// and [`ClientId::parse`], both of which check.
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// No `Clone`, `Default`, `From<String>` or `Deserialize`: the only ways in are
+/// [`ClientId::generate`] and the crate-private `parse`, both of which check.
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::{ClientId, Role};
+/// let id = ClientId::generate(Role::Entry);
+/// let _again = id.clone(); // an id cannot be copied to resend the same request
+/// ```
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::ClientId;
+/// let _ = ClientId::parse("eAAAA"); // callers outside the crate cannot rebuild an id
+/// ```
+///
+/// The inputs that carry an id own it, and neither they nor the requests built from them can
+/// be copied, so one id cannot go into two builders or be resent through a clone. Each
+/// `compile_fail` block below has a control that compiles:
+///
+/// ```
+/// use flowsurface_exchange::trade::binance_futures::FuturesEntry;
+/// use flowsurface_exchange::trade::okx::OkxEntry;
+/// use flowsurface_exchange::trade::gate::ApprovedOrder;
+/// use flowsurface_exchange::trade::{BinanceRequest, OkxRequest, Protective};
+/// fn is_send<T: Send>() {}
+/// is_send::<ApprovedOrder>();
+/// is_send::<FuturesEntry<'static>>();
+/// is_send::<OkxEntry<'static>>();
+/// is_send::<Protective>();
+/// is_send::<BinanceRequest>();
+/// is_send::<OkxRequest>();
+/// ```
+///
+/// ```
+/// use flowsurface_exchange::trade::binance_futures::{FuturesEntry, new_order};
+/// fn once(e: FuturesEntry<'_>) { let _ = new_order(e); }
+/// ```
+///
+/// ```compile_fail,E0382
+/// use flowsurface_exchange::trade::binance_futures::{FuturesEntry, new_order};
+/// fn twice(e: FuturesEntry<'_>) {
+///     let _ = new_order(e);
+///     let _ = new_order(e); // the id went into the first builder and is gone
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use flowsurface_exchange::trade::BinanceRequest;
+/// fn f(r: BinanceRequest) { let _ = r.clone(); }
+/// ```
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::binance_futures::FuturesEntry;
+/// fn is_clone<T: Clone>() {}
+/// is_clone::<FuturesEntry<'static>>(); // the entry owns its id: no copy
+/// ```
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::okx::OkxEntry;
+/// fn is_clone<T: Clone>() {}
+/// is_clone::<OkxEntry<'static>>();
+/// ```
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::Protective;
+/// fn is_clone<T: Clone>() {}
+/// is_clone::<Protective>();
+/// ```
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::BinanceRequest;
+/// fn is_clone<T: Clone>() {}
+/// is_clone::<BinanceRequest>(); // a request cannot be cloned and sent twice
+/// ```
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::OkxRequest;
+/// fn is_clone<T: Clone>() {}
+/// is_clone::<OkxRequest>();
+/// ```
+///
+/// ```compile_fail
+/// use flowsurface_exchange::trade::gate::ApprovedOrder;
+/// fn is_clone<T: Clone>() {}
+/// is_clone::<ApprovedOrder>();
+/// ```
+#[derive(PartialEq, Eq, Hash)]
 pub struct ClientId(String);
 
 impl ClientId {
@@ -71,8 +154,10 @@ impl ClientId {
         ClientId::from_bytes(role, rand::random::<u8>)
     }
 
-    /// Re-validate an id restored from storage or from the exchange.
-    pub fn parse(s: &str) -> Result<ClientId, TradeError> {
+    /// Re-validate an id restored from storage or from the exchange. Crate-private: callers
+    /// outside `exchange` cannot rebuild an id, and `ClientId` is not `Clone`, so a request
+    /// cannot be copied and sent again under the same id.
+    pub(crate) fn parse(s: &str) -> Result<ClientId, TradeError> {
         validate_client_id(s, IdField::Okx)?;
         Ok(ClientId(s.to_string()))
     }

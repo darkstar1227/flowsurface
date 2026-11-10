@@ -337,7 +337,7 @@ fn position_event(d: &Value) -> Result<Vec<PrivateEvent>, ParseError> {
 fn account_event(d: &Value) -> Result<Vec<PrivateEvent>, ParseError> {
     let mut out = Vec::new();
     if let Some(total_equity) = decimal_opt(d, "totalEq")? {
-        out.push(PrivateEvent::Equity(EquityUpdate { total_equity }));
+        out.push(PrivateEvent::Equity(EquityUpdate::new(total_equity, false)));
     }
     for b in d
         .get("details")
@@ -507,9 +507,7 @@ mod tests {
         };
         assert_eq!(
             ev[0],
-            PrivateEvent::Equity(EquityUpdate {
-                total_equity: dec("91884.8")
-            })
+            PrivateEvent::Equity(EquityUpdate::new(dec("91884.8"), false))
         );
         assert!(matches!(&ev[1], PrivateEvent::Balance(b) if b.free == Some(dec("100"))));
 

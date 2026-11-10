@@ -16,6 +16,7 @@ pub mod client_id;
 mod common;
 pub mod decimal;
 pub mod gate;
+pub mod journal;
 mod locks;
 pub mod okx;
 pub mod outcome;
@@ -39,21 +40,27 @@ pub use gate::{
     ApprovedOrder, AutoIntent, AutoPath, ConfirmToken, GateClass, GateRequest, OrderIntent,
     RiskHook, RiskRefusal, RiskView, SendGate, SubmitError,
 };
+pub use journal::{JournalError, UnknownJournal};
 pub use outcome::{ItemRejection, Outcome, RejectKind};
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
 pub use risk::{
     AutoCloseDecision, AutoCloseGrant, DrawdownAnchor, EquityBasis, EquityFreshness,
     EquityObservation, EquitySource, EquityTracker, IgnoreReason, Observed, RiskLimits, RiskNotice,
-    RiskNoticeKind, RiskSnapshot, TripReason, local_day,
+    RiskNoticeKind, RiskSnapshot, StreamEquityFeed, TripReason, local_day,
 };
 pub use rules::{FreshRules, RulesTable, SymbolRules, TradeProduct, ValidSymbol};
 pub use types::{
     Action, Dir, Exec, MarginMode, OrderRef, Protective, ProtectiveKind, Side, Size, TimeInForce,
     TradeError, Trailing, WorkingType,
 };
-pub use unknown::{DEFAULT_SCHEDULE, PendingUnknown, Resolution};
+pub use unknown::{
+    DEFAULT_SCHEDULE, ManualReleaseToken, PendingUnknown, ReleaseChallenge, ReleaseError,
+    ReleasedUnknown, Resolution, RestoreError, UnknownRecord, block_all_entries, lock_from_record,
+};
 
 #[cfg(test)]
 mod matrix_tests;
 #[cfg(test)]
 mod send_tests;
+#[cfg(test)]
+mod source_rules_tests;

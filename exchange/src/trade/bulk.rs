@@ -6,7 +6,8 @@
 use super::binance_futures as fut;
 use super::client::{OpenKind, OpenOrder, Position, ReadError, TradeClient};
 use super::client_id::{ClientId, Role};
-use super::gate::{AutoIntent, AutoPath, ConfirmToken, OrderIntent, RiskHook, SendGate, Spent};
+use super::gate::{AutoIntent, ConfirmToken, OrderIntent, RiskHook, SendGate, Spent};
+use super::journal::UnknownJournal;
 use super::okx::{self, OkxAlgoType};
 use super::outcome::Outcome;
 use super::queries;
@@ -98,6 +99,7 @@ impl TradeClient {
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         route: &Route,
         built: Result<Built, TradeError>,
         fresh: &FreshRules<'_>,
@@ -112,9 +114,12 @@ impl TradeClient {
             return;
         };
         let sent = match route {
-            Route::User(spent) => self.submit_spent(gate, risk, spent.clone(), intent).await,
-            Route::RiskClose => match AutoIntent::new(AutoPath::RiskClose, intent) {
-                Ok(auto) => self.submit_auto(gate, risk, auto).await,
+            Route::User(spent) => {
+                self.submit_spent(gate, risk, journal, spent.clone(), intent)
+                    .await
+            }
+            Route::RiskClose => match AutoIntent::risk_close(intent) {
+                Ok(auto) => self.submit_auto(gate, risk, journal, auto).await,
                 // A request that would add exposure is never sent on this path.
                 Err(_) => {
                     report.failed += 1;
@@ -140,17 +145,26 @@ impl TradeClient {
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         confirm: ConfirmToken,
         table: &RulesTable,
     ) -> Result<BulkReport<OpenOrder>, BulkError> {
-        self.cancel_all_via(gate, risk, &Route::User(confirm.spend()), table, true)
-            .await
+        self.cancel_all_via(
+            gate,
+            risk,
+            journal,
+            &Route::User(confirm.spend()),
+            table,
+            true,
+        )
+        .await
     }
 
     async fn cancel_all_via<G: SendGate>(
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         route: &Route,
         table: &RulesTable,
         reread: bool,
@@ -201,16 +215,16 @@ impl TradeClient {
                         .into_iter()
                         .filter(|t| t.cancel_algos_supported())
                     {
-                        let ids: Vec<Result<OrderRef, TradeError>> = orders
+                        let ids: Vec<&str> = orders
                             .iter()
                             .filter(|o| o.kind == OpenKind::Algo(Some(t)))
-                            .map(|o| OrderRef::exchange(&o.id))
+                            .map(|o| o.id.as_str())
                             .collect();
                         for chunk in ids.chunks(okx::MAX_CANCEL_ALGOS) {
                             requests.push(
                                 chunk
                                     .iter()
-                                    .cloned()
+                                    .map(|id| OrderRef::exchange(id))
                                     .collect::<Result<Vec<_>, _>>()
                                     .and_then(|c| okx::cancel_algos(rules, t, &c))
                                     .map(|r| Built::Okx(Box::new(r))),
@@ -220,7 +234,7 @@ impl TradeClient {
                 }
             }
             for built in requests {
-                self.send_built(gate, risk, route, built, &fresh, &mut report)
+                self.send_built(gate, risk, journal, route, built, &fresh, &mut report)
                     .await;
             }
         }
@@ -242,6 +256,7 @@ impl TradeClient {
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         confirm: ConfirmToken,
         table: &RulesTable,
         margin: MarginMode,
@@ -249,6 +264,7 @@ impl TradeClient {
         self.flatten_via(
             gate,
             risk,
+            journal,
             &Route::User(confirm.spend()),
             table,
             margin,
@@ -261,6 +277,7 @@ impl TradeClient {
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         route: &Route,
         table: &RulesTable,
         margin: MarginMode,
@@ -284,22 +301,22 @@ impl TradeClient {
             });
             let cid = ClientId::generate(Role::Entry);
             let built = match self.venue {
-                AccountVenue::Binance => fut::new_order(&fut::FuturesEntry {
+                AccountVenue::Binance => fut::new_order(fut::FuturesEntry {
                     rules,
                     mode,
                     action: Action::Close(p.dir),
                     qty: p.qty,
                     exec: Exec::Market,
                     ref_price: None,
-                    client_id: &cid,
+                    client_id: cid,
                 })
                 .map(Built::Binance),
                 AccountVenue::Okx => {
-                    okx::close_position(rules, mode, p.margin.unwrap_or(margin), p.dir, &cid)
+                    okx::close_position(rules, mode, p.margin.unwrap_or(margin), p.dir, cid)
                         .map(|r| Built::Okx(Box::new(r)))
                 }
             };
-            self.send_built(gate, risk, route, built, &fresh, &mut report)
+            self.send_built(gate, risk, journal, route, built, &fresh, &mut report)
                 .await;
         }
         if reread {
@@ -323,6 +340,7 @@ impl TradeClient {
         &self,
         gate: &G,
         risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
         grant: AutoCloseGrant,
         table: &RulesTable,
         margin: MarginMode,
@@ -332,13 +350,13 @@ impl TradeClient {
             return AutoCloseReport::refused();
         }
         let cancel = self
-            .cancel_all_via(gate, risk, &Route::RiskClose, table, false)
+            .cancel_all_via(gate, risk, journal, &Route::RiskClose, table, false)
             .await;
         let flatten = if self.product == AccountProduct::Spot {
             None
         } else {
             Some(
-                self.flatten_via(gate, risk, &Route::RiskClose, table, margin, false)
+                self.flatten_via(gate, risk, journal, &Route::RiskClose, table, margin, false)
                     .await,
             )
         };
