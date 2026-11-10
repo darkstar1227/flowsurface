@@ -6,7 +6,7 @@ use data::{
     chart::kline::indicators::manifest::{
         self, Message as CatalogMessage, SourceAction, SourceChange, Trigger,
     },
-    layout::{WindowSpec, pane::Axis, presets},
+    layout::{WindowSpec, drawings, pane::Axis, presets},
 };
 
 use iced::Task;
@@ -29,6 +29,7 @@ pub struct LayoutId {
 pub struct SharedChartResources {
     presets: presets::Library,
     indicator_catalog: manifest::State,
+    drawings: drawings::Library,
 }
 
 #[derive(Debug, Clone)]
@@ -38,11 +39,23 @@ pub enum ChartResourcesMessage {
 }
 
 impl SharedChartResources {
-    pub fn from_config(presets: Vec<data::chart::kline::ChartPreset>) -> Self {
+    pub fn from_config(
+        presets: Vec<data::chart::kline::ChartPreset>,
+        drawings: drawings::Config,
+    ) -> Self {
         Self {
             presets: presets::Library::from_config(presets),
             indicator_catalog: manifest::State::default(),
+            drawings: drawings::Library::from_config(drawings),
         }
+    }
+
+    pub fn drawings(&self) -> &drawings::Library {
+        &self.drawings
+    }
+
+    pub fn drawings_mut(&mut self) -> &mut drawings::Library {
+        &mut self.drawings
     }
 
     pub fn presets(&self) -> &presets::Library {
@@ -381,6 +394,7 @@ pub fn load_saved_state() -> SavedState {
                     layouts,
                     active_layout,
                     state.layout_manager.chart_presets.clone(),
+                    state.layout_manager.drawings.clone(),
                 )
             };
 

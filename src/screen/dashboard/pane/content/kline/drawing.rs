@@ -737,6 +737,17 @@ impl DrawingTools {
         self.active_tool.supports_magnet() && (self.magnet_enabled || self.magnet_modifier_active)
     }
 
+    /// Replaces the time-anchored drawings, e.g. with edits made in another chart.
+    pub(super) fn replace_time_drawings(&mut self, drawings: Vec<DrawingEntity>) {
+        let mut state = self.edit_state();
+        if self.tick_mode {
+            state.inactive_drawings = drawings;
+        } else {
+            state.drawings = drawings;
+        }
+        self.restore_edit_state(state);
+    }
+
     pub(super) fn time_drawings(&self) -> &[DrawingEntity] {
         if self.tick_mode {
             &self.inactive_drawings

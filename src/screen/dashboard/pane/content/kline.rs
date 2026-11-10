@@ -102,6 +102,8 @@ pub struct KlineChart {
     inspector: InspectorState,
     indicator_browser: indicator_browser::State,
     drawing_sidebar_visible: bool,
+    /// Last exchange of drawings with the shared library; `None` until the first sync.
+    drawing_sync: Option<data::layout::drawings::Synced>,
     settings_reconfigure_pending: bool,
     render_invalidation: RenderInvalidation,
     last_maintenance_at: Instant,
@@ -194,6 +196,7 @@ impl KlineChart {
             inspector: InspectorState::default(),
             indicator_browser: indicator_browser::State::default(),
             drawing_sidebar_visible: true,
+            drawing_sync: None,
             last_maintenance_at: Instant::now(),
             render_invalidation: RenderInvalidation::new(),
             settings_reconfigure_pending: false,
@@ -1974,11 +1977,29 @@ impl KlineChart {
         }
     }
 
+    /// Publishes this chart's drawing edits to `library`, or loads the drawings other
+    /// charts of the same ticker made. Skipped mid-drag so a gesture is published once.
+    pub fn sync_shared_drawings(&mut self, library: &mut data::layout::drawings::Library) {
+        if self.drawings.tools.is_dragging() {
+            return;
+        }
+        let ticker = self.data.base_ticker().ticker;
+        let local = self.drawings.tools.time_drawings();
+        if let Some(drawings) = library.sync(ticker, local, &mut self.drawing_sync)
+            && drawings.as_slice() != self.drawings.tools.time_drawings()
+        {
+            self.drawings.tools.replace_time_drawings(drawings);
+            self.drawings.clear_history();
+            self.render_invalidation.invalidate();
+        }
+    }
+
     pub fn serializable_config(&self) -> persisted::Config {
         persisted::Config {
             selected_preset: self.selected_preset,
             settings: self.settings_snapshot(),
-            drawings: self.drawings.tools.time_drawings().to_vec(),
+            // Drawings live in the shared library, keyed by ticker.
+            drawings: Vec::new(),
             active_drawing_tool: self.drawings.tools.active_tool(),
             floating_toolbar_position: self.drawings.floating_toolbar.position,
             drawing_sidebar_visible: self.drawing_sidebar_visible,

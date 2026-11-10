@@ -3,6 +3,7 @@ pub use pane::Pane;
 use serde::{Deserialize, Serialize};
 
 pub mod dashboard;
+pub mod drawings;
 pub mod pane;
 pub mod presets;
 

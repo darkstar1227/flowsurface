@@ -78,10 +78,11 @@ impl LayoutManager {
         layouts: Vec<Layout>,
         active_layout: Option<LayoutId>,
         chart_presets: Vec<data::chart::kline::ChartPreset>,
+        drawings: data::layout::drawings::Config,
     ) -> Self {
         let mut manager = Self {
             layouts,
-            chart_resources: SharedChartResources::from_config(chart_presets),
+            chart_resources: SharedChartResources::from_config(chart_presets, drawings),
             active_layout_id: active_layout.map(|l| l.unique),
             edit_mode: Editing::None,
         };
@@ -209,6 +210,21 @@ impl LayoutManager {
                 source_pane,
                 response,
             );
+        }
+    }
+
+    /// Exchanges kline drawings between the active layout's charts and the shared library.
+    pub fn sync_drawings(&mut self, main_window: window::Id) {
+        let Some(active) = self.active_layout_id else {
+            return;
+        };
+        let library = self.chart_resources.drawings_mut();
+        if let Some(layout) = self
+            .layouts
+            .iter_mut()
+            .find(|layout| layout.id.unique == active)
+        {
+            layout.dashboard.sync_drawings(main_window, library);
         }
     }
 

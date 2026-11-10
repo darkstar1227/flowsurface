@@ -1035,6 +1035,16 @@ impl Dashboard {
         }
     }
 
+    pub fn sync_drawings(
+        &mut self,
+        main_window: window::Id,
+        library: &mut data::layout::drawings::Library,
+    ) {
+        for (_, _, state) in self.iter_all_panes_mut(main_window) {
+            state.sync_drawings(library);
+        }
+    }
+
     pub fn invalidate_all_panes(&mut self, main_window: window::Id) {
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, state)| {

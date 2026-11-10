@@ -1231,6 +1231,9 @@ pub struct Config {
     pub settings: SettingsSnapshot,
     #[serde(default)]
     pub selected_preset: Option<uuid::Uuid>,
+    /// Only read from configs saved before drawings moved to the shared
+    /// `layout::drawings::Library`; new configs leave it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drawings: Vec<DrawingConfig>,
     pub active_drawing_tool: DrawingTool,
     pub floating_toolbar_position: FloatingToolbarPosition,

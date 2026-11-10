@@ -278,6 +278,8 @@ impl Flowsurface {
                     return Task::none();
                 }
 
+                self.layout_manager.sync_drawings(main_window_id);
+
                 let task = self
                     .active_dashboard_mut()
                     .tick(now, &data_sources, main_window_id);
@@ -950,6 +952,9 @@ impl Flowsurface {
     }
 
     fn load_layout(&mut self, layout_uid: uuid::Uuid, main_window: window::Id) -> Task<Message> {
+        // Publish the outgoing layout's edits before its charts are parked.
+        self.layout_manager.sync_drawings(main_window);
+
         if let Err(err) = self.layout_manager.set_active_layout(layout_uid) {
             log::error!("Failed to set active layout: {}", err);
             return Task::none();
@@ -1488,6 +1493,7 @@ impl Flowsurface {
             });
 
         self.sidebar.sync_tickers_table_settings();
+        self.layout_manager.sync_drawings(self.main_window.id);
 
         let mut ser_layouts = vec![];
         for layout in &self.layout_manager.layouts {
@@ -1502,6 +1508,7 @@ impl Flowsurface {
 
         let layouts = data::Layouts {
             chart_presets: self.layout_manager.presets().entries().to_vec(),
+            drawings: self.layout_manager.chart_resources().drawings().to_config(),
             layouts: ser_layouts,
             active_layout: self
                 .layout_manager

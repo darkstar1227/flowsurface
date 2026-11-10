@@ -145,6 +145,15 @@ impl State {
         }
     }
 
+    pub fn sync_drawings(&mut self, library: &mut data::layout::drawings::Library) {
+        if let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut self.content
+        {
+            chart.sync_shared_drawings(library);
+        }
+    }
+
     pub fn stream_pair(&self) -> Option<TickerInfo> {
         self.streams.find_ready_map(|stream| match stream {
             StreamKind::Kline { ticker_info, .. } => Some(*ticker_info),

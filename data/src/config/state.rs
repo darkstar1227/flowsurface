@@ -13,6 +13,9 @@ pub struct Layouts {
     pub active_layout: Option<String>,
     #[serde(default)]
     pub chart_presets: Vec<crate::chart::kline::ChartPreset>,
+    /// Kline drawings shared by every pane, keyed by ticker.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub drawings: crate::layout::drawings::Config,
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]
