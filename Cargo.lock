@@ -1265,6 +1265,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowsurface-pine"
+version = "0.9.0"
+dependencies = [
+ "flowsurface-indicator-engine",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

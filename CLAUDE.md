@@ -51,6 +51,7 @@ cargo clippy -p flowsurface-data --all-targets -- -D warnings   # 只檢查單�
 
 ```bash
 cargo test -p flowsurface-indicator-engine --locked   # 語言 parser／runtime／warmup 與 CLI 測試
+cargo test -p flowsurface-pine --locked               # Pine → .ind 翻譯器（fixture 在 pine/tests/fixtures/）
 cargo test -p flowsurface --bin flowsurface --locked  # GUI bin（目前沒有測試模組，主要確認能編譯）
 cargo test -p flowsurface-data --lib --locked         # 指標 registry／loader／scripting，會載入 data/indicators/sources 內的全部 .ind
 cargo run --locked -p flowsurface-indicator-engine --bin flowsurface-indicator -- \
@@ -66,7 +67,7 @@ cargo test -p flowsurface-data --lib <module>::tests::<name> -- --exact --nocapt
 cargo test -p flowsurface-indicator-engine -- --list   # 列出所有測試名稱
 ```
 
-- 測試採用 inline 的 `#[cfg(test)] mod tests`。目前只有 `indicator-engine/src/{lib,warmup}.rs`、`indicator-engine/src/bin/flowsurface-indicator.rs`，以及 `data/src/chart/kline/indicators/`（`registry`、`loader`、`scripting`、`language`、`core/runtime`）有測試。`exchange` 和 GUI 目前沒有測試。
+- 測試採用 inline 的 `#[cfg(test)] mod tests`。目前只有 `indicator-engine/src/{lib,warmup}.rs`、`indicator-engine/src/bin/flowsurface-indicator.rs`、`pine/src/`，以及 `data/src/chart/kline/indicators/`（`registry`、`loader`、`scripting`、`language`、`core/runtime`）有測試。`exchange` 和 GUI 目前沒有測試。
 - `indicator-engine/tests/fixtures/*.ind` 是透過 `include_str!` 載入的測試輸入，不是 integration test。新增語言功能時，在此加入 fixture，並在 `lib.rs` 的測試中引用。
 - 修改 `data/indicators/sources/` 下的 `.ind`，或修改指標語言時，`flowsurface-data` 的測試和 CLI `test` 兩者都要跑。
 - 依改動範圍挑選要跑的測試：只改 `exchange/` 或 `src/` 時，至少跑 `cargo clippy --workspace --all-targets -- -D warnings`，並用 `cargo run` 實際確認行為。
@@ -79,6 +80,7 @@ Cargo workspace，依賴方向 `flowsurface`（root，GUI）→ `data` → `exch
 - **`exchange/`**：與 UI 無關的交易所層。`adapter/hub/<venue>/` 是各交易所的 REST 擷取與 WebSocket stream；`adapter/{ws,http,limiter,proxy,client}.rs` 是共用的連線、限流與 proxy 機制。對外輸出統一的 `exchange::Event`，以及 `Ticker`、`Kline`、`Trade`、depth 等型別。
 - **`data/`**：可序列化的狀態與與 GUI 無關的運算，包括聚合（`aggr/` 的 time／tick 聚合）、圖表資料模型（`chart/kline`、`chart/heatmap`）、面板模型（`panel/` 的 ladder、time & sales）、設定（`config/` 的 theme、timezone、auth、network）、layout／preset 的持久化，以及指標 catalog／manifest（`chart/kline/indicators/`）。
 - **`indicator-engine/`**：`.ind` 指標語言的 parser → HIR → runtime，另附 `flowsurface-indicator` CLI（`new` / `check` / `test` / `catalog`）。語言規格見 `indicator-engine/LANGUAGE.md`，CLI 見 `indicator-engine/README.md`。內建指標放在 `data/indicators/sources/`，namespace 為 `core`。
+- **`pine/`**：`flowsurface-pine` 獨立 crate，把 Pine Script v5／v6 的子集翻譯成 `.ind` 來源，CLI 見 `pine/README.md`。以 `indicator-engine` 作為 dev-dependency 做測試，不被 app 依賴。
 - **`src/`（GUI）**：iced `daemon` 多視窗 app，採 Elm 架構。`main.rs` 的 `Flowsurface` 負責頂層 `update` / `view` / `subscription`。
   - `layout.rs` + `modal/layout_manager.rs`：多個具名 layout，每個 layout 擁有一個 `screen::dashboard::Dashboard`（pane grid，可 popout 成獨立視窗）。
   - `screen/dashboard/pane/`：`state.rs` 管理各 pane 的 stream 綁定，`content/` 是各種 pane 類型（kline、heatmap、ladder、timesales）的邏輯，`settings/` 是各 pane 的設定。

@@ -1,0 +1,37 @@
+//@version=6
+indicator("Trend State", overlay = true)
+
+enum Mode
+    fast = "Fast"
+    slow = "Slow"
+    balanced
+
+mode = input.enum(Mode.balanced, "Mode")
+length = input.int(10, "Length", minval = 1)
+src = input.source(close, "Source")
+threshold = input.float(1.5, "ATR threshold")
+
+var int direction = 0
+var float anchor = na
+
+ma = ta.ema(src, length)
+spread = ta.atr(length)
+up = src > ma + spread * threshold
+down = src < ma - spread * threshold
+
+if up
+    direction := 1
+    anchor := low
+else if down
+    direction := -1
+    anchor := high
+else
+    anchor := na(anchor) ? ma : anchor
+
+levelColor = direction > 0 ? color.green : direction < 0 ? color.red : color.gray
+modeText = mode == Mode.fast ? "fast" : mode == Mode.slow ? "slow" : "balanced"
+
+plot(ma, "MA", color = levelColor, linewidth = 2)
+plot(anchor, "Anchor", color = color.new(levelColor, 40), style = plot.style_stepline)
+plot(ta.barssince(up), "Bars since up", display = display.data_window)
+plot(ta.valuewhen(up, close, 0), "Last up close")

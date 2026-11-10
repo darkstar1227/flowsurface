@@ -1,0 +1,25 @@
+//@version=5
+indicator("MA Crossover", shorttitle = "MAX", overlay = true, max_bars_back = 500)
+
+// Inputs
+fastLen = input.int(9, "Fast length", minval = 1, maxval = 200, group = "Lengths")
+slowLen = input.int(21, title = "Slow length", minval = 2, maxval = 400, step = 1, group = "Lengths")
+src = input(close, "Source")
+useEma = input.bool(true, "Use EMA")
+fastColor = input.color(color.new(color.blue, 0), "Fast color")
+slowColor = input.color(#FF9800, "Slow color")
+
+fast = useEma ? ta.ema(src, fastLen) : ta.sma(src, fastLen)
+slow = useEma ? ta.ema(src, slowLen) : ta.sma(src, slowLen)
+
+bullish = ta.crossover(fast, slow)
+bearish = ta.crossunder(fast, slow)
+spread = fast - slow
+trend = fast > slow ? color.green : color.red
+
+plot(fast, "Fast", color = fastColor, linewidth = 2)
+plot(slow, "Slow", color = slowColor)
+plot(spread, title = "Spread", color = color.new(trend, 50), style = plot.style_histogram, trackprice = false)
+plot(bullish ? low : na, "Buy", color = color.lime, style = plot.style_circles)
+plot(bearish ? high : na, "Sell", color = color.red, style = plot.style_circles)
+alertcondition(bullish, "Bullish cross", "Fast crossed above slow")
