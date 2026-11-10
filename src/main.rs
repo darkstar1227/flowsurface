@@ -299,6 +299,12 @@ impl Flowsurface {
             }
             Message::GoBack => {
                 let main_window = self.main_window.id;
+                if self.layout_manager.closing().is_some() {
+                    let _ = self
+                        .layout_manager
+                        .update(modal::layout_manager::Message::CancelClose);
+                    return Task::none();
+                }
 
                 if self.sidebar.active_menu().is_some() {
                     self.sidebar.set_menu(None);
@@ -533,6 +539,31 @@ impl Flowsurface {
                             manager.insert_layout(new_layout.clone(), dashboard);
                         }
                     }
+                    Some(modal::layout_manager::Action::Close { select, remove }) => {
+                        let popouts = self
+                            .active_dashboard()
+                            .popout
+                            .keys()
+                            .copied()
+                            .collect::<Vec<_>>();
+                        for popout in &popouts {
+                            self.window_scale_factors.remove(*popout);
+                        }
+                        let close_popouts = Task::batch(
+                            popouts
+                                .into_iter()
+                                .map(window::close::<window::Id>)
+                                .collect::<Vec<_>>(),
+                        )
+                        .discard();
+
+                        let load = self.load_layout(select, self.main_window.id);
+                        self.layout_manager
+                            .layouts
+                            .retain(|layout| layout.id.unique != remove);
+
+                        return close_popouts.chain(load);
+                    }
                     None => {}
                 }
             }
@@ -762,7 +793,9 @@ impl Flowsurface {
                 sidebar::Position::Right => row![dashboard_view, sidebar_view],
             };
 
-            let base = column![header_title, dashboard_row.spacing(4).padding(8),];
+            let tab_bar = screen::tab_bar::view(&self.layout_manager).map(Message::Layouts);
+
+            let base = column![header_title, tab_bar, dashboard_row.spacing(4).padding(8),];
 
             if let Some(menu) = self.sidebar.active_menu() {
                 self.view_with_modal(base.into(), dashboard, menu)
@@ -830,11 +863,30 @@ impl Flowsurface {
         let tick = iced::window::frames().map(Message::Tick);
 
         let hotkeys = keyboard::listen().filter_map(|event| {
-            let keyboard::Event::KeyPressed { key, .. } = event else {
+            use modal::layout_manager::Message as Layouts;
+
+            let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return None;
             };
-            match key {
+            match key.as_ref() {
                 keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::GoBack),
+                keyboard::Key::Named(keyboard::key::Named::Tab) if modifiers.control() => {
+                    Some(Message::Layouts(Layouts::Cycle {
+                        forward: !modifiers.shift(),
+                    }))
+                }
+                keyboard::Key::Character(c) if modifiers.command() => match c {
+                    "t" => Some(Message::Layouts(Layouts::AddLayout)),
+                    "w" => Some(Message::Layouts(Layouts::RequestCloseActive)),
+                    "k" => Some(Message::Sidebar(screen::sidebar::Message::TickersTable(
+                        screen::sidebar::tickers_table::Message::ToggleTable,
+                    ))),
+                    digit => digit
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=9).contains(n))
+                        .map(|n| Message::Layouts(Layouts::SelectIndex(n - 1))),
+                },
                 _ => None,
             }
         });

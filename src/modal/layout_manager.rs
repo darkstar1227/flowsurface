@@ -35,11 +35,26 @@ pub enum Message {
     ToggleEditMode(Editing),
     CloneLayout(Uuid),
     Reorder(DragEvent),
+    /// Selects the layout at this position in the tab bar.
+    SelectIndex(usize),
+    /// Selects the next (or previous) layout, wrapping around.
+    Cycle {
+        forward: bool,
+    },
+    /// First request arms the delete confirmation; a second one deletes the layout.
+    RequestClose(Uuid),
+    RequestCloseActive,
+    CancelClose,
 }
 
 pub enum Action {
     Select(Uuid),
     Clone(Uuid),
+    /// Switch to `select`, then delete the previously active layout `remove`.
+    Close {
+        select: Uuid,
+        remove: Uuid,
+    },
 }
 
 pub struct LayoutManager {
@@ -47,6 +62,8 @@ pub struct LayoutManager {
     chart_resources: SharedChartResources,
     active_layout_id: Option<Uuid>,
     pub edit_mode: Editing,
+    /// Layout whose tab-bar delete button is awaiting confirmation.
+    closing: Option<Uuid>,
 }
 
 impl LayoutManager {
@@ -71,6 +88,7 @@ impl LayoutManager {
             chart_resources: SharedChartResources::default(),
             active_layout_id: Some(default_layout.unique),
             edit_mode: Editing::None,
+            closing: None,
         }
     }
 
@@ -84,6 +102,7 @@ impl LayoutManager {
             chart_resources: SharedChartResources::from_config(chart_presets),
             active_layout_id: active_layout.map(|l| l.unique),
             edit_mode: Editing::None,
+            closing: None,
         };
         manager.ensure_layout();
         manager
@@ -226,8 +245,68 @@ impl LayoutManager {
             .ok_or_else(|| "Layout not found".into())
     }
 
+    pub fn closing(&self) -> Option<Uuid> {
+        self.closing
+    }
+
+    fn close(&mut self, id: Uuid) -> Option<Action> {
+        self.closing = None;
+        if self.layouts.len() <= 1 {
+            return None;
+        }
+        if Some(id) != self.active_layout_id {
+            self.layouts.retain(|layout| layout.id.unique != id);
+            return None;
+        }
+        let index = self.layouts.iter().position(|l| l.id.unique == id)?;
+        let neighbor = if index > 0 { index - 1 } else { index + 1 };
+        let select = self.layouts.get(neighbor)?.id.unique;
+        Some(Action::Close { select, remove: id })
+    }
+
     pub fn update(&mut self, message: Message) -> Option<Action> {
+        if !matches!(
+            message,
+            Message::RequestClose(_) | Message::RequestCloseActive
+        ) {
+            self.closing = None;
+        }
+
         match message {
+            Message::SelectIndex(index) => {
+                let id = self.layouts.get(index)?.id.unique;
+                if Some(id) != self.active_layout_id {
+                    return self.update(Message::SelectActive(id));
+                }
+            }
+            Message::Cycle { forward } => {
+                let len = self.layouts.len();
+                let index = self
+                    .layouts
+                    .iter()
+                    .position(|l| Some(l.id.unique) == self.active_layout_id)?;
+                let next = if forward {
+                    (index + 1) % len
+                } else {
+                    (index + len - 1) % len
+                };
+                if next != index {
+                    return self.update(Message::SelectIndex(next));
+                }
+            }
+            Message::RequestClose(id) => {
+                if self.closing == Some(id) {
+                    return self.close(id);
+                }
+                if self.layouts.len() > 1 {
+                    self.closing = Some(id);
+                }
+            }
+            Message::RequestCloseActive => {
+                let id = self.active_layout_id?;
+                return self.update(Message::RequestClose(id));
+            }
+            Message::CancelClose => {}
             Message::SelectActive(id) => {
                 self.active_layout_id = Some(id);
                 return Some(Action::Select(id));
@@ -481,4 +560,101 @@ fn create_layout_button<'a>(
     .style(style::button::manager_entry)
     .on_press_maybe(on_press)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager_with(count: usize) -> LayoutManager {
+        let mut manager = LayoutManager::new();
+        for _ in 1..count {
+            let _ = manager.update(Message::AddLayout);
+        }
+        manager
+    }
+
+    fn id_at(manager: &LayoutManager, index: usize) -> Uuid {
+        manager.layouts[index].id.unique
+    }
+
+    fn active(manager: &LayoutManager) -> Uuid {
+        manager.active_layout_id().unwrap().unique
+    }
+
+    #[test]
+    fn select_index_switches_to_that_tab() {
+        let mut manager = manager_with(3);
+        let target = id_at(&manager, 2);
+        assert!(matches!(
+            manager.update(Message::SelectIndex(2)),
+            Some(Action::Select(id)) if id == target
+        ));
+        assert!(manager.update(Message::SelectIndex(2)).is_none());
+        assert!(manager.update(Message::SelectIndex(7)).is_none());
+    }
+
+    #[test]
+    fn cycle_wraps_around() {
+        let mut manager = manager_with(3);
+        let first = id_at(&manager, 0);
+        let last = id_at(&manager, 2);
+        assert_eq!(active(&manager), first);
+        assert!(matches!(
+            manager.update(Message::Cycle { forward: false }),
+            Some(Action::Select(id)) if id == last
+        ));
+        assert!(matches!(
+            manager.update(Message::Cycle { forward: true }),
+            Some(Action::Select(id)) if id == first
+        ));
+    }
+
+    #[test]
+    fn closing_needs_a_second_request() {
+        let mut manager = manager_with(2);
+        let other = id_at(&manager, 1);
+
+        assert!(manager.update(Message::RequestClose(other)).is_none());
+        assert_eq!(manager.closing(), Some(other));
+        assert_eq!(manager.layouts.len(), 2);
+
+        assert!(manager.update(Message::RequestClose(other)).is_none());
+        assert_eq!(manager.layouts.len(), 1);
+        assert_eq!(manager.closing(), None);
+    }
+
+    #[test]
+    fn other_messages_cancel_a_pending_close() {
+        let mut manager = manager_with(2);
+        let other = id_at(&manager, 1);
+        let _ = manager.update(Message::RequestClose(other));
+        let _ = manager.update(Message::CancelClose);
+        assert_eq!(manager.closing(), None);
+        let _ = manager.update(Message::RequestClose(other));
+        assert_eq!(manager.layouts.len(), 2);
+    }
+
+    #[test]
+    fn closing_the_active_tab_selects_a_neighbor() {
+        let mut manager = manager_with(2);
+        let first = id_at(&manager, 0);
+        let second = id_at(&manager, 1);
+
+        let _ = manager.update(Message::RequestCloseActive);
+        assert!(matches!(
+            manager.update(Message::RequestCloseActive),
+            Some(Action::Close { select, remove }) if select == second && remove == first
+        ));
+    }
+
+    #[test]
+    fn the_last_layout_cannot_be_closed() {
+        let mut manager = manager_with(1);
+        let only = active(&manager);
+        assert!(manager.update(Message::RequestClose(only)).is_none());
+        assert_eq!(manager.closing(), None);
+        assert!(manager.update(Message::RequestClose(only)).is_none());
+        assert_eq!(manager.layouts.len(), 1);
+    }
 }
