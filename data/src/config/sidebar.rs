@@ -63,4 +63,5 @@ pub enum Menu {
     Audio,
     ThemeEditor,
     Network,
+    IndicatorEditor,
 }

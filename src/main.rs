@@ -22,6 +22,7 @@ use modal::dashboard_modal;
 use modal::{
     LayoutManager, ThemeEditor,
     audio::AudioStream,
+    indicator_editor::{self, IndicatorEditor},
     network_editor::{self, NetworkEditor},
 };
 use notify::Notifications;
@@ -84,6 +85,7 @@ struct Flowsurface {
     sidebar: screen::sidebar::Sidebar,
     layout_manager: LayoutManager,
     theme_editor: ThemeEditor,
+    indicator_editor: IndicatorEditor,
     network_editor: NetworkEditor,
     network_config: data::Network,
     data_sources: Arc<DataSources>,
@@ -97,6 +99,17 @@ struct Flowsurface {
     window_scale_factors: window::WindowScaleFactors,
     antialiasing: bool,
     applied_antialiasing: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Hotkey {
+    Escape,
+    CycleLayout { forward: bool },
+    NewLayout,
+    CloseLayout,
+    SelectLayout(usize),
+    TickerSearch,
+    Save,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +126,7 @@ enum Message {
     ExitRequested(HashMap<window::Id, WindowSpec>),
     SaveStateRequested(HashMap<window::Id, WindowSpec>),
     GoBack,
+    Hotkey(Hotkey),
     DataFolderRequested,
     OpenUrlRequested(Cow<'static, str>),
     ThemeSelected(iced_core::Theme),
@@ -128,6 +142,7 @@ enum Message {
         scale_factor: window::WindowScaleFactor,
     },
     ThemeEditor(modal::theme_editor::Message),
+    IndicatorEditor(indicator_editor::Message),
     NetworkEditor(modal::network_editor::Message),
     Layouts(modal::layout_manager::Message),
     SharedChartResources(manifest::Message),
@@ -163,6 +178,7 @@ impl Flowsurface {
             main_window: window::Window::new(main_window_id),
             layout_manager: saved_state.layout_manager,
             theme_editor: ThemeEditor::new(saved_state.custom_theme),
+            indicator_editor: IndicatorEditor::new(),
             window_scale_factors: window::WindowScaleFactors::new(main_window_id),
             audio_stream,
             sidebar,
@@ -594,6 +610,15 @@ impl Flowsurface {
                 }
             }
             Message::OpenUrlRequested(url) => self.open_url(url.as_ref()),
+            Message::Hotkey(hotkey) => return self.handle_hotkey(hotkey),
+            Message::IndicatorEditor(msg) => {
+                let (task, action) = self.indicator_editor.update(msg);
+                let task = task.map(Message::IndicatorEditor);
+                if let Some(indicator_editor::Action::Reloaded(id)) = action {
+                    return Task::batch([task, self.reload_indicator(&id)]);
+                }
+                return task;
+            }
             Message::ThemeEditor(msg) => {
                 let action = self.theme_editor.update(msg, self.theme.current());
 
@@ -680,6 +705,11 @@ impl Flowsurface {
                             &self.network_config,
                             self.network_editor.pending_apply().cloned(),
                         );
+                    }
+                    Some(screen::sidebar::Action::MenuChanged(Some(
+                        sidebar::Menu::IndicatorEditor,
+                    ))) => {
+                        self.indicator_editor.refresh();
                     }
                     Some(screen::sidebar::Action::MenuChanged(_)) => {}
                     Some(screen::sidebar::Action::TickerSelected(ticker_info, content)) => {
@@ -868,32 +898,30 @@ impl Flowsurface {
         let tick = iced::window::frames().map(Message::Tick);
 
         let hotkeys = keyboard::listen().filter_map(|event| {
-            use modal::layout_manager::Message as Layouts;
-
             let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return None;
             };
-            match key.as_ref() {
-                keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::GoBack),
+            let hotkey = match key.as_ref() {
+                keyboard::Key::Named(keyboard::key::Named::Escape) => Hotkey::Escape,
                 keyboard::Key::Named(keyboard::key::Named::Tab) if modifiers.control() => {
-                    Some(Message::Layouts(Layouts::Cycle {
+                    Hotkey::CycleLayout {
                         forward: !modifiers.shift(),
-                    }))
+                    }
                 }
                 keyboard::Key::Character(c) if modifiers.command() => match c {
-                    "t" => Some(Message::Layouts(Layouts::AddLayout)),
-                    "w" => Some(Message::Layouts(Layouts::RequestCloseActive)),
-                    "k" => Some(Message::Sidebar(screen::sidebar::Message::TickersTable(
-                        screen::sidebar::tickers_table::Message::ToggleTable,
-                    ))),
+                    "t" => Hotkey::NewLayout,
+                    "w" => Hotkey::CloseLayout,
+                    "k" => Hotkey::TickerSearch,
+                    "s" => Hotkey::Save,
                     digit => digit
                         .parse::<usize>()
                         .ok()
                         .filter(|n| (1..=9).contains(n))
-                        .map(|n| Message::Layouts(Layouts::SelectIndex(n - 1))),
+                        .map(|n| Hotkey::SelectLayout(n - 1))?,
                 },
-                _ => None,
-            }
+                _ => return None,
+            };
+            Some(Message::Hotkey(hotkey))
         });
 
         Subscription::batch(vec![
@@ -903,6 +931,50 @@ impl Flowsurface {
             tick,
             hotkeys,
         ])
+    }
+
+    fn handle_hotkey(&mut self, hotkey: Hotkey) -> Task<Message> {
+        use modal::layout_manager::Message as Layouts;
+
+        // While the indicator editor is open, layout and search shortcuts would act on the
+        // dashboard hidden behind it; only Escape and save apply there.
+        if self.sidebar.active_menu() == Some(sidebar::Menu::IndicatorEditor) {
+            return match hotkey {
+                Hotkey::Escape => Task::done(Message::GoBack),
+                Hotkey::Save => {
+                    Task::done(Message::IndicatorEditor(indicator_editor::Message::Save))
+                }
+                _ => Task::none(),
+            };
+        }
+        let message = match hotkey {
+            Hotkey::Escape => Message::GoBack,
+            Hotkey::CycleLayout { forward } => Message::Layouts(Layouts::Cycle { forward }),
+            Hotkey::NewLayout => Message::Layouts(Layouts::AddLayout),
+            Hotkey::CloseLayout => Message::Layouts(Layouts::RequestCloseActive),
+            Hotkey::SelectLayout(index) => Message::Layouts(Layouts::SelectIndex(index)),
+            Hotkey::TickerSearch => Message::Sidebar(screen::sidebar::Message::TickersTable(
+                screen::sidebar::tickers_table::Message::ToggleTable,
+            )),
+            Hotkey::Save => return Task::none(),
+        };
+        Task::done(message)
+    }
+
+    /// Rebuild the active layout's charts that use `indicator` after the catalog was reloaded.
+    /// Inactive layouts are rebuilt from the new catalog when they are loaded.
+    fn reload_indicator(&mut self, indicator: &data::chart::kline::IndicatorId) -> Task<Message> {
+        if self.layout_manager.active_layout_id().is_none() {
+            return Task::none();
+        }
+        let main_window = self.main_window.id;
+        let data_sources = Arc::clone(&self.data_sources);
+        self.active_dashboard_mut()
+            .reload_indicator(main_window, indicator, &data_sources)
+            .map(move |event| Message::Dashboard {
+                layout_id: None,
+                event,
+            })
     }
 
     fn active_dashboard(&self) -> &Dashboard {
@@ -1514,6 +1586,21 @@ impl Flowsurface {
                     Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(None)),
                     padding,
                     Alignment::End,
+                    align_x,
+                )
+            }
+            sidebar::Menu::IndicatorEditor => {
+                let (align_x, padding) = match sidebar_pos {
+                    sidebar::Position::Left => (Alignment::Start, padding::left(44).top(40)),
+                    sidebar::Position::Right => (Alignment::End, padding::right(44).top(40)),
+                };
+
+                dashboard_modal(
+                    base,
+                    self.indicator_editor.view().map(Message::IndicatorEditor),
+                    Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(None)),
+                    padding,
+                    Alignment::Start,
                     align_x,
                 )
             }

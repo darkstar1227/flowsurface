@@ -1045,6 +1045,22 @@ impl Dashboard {
         }
     }
 
+    /// Rebuild every chart that uses `indicator` after the indicator catalog was reloaded.
+    pub fn reload_indicator(
+        &mut self,
+        main_window: window::Id,
+        indicator: &data::chart::kline::IndicatorId,
+        data_sources: &DataSources,
+    ) -> Task<Message> {
+        let now = Instant::now();
+        let tasks = self
+            .iter_all_panes_mut(main_window)
+            .filter_map(|(_, _, state)| state.reload_indicator(indicator, data_sources, now))
+            .map(|task| task.map(Message::from))
+            .collect::<Vec<_>>();
+        Task::batch(tasks)
+    }
+
     pub fn invalidate_all_panes(&mut self, main_window: window::Id) {
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, state)| {

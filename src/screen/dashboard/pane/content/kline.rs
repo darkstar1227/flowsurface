@@ -1994,6 +1994,14 @@ impl KlineChart {
         }
     }
 
+    pub fn uses_indicator(&self, indicator: &IndicatorId) -> bool {
+        self.indicators
+            .instances
+            .instances()
+            .iter()
+            .any(|instance| instance.kind == *indicator)
+    }
+
     pub fn serializable_config(&self) -> persisted::Config {
         persisted::Config {
             selected_preset: self.selected_preset,

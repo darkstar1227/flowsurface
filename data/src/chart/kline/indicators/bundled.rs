@@ -36,3 +36,15 @@ pub(super) fn load_bundled_sources() -> language::IndicatorLoadReport {
         language::PackageOrigin::Bundled,
     )
 }
+
+/// The embedded source text of a bundled indicator, for read-only viewing.
+pub(super) fn source_text(id: &IndicatorId) -> Option<&'static str> {
+    let file_name = id
+        .id()
+        .rsplit_once('.')
+        .map(|(_, name)| format!("{name}.ind"))?;
+    BUNDLED_SOURCES
+        .iter()
+        .find(|source| source.file_name == file_name)
+        .map(|source| source.source)
+}
