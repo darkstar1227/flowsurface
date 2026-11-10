@@ -12,6 +12,27 @@ struct VertexOutput {
 @group(1) @binding(0)
 var heatmap_rg: texture_2d<u32>;
 
+fn viridis(t_in: f32) -> vec3<f32> {
+    let t = clamp(t_in, 0.0, 1.0);
+    let c0 = vec3<f32>(0.2777273272234177, 0.005407344544966578, 0.3340998053353061);
+    let c1 = vec3<f32>(0.1050930431085774, 1.404613529898575, 1.384590162594685);
+    let c2 = vec3<f32>(-0.3308618287255563, 0.214847559468213, 0.09509516302823659);
+    let c3 = vec3<f32>(-4.634230498983486, -5.799100973351585, -19.33244095627987);
+    let c4 = vec3<f32>(6.228269936347081, 14.17993336680509, 56.69055260068105);
+    let c5 = vec3<f32>(4.776384997670288, -13.74514537774601, -65.35303263337234);
+    let c6 = vec3<f32>(-5.435455855934631, 4.645852612178535, 26.3124352495832);
+    return clamp(c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6))))), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Mirrors data::chart::heatmap::shape_intensity
+fn shape_intensity(t_in: f32) -> f32 {
+    var t = clamp(t_in, 0.0, 1.0);
+    if (params.shade.z > 0.5) {
+        t = log(1.0 + 99.0 * t) / log(100.0);
+    }
+    return pow(t, params.shade.y);
+}
+
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
@@ -75,8 +96,19 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let alpha_min = params.depth.y;
     let alpha_max = params.depth.z;
 
-    let bid_t = clamp(bid_qty / max_depth, 0.0, 1.0);
-    let ask_t = clamp(ask_qty / max_depth, 0.0, 1.0);
+    if (params.shade.x > 0.5) {
+        let total = bid_qty + ask_qty;
+        if (total <= 0.0) {
+            return vec4<f32>(0.0);
+        }
+        let t = shape_intensity(total / max_depth);
+        let a = alpha_min + t * (alpha_max - alpha_min);
+        let fade_v = fade_factor(world.x);
+        return vec4<f32>(viridis(t) * a * fade_v, a * fade_v);
+    }
+
+    let bid_t = shape_intensity(bid_qty / max_depth);
+    let ask_t = shape_intensity(ask_qty / max_depth);
 
     let bid_a = select(0.0, alpha_min + bid_t * (alpha_max - alpha_min), bid_qty > 0.0);
     let ask_a = select(0.0, alpha_min + ask_t * (alpha_max - alpha_min), ask_qty > 0.0);

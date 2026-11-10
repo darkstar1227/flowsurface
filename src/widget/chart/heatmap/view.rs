@@ -2,7 +2,7 @@ use crate::widget::chart::heatmap::scene::{
     camera::Camera,
     cell::{Cell, MIN_ROW_PX},
 };
-use data::chart::heatmap::HistoricalDepth;
+use data::chart::heatmap::{DepthCap, HistoricalDepth, percentile};
 use exchange::UnixMs;
 use exchange::adapter::MarketKind;
 use exchange::unit::{Price, PriceStep};
@@ -790,6 +790,26 @@ struct NormKey {
     y0_bin: i64,
     y1_bin: i64,
     order_filter_bits: u32,
+    cap: CapKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapKey {
+    VisibleMax,
+    P95,
+    P99,
+    Fixed(u32),
+}
+
+impl From<DepthCap> for CapKey {
+    fn from(cap: DepthCap) -> Self {
+        match cap {
+            DepthCap::VisibleMax => Self::VisibleMax,
+            DepthCap::P95 => Self::P95,
+            DepthCap::P99 => Self::P99,
+            DepthCap::Fixed(v) => Self::Fixed(v.to_bits()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -817,6 +837,7 @@ impl DepthNormCache {
         latest_incl: u64,
         step: PriceStep,
         order_size_filter: f32,
+        cap: DepthCap,
     ) -> NormKey {
         let aggr = w.aggr_time.max(1);
         let start_bucket = (w.earliest / aggr) as i64;
@@ -837,6 +858,7 @@ impl DepthNormCache {
             y0_bin,
             y1_bin,
             order_filter_bits: order_size_filter.max(0.0).to_bits(),
+            cap: cap.into(),
         }
     }
 
@@ -848,11 +870,12 @@ impl DepthNormCache {
         step: PriceStep,
         market_type: &MarketKind,
         order_size_filter: f32,
+        cap: DepthCap,
         data_gen: u64,
         now: Instant,
         is_interacting: bool,
     ) -> f32 {
-        let key = self.make_key(w, latest_incl, step, order_size_filter);
+        let key = self.make_key(w, latest_incl, step, order_size_filter, cap);
         let key_changed = self.key != Some(key);
 
         let throttle_ms = if is_interacting {
@@ -878,6 +901,7 @@ impl DepthNormCache {
             key,
             market_type,
             order_size_filter,
+            cap,
             data_gen,
         )
     }
@@ -890,10 +914,35 @@ impl DepthNormCache {
         key: NormKey,
         market_type: &MarketKind,
         order_size_filter: f32,
+        cap: DepthCap,
         data_gen: u64,
     ) -> f32 {
         if self.key == Some(key) && self.generation == data_gen {
             return self.value.max(1e-6);
+        }
+
+        if let DepthCap::Fixed(v) = cap {
+            let denom = if v.is_finite() { v.max(1e-6) } else { 1.0 };
+            self.key = Some(key);
+            self.value = denom;
+            self.generation = data_gen;
+            return denom;
+        }
+
+        if let Some(p) = cap.percentile() {
+            let mut qtys = hist.depth_qtys_in_range(
+                UnixMs::new(w.earliest),
+                UnixMs::new(latest_incl),
+                w.highest,
+                w.lowest,
+                *market_type,
+                order_size_filter.max(0.0),
+            );
+            let denom = percentile(&mut qtys, p).max(1e-6);
+            self.key = Some(key);
+            self.value = denom;
+            self.generation = data_gen;
+            return denom;
         }
 
         let max_qty = if order_size_filter > 0.0 {

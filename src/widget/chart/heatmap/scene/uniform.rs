@@ -29,6 +29,8 @@ pub struct ParamsUniform {
     heatmap_tex: [f32; 4],
     /// (x_left_world, width_world, alpha_min, alpha_max)
     fade: [f32; 4],
+    /// (palette_id, contrast, log_flag, *pad*)
+    shade: [f32; 4],
 }
 
 impl Default for ParamsUniform {
@@ -42,6 +44,7 @@ impl Default for ParamsUniform {
             heatmap_map: [0.0, 0.0, 1.0, 0.0],
             heatmap_tex: [0.0, 0.0, 0.0, 0.0],
             fade: [0.0, 0.0, 1.0, 1.0],
+            shade: [0.0, 1.0, 0.0, 0.0],
         }
     }
 }
@@ -103,6 +106,15 @@ impl ParamsUniform {
 
     pub fn set_depth_denom(&mut self, denom: f32) {
         self.depth[0] = denom;
+    }
+
+    pub fn set_depth_shading(&mut self, palette_id: f32, contrast: f32, log: bool) {
+        self.shade = [
+            palette_id,
+            contrast.max(0.01),
+            if log { 1.0 } else { 0.0 },
+            0.0,
+        ];
     }
 
     pub fn set_trade_fade(&mut self, view_window: &ViewWindow) {

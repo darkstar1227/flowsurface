@@ -39,9 +39,6 @@ const REBUILD_DEBOUNCE_MS: u64 = 250;
 // If rendering stalls longer than this, assume GPU heatmap texture may have been lost/desynced
 const HEATMAP_RESYNC_AFTER_STALL_MS: u64 = 750;
 
-// Volume profile width as % of viewport width
-const VOLUME_PROFILE_WIDTH_PCT: f32 = 0.10;
-
 // Depth profile width in pixels fixed
 const DEPTH_PROFILE_WIDTH_PX: f32 = 160.0;
 
@@ -345,7 +342,7 @@ impl HeatmapShader {
                 view::OverlayGeometryConfig {
                     depth_profile_col_width_px: DEPTH_PROFILE_WIDTH_PX,
                     volume_strip_height_pct: STRIP_HEIGHT_FRAC,
-                    volume_profile_width_pct: VOLUME_PROFILE_WIDTH_PCT,
+                    volume_profile_width_pct: self.config.volume_profile_width_pct,
                 },
             )
         });
@@ -695,12 +692,27 @@ impl HeatmapShader {
             prev.order_size_filter.to_bits() != self.config.order_size_filter.to_bits();
         let trade_visual_changed = prev.trade_size_filter.to_bits()
             != self.config.trade_size_filter.to_bits()
-            || prev.trade_size_scale != self.config.trade_size_scale;
+            || prev.trade_size_scale != self.config.trade_size_scale
+            || prev.trade_radius_scale != self.config.trade_radius_scale
+            || prev.trade_max_radius_px.to_bits() != self.config.trade_max_radius_px.to_bits()
+            || prev.volume_profile_width_pct.to_bits()
+                != self.config.volume_profile_width_pct.to_bits();
+
+        let depth_shading_changed = prev.depth_palette != self.config.depth_palette
+            || prev.depth_cap != self.config.depth_cap
+            || prev.depth_log != self.config.depth_log
+            || prev.depth_contrast.to_bits() != self.config.depth_contrast.to_bits();
+
+        self.scene.params.set_depth_shading(
+            self.config.depth_palette.shader_id(),
+            self.config.depth_contrast,
+            self.config.depth_log,
+        );
 
         self.canvas_invalidation.mark_overlay_tooltip();
         self.canvas_invalidation.mark_overlay_scale_labels();
 
-        if trade_visual_changed || order_filter_changed {
+        if trade_visual_changed || order_filter_changed || depth_shading_changed {
             self.try_rebuild_instances();
         }
 
@@ -753,7 +765,7 @@ impl HeatmapShader {
         let cfg = ViewConfig {
             depth_profile_col_width_px: DEPTH_PROFILE_WIDTH_PX,
             volume_strip_height_pct: STRIP_HEIGHT_FRAC,
-            volume_profile_width_pct: VOLUME_PROFILE_WIDTH_PCT,
+            volume_profile_width_pct: self.config.volume_profile_width_pct,
             max_steps_per_y_bin: i64::from(self.depth_grid.tex_h()),
         };
 
@@ -1062,12 +1074,18 @@ impl HeatmapShader {
             self.step,
             &self.ticker_info.market_type(),
             self.config.order_size_filter.max(0.0),
+            self.config.depth_cap,
             norm_gen,
             now_i,
             is_interacting,
         );
 
         self.scene.params.set_depth_denom(denom);
+        self.scene.params.set_depth_shading(
+            self.config.depth_palette.shader_id(),
+            self.config.depth_contrast,
+            self.config.depth_log,
+        );
     }
 
     fn mark_needs_full_upload_if_stalled(&mut self) {

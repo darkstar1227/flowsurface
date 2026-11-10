@@ -8,7 +8,10 @@ use data::chart::heatmap;
 use data::chart::heatmap::indicators::{
     DepthDistance, HeatmapIndicator, HeatmapIndicatorConfig, SpreadUnit,
 };
-use data::chart::heatmap::{CLEANUP_THRESHOLD, ProfileKind};
+use data::chart::heatmap::{
+    CLEANUP_THRESHOLD, DEPTH_CONTRAST_RANGE, DepthCap, DepthPalette, ProfileKind, RadiusScale,
+    TRADE_MAX_RADIUS_RANGE, VOLUME_PROFILE_WIDTH_RANGE,
+};
 use data::layout::pane::VisualConfig;
 use data::util::{format_duration_ms, format_with_commas};
 use exchange::adapter::Venue;
@@ -99,10 +102,131 @@ pub fn heatmap_shader_cfg_view<'a>(
             .padding([0, 8]);
         let mut col = column![checkbox_row];
         if let Some(slider) = circle_scaling_slider {
-            col = col.push(container(slider).padding(8));
+            let mut scaling = column![slider].spacing(8);
+            for scale in RadiusScale::ALL {
+                scaling = scaling.push(radio(
+                    scale.to_string(),
+                    scale,
+                    Some(cfg.trade_radius_scale),
+                    move |scale| Message::VisualConfigChanged {
+                        config: VisualConfig::Heatmap(heatmap::Config {
+                            trade_radius_scale: scale,
+                            ..cfg
+                        }),
+                        sync_all: false,
+                    },
+                ));
+            }
+            scaling = scaling.push(classic_slider_row(
+                Some(text("Max radius")),
+                TRADE_MAX_RADIUS_RANGE.0..=TRADE_MAX_RADIUS_RANGE.1,
+                cfg.trade_max_radius_px,
+                move |value| Message::VisualConfigChanged {
+                    config: VisualConfig::Heatmap(heatmap::Config {
+                        trade_max_radius_px: value,
+                        ..cfg
+                    }),
+                    sync_all: false,
+                },
+                |value| format!("{value:.0}px"),
+                Some(1.0),
+            ));
+            col = col.push(container(scaling).padding(8));
         }
         container(col)
             .width(Length::Fill)
+            .style(style::inspector_control)
+    };
+
+    let depth_color_column = {
+        let mut col = column![].spacing(8);
+        for palette in DepthPalette::ALL {
+            col = col.push(radio(
+                palette.to_string(),
+                palette,
+                Some(cfg.depth_palette),
+                move |palette| Message::VisualConfigChanged {
+                    config: VisualConfig::Heatmap(heatmap::Config {
+                        depth_palette: palette,
+                        ..cfg
+                    }),
+                    sync_all: false,
+                },
+            ));
+        }
+
+        let caps = [
+            DepthCap::VisibleMax,
+            DepthCap::P95,
+            DepthCap::P99,
+            DepthCap::Fixed(match cfg.depth_cap {
+                DepthCap::Fixed(v) => v,
+                _ => DepthCap::DEFAULT_FIXED,
+            }),
+        ];
+        let selected_idx = caps
+            .iter()
+            .position(|cap| std::mem::discriminant(cap) == std::mem::discriminant(&cfg.depth_cap));
+        let mut cap_col = column![text("Colour scale maximum")].spacing(4);
+        for (idx, cap) in caps.into_iter().enumerate() {
+            cap_col = cap_col.push(radio(cap.label(), idx, selected_idx, move |_| {
+                Message::VisualConfigChanged {
+                    config: VisualConfig::Heatmap(heatmap::Config {
+                        depth_cap: cap,
+                        ..cfg
+                    }),
+                    sync_all: false,
+                }
+            }));
+        }
+        col = col.push(cap_col);
+
+        if let DepthCap::Fixed(value) = cfg.depth_cap {
+            col = col.push(classic_slider_row(
+                Some(text("Quantity")),
+                1.0..=10_000.0,
+                value.clamp(1.0, 10_000.0),
+                move |value| Message::VisualConfigChanged {
+                    config: VisualConfig::Heatmap(heatmap::Config {
+                        depth_cap: DepthCap::Fixed(value),
+                        ..cfg
+                    }),
+                    sync_all: false,
+                },
+                |value| format_with_commas(*value as f64),
+                Some(1.0),
+            ));
+        }
+
+        col = col.push(
+            checkbox(cfg.depth_log)
+                .label("Logarithmic")
+                .on_toggle(move |log| Message::VisualConfigChanged {
+                    config: VisualConfig::Heatmap(heatmap::Config {
+                        depth_log: log,
+                        ..cfg
+                    }),
+                    sync_all: false,
+                }),
+        );
+        col = col.push(classic_slider_row(
+            Some(text("Contrast")),
+            DEPTH_CONTRAST_RANGE.0..=DEPTH_CONTRAST_RANGE.1,
+            cfg.depth_contrast,
+            move |value| Message::VisualConfigChanged {
+                config: VisualConfig::Heatmap(heatmap::Config {
+                    depth_contrast: value,
+                    ..cfg
+                }),
+                sync_all: false,
+            },
+            |value| format!("{value:.2}"),
+            Some(0.05),
+        ));
+
+        container(col)
+            .width(Length::Fill)
+            .padding(8)
             .style(style::inspector_control)
     };
 
@@ -145,7 +269,7 @@ pub fn heatmap_shader_cfg_view<'a>(
                 HeatmapIndicator::Volume => None,
                 HeatmapIndicator::VolumeProfile => indicators
                     .volume_profile
-                    .map(|kind| volume_profile_controls(kind, basis)),
+                    .map(|kind| volume_profile_controls(kind, basis, cfg)),
 
                 HeatmapIndicator::Spread => Some(
                     column![
@@ -222,6 +346,8 @@ pub fn heatmap_shader_cfg_view<'a>(
     let mut content = InspectorContent::new(vec![
         InspectorSection::titled("Size filter", size_filters).with_modal_container(),
         InspectorSection::titled("Trade visualization", trade_viz_column).with_modal_container(),
+        InspectorSection::titled("Order quantity colour", depth_color_column)
+            .with_modal_container(),
         InspectorSection::titled("Indicators", indicator_controls).with_modal_container(),
     ]);
     content.set_footer(row![
@@ -234,6 +360,7 @@ pub fn heatmap_shader_cfg_view<'a>(
 fn volume_profile_controls<'a>(
     kind: ProfileKind,
     basis: data::chart::Basis,
+    cfg: heatmap::Config,
 ) -> iced::Element<'a, Message> {
     let interval_ms = match basis {
         data::chart::Basis::Time(interval) => interval.to_milliseconds(),
@@ -276,6 +403,21 @@ fn volume_profile_controls<'a>(
             Some(40.0),
         ));
     }
+
+    controls = controls.push(classic_slider_row(
+        Some(text("Width")),
+        VOLUME_PROFILE_WIDTH_RANGE.0..=VOLUME_PROFILE_WIDTH_RANGE.1,
+        cfg.volume_profile_width_pct,
+        move |value| Message::VisualConfigChanged {
+            config: VisualConfig::Heatmap(heatmap::Config {
+                volume_profile_width_pct: value,
+                ..cfg
+            }),
+            sync_all: false,
+        },
+        |value| format!("{:.0}%", value * 100.0),
+        Some(0.01),
+    ));
 
     controls.into()
 }
