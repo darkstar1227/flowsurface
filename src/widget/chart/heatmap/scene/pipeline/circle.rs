@@ -1,4 +1,4 @@
-use data::chart::heatmap::GroupedTrade;
+use data::chart::heatmap::{Config, GroupedTrade, bubble_radius_px};
 use exchange::unit::{Price, PriceStep, Qty, qty};
 
 use crate::widget::chart::heatmap::scene::depth_grid::HeatmapPalette;
@@ -20,7 +20,6 @@ pub struct CircleInstance {
 
 impl CircleInstance {
     pub const R_MIN_PX: f32 = 1.5;
-    const R_MAX_PX: f32 = 25.0;
     const ALPHA: f32 = 0.8;
 
     pub fn from_trade(
@@ -33,7 +32,7 @@ impl CircleInstance {
         w: &ViewWindow,
         palette: &HeatmapPalette,
         max_trade_qty: Qty,
-        trade_size_scale: Option<i32>,
+        config: &Config,
         fallback_radius_px: f32,
     ) -> Self {
         let x_bin_rel = (bucket - ref_bucket).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
@@ -43,9 +42,14 @@ impl CircleInstance {
 
         let q = trade.qty.max(qty::Qty::ZERO).to_f64();
         let t = (q / max_trade_qty.to_scale_or_one()).clamp(0.0, 1.0) as f32;
-        let radius_px = if let Some(scale_pct) = trade_size_scale {
-            let scale_factor = (scale_pct as f32 / 100.0).max(0.0);
-            Self::R_MIN_PX + t * (Self::R_MAX_PX - Self::R_MIN_PX) * scale_factor
+        let radius_px = if let Some(scale_pct) = config.trade_size_scale {
+            bubble_radius_px(
+                t,
+                config.trade_radius_scale,
+                Self::R_MIN_PX,
+                config.trade_max_radius_px,
+                scale_pct,
+            )
         } else {
             fallback_radius_px.max(Self::R_MIN_PX)
         };

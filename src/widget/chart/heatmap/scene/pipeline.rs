@@ -38,7 +38,7 @@ mod bind {
 }
 
 const CAMERA_UNIFORM_BYTES: usize = 2 * 16; // 2 vec4<f32>
-const PARAMS_UNIFORM_BYTES: usize = 8 * 16; // 8 vec4<f32>
+const PARAMS_UNIFORM_BYTES: usize = 9 * 16; // 9 vec4<f32>
 
 // Compile-time guarantees (fail build immediately on mismatch)
 const _: [(); CAMERA_UNIFORM_BYTES] = [(); std::mem::size_of::<CameraUniform>()];

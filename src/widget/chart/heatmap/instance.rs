@@ -361,7 +361,7 @@ impl InstanceBuilder {
                 w,
                 palette,
                 max_qty,
-                config.trade_size_scale,
+                config,
                 fallback_radius_px,
             ));
         }

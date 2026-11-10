@@ -14,6 +14,7 @@ struct Params {
     heatmap_map: vec4<f32>,
     heatmap_tex: vec4<f32>,
     fade: vec4<f32>, // (x_left, width, alpha_min, alpha_max)
+    shade: vec4<f32>, // (palette_id, contrast, log_flag, *pad*)
 };
 @group(0) @binding(1)
 var<uniform> params: Params;

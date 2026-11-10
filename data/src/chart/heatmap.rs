@@ -13,12 +13,130 @@ use std::{collections::BTreeMap, ops::ControlFlow};
 
 pub const CLEANUP_THRESHOLD: usize = 4800;
 
+/// How a trade's size maps to its bubble radius.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum RadiusScale {
+    #[default]
+    Linear,
+    /// Radius grows with the square root of size, so bubble *area* is proportional to size.
+    Sqrt,
+}
+
+impl RadiusScale {
+    pub const ALL: [Self; 2] = [Self::Linear, Self::Sqrt];
+}
+
+impl std::fmt::Display for RadiusScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Linear => f.write_str("Linear"),
+            Self::Sqrt => f.write_str("Square root"),
+        }
+    }
+}
+
+/// Colour scheme used for resting order quantity.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub enum DepthPalette {
+    /// Theme bid/ask colours with varying opacity.
+    #[default]
+    Classic,
+    /// Viridis colour ramp on total quantity (bid and ask share one ramp).
+    Viridis,
+}
+
+impl DepthPalette {
+    pub const ALL: [Self; 2] = [Self::Classic, Self::Viridis];
+
+    /// Shader palette id (`params.shade.x`).
+    pub fn shader_id(self) -> f32 {
+        match self {
+            Self::Classic => 0.0,
+            Self::Viridis => 1.0,
+        }
+    }
+}
+
+impl std::fmt::Display for DepthPalette {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Classic => f.write_str("Classic (bid/ask)"),
+            Self::Viridis => f.write_str("Viridis"),
+        }
+    }
+}
+
+/// Which quantity maps to the top of the colour scale.
+#[derive(Debug, Copy, Clone, PartialEq, Default, Deserialize, Serialize)]
+pub enum DepthCap {
+    /// Largest resting quantity in the visible range.
+    #[default]
+    VisibleMax,
+    P95,
+    P99,
+    /// Fixed quantity in base units.
+    Fixed(f32),
+}
+
+impl DepthCap {
+    pub const DEFAULT_FIXED: f32 = 100.0;
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::VisibleMax => "Visible max",
+            Self::P95 => "95th percentile",
+            Self::P99 => "99th percentile",
+            Self::Fixed(_) => "Fixed",
+        }
+    }
+
+    pub fn percentile(&self) -> Option<f32> {
+        match self {
+            Self::P95 => Some(0.95),
+            Self::P99 => Some(0.99),
+            _ => None,
+        }
+    }
+}
+
+const fn default_trade_max_radius_px() -> f32 {
+    25.0
+}
+
+const fn default_volume_profile_width_pct() -> f32 {
+    0.10
+}
+
+const fn default_depth_contrast() -> f32 {
+    1.0
+}
+
+pub const TRADE_MAX_RADIUS_RANGE: (f32, f32) = (4.0, 80.0);
+pub const VOLUME_PROFILE_WIDTH_RANGE: (f32, f32) = (0.02, 0.40);
+pub const DEPTH_CONTRAST_RANGE: (f32, f32) = (0.25, 4.0);
+
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Config {
     pub trade_size_filter: f32,
     pub order_size_filter: f32,
     pub trade_size_scale: Option<i32>,
     pub coalescing: Option<CoalesceKind>,
+    #[serde(default)]
+    pub trade_radius_scale: RadiusScale,
+    #[serde(default = "default_trade_max_radius_px")]
+    pub trade_max_radius_px: f32,
+    /// Width of the volume profile sidebar as a fraction of the chart width.
+    #[serde(default = "default_volume_profile_width_pct")]
+    pub volume_profile_width_pct: f32,
+    #[serde(default)]
+    pub depth_palette: DepthPalette,
+    #[serde(default)]
+    pub depth_cap: DepthCap,
+    #[serde(default)]
+    pub depth_log: bool,
+    /// Exponent applied to the normalised quantity; above 1 darkens small orders.
+    #[serde(default = "default_depth_contrast")]
+    pub depth_contrast: f32,
 }
 
 impl Default for Config {
@@ -28,8 +146,78 @@ impl Default for Config {
             order_size_filter: 0.0,
             trade_size_scale: Some(100),
             coalescing: Some(CoalesceKind::Average(0.15)),
+            trade_radius_scale: RadiusScale::default(),
+            trade_max_radius_px: default_trade_max_radius_px(),
+            volume_profile_width_pct: default_volume_profile_width_pct(),
+            depth_palette: DepthPalette::default(),
+            depth_cap: DepthCap::default(),
+            depth_log: false,
+            depth_contrast: default_depth_contrast(),
         }
     }
+}
+
+/// Bubble radius in px for a trade of `t = qty / max_qty` (0..=1).
+pub fn bubble_radius_px(
+    t: f32,
+    scale: RadiusScale,
+    min_px: f32,
+    max_px: f32,
+    scale_pct: i32,
+) -> f32 {
+    let t = if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let t = match scale {
+        RadiusScale::Linear => t,
+        RadiusScale::Sqrt => t.sqrt(),
+    };
+    let factor = (scale_pct as f32 / 100.0).max(0.0);
+    let r = min_px + t * (max_px - min_px).max(0.0) * factor;
+    r.min(max_px.max(min_px))
+}
+
+/// Shapes a normalised quantity (0..=1) before it is mapped to colour.
+/// Mirrored in `heatmap_tex.wgsl`; keep the two in sync.
+pub fn shape_intensity(t: f32, log: bool, contrast: f32) -> f32 {
+    const LOG_K: f32 = 99.0;
+    let mut t = if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if log {
+        t = (1.0 + LOG_K * t).ln() / (1.0 + LOG_K).ln();
+    }
+    t.powf(contrast.max(0.01))
+}
+
+/// Viridis approximation (polynomial fit). Mirrored in `heatmap_tex.wgsl`.
+pub fn viridis(t: f32) -> [f32; 3] {
+    const C0: [f32; 3] = [0.277_727_33, 0.005_407_345, 0.334_099_8];
+    const C1: [f32; 3] = [0.105_093_04, 1.404_613_5, 1.384_590_2];
+    const C2: [f32; 3] = [-0.330_861_83, 0.214_847_56, 0.095_095_165];
+    const C3: [f32; 3] = [-4.634_23, -5.799_101, -19.332_441];
+    const C4: [f32; 3] = [6.228_27, 14.179_934, 56.690_55];
+    const C5: [f32; 3] = [4.776_385, -13.745_146, -65.353_03];
+    const C6: [f32; 3] = [-5.435_456, 4.645_853, 26.312_435];
+    let t = t.clamp(0.0, 1.0);
+    std::array::from_fn(|i| {
+        (C0[i] + t * (C1[i] + t * (C2[i] + t * (C3[i] + t * (C4[i] + t * (C5[i] + t * C6[i]))))))
+            .clamp(0.0, 1.0)
+    })
+}
+
+/// Nearest-rank percentile (`p` in 0..=1). Reorders `values`. Returns 0 when empty.
+pub fn percentile(values: &mut [f32], p: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_unstable_by(f32::total_cmp);
+    let rank = (p.clamp(0.0, 1.0) * values.len() as f32).ceil() as usize;
+    values[rank.clamp(1, values.len()) - 1]
 }
 
 #[derive(Debug, Clone)]
@@ -589,6 +777,36 @@ impl HistoricalDepth {
         max_qty
     }
 
+    /// Resting-order quantities (base units) in the range, for percentile caps.
+    /// Applies the same order-size filter as [`Self::max_depth_qty_in_range`].
+    pub fn depth_qtys_in_range(
+        &self,
+        earliest: UnixMs,
+        latest: UnixMs,
+        highest: Price,
+        lowest: Price,
+        market_type: MarketKind,
+        order_size_filter: f32,
+    ) -> Vec<f32> {
+        let size_in_quote_ccy = volume_size_unit() == SizeUnit::Quote;
+        let mut out = Vec::new();
+        for (price, runs) in self.price_levels.range(lowest..=highest) {
+            for run in runs.iter() {
+                if run.until_time < earliest || run.start_time > latest {
+                    continue;
+                }
+                if order_size_filter > 0.0 {
+                    let size = market_type.qty_in_quote_value(run.qty, *price, size_in_quote_ccy);
+                    if size as f32 <= order_size_filter {
+                        continue;
+                    }
+                }
+                out.push(run.qty.to_f32_lossy());
+            }
+        }
+        out
+    }
+
     pub fn max_depth_qty_in_range(
         &self,
         earliest: UnixMs,
@@ -770,5 +988,110 @@ impl std::fmt::Display for ProfileKind {
             ProfileKind::FixedWindow(_) => write!(f, "Fixed window"),
             ProfileKind::VisibleRange => write!(f, "Visible range"),
         }
+    }
+}
+
+#[cfg(test)]
+mod visual_tests {
+    use super::*;
+
+    #[test]
+    fn old_config_without_new_fields_loads() {
+        let json = r#"{"trade_size_filter":10.0,"order_size_filter":5.0,
+            "trade_size_scale":100,"coalescing":null}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.trade_radius_scale, RadiusScale::Linear);
+        assert_eq!(cfg.trade_max_radius_px, 25.0);
+        assert_eq!(cfg.depth_cap, DepthCap::VisibleMax);
+        assert_eq!(cfg.depth_palette, DepthPalette::Classic);
+        assert!(!cfg.depth_log);
+        assert_eq!(cfg.depth_contrast, 1.0);
+        assert_eq!(cfg.volume_profile_width_pct, 0.10);
+    }
+
+    #[test]
+    fn config_round_trips() {
+        let cfg = Config {
+            depth_cap: DepthCap::Fixed(42.0),
+            depth_palette: DepthPalette::Viridis,
+            trade_radius_scale: RadiusScale::Sqrt,
+            ..Config::default()
+        };
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn radius_linear_and_sqrt() {
+        let lin = bubble_radius_px(0.25, RadiusScale::Linear, 2.0, 22.0, 100);
+        let sq = bubble_radius_px(0.25, RadiusScale::Sqrt, 2.0, 22.0, 100);
+        assert!((lin - 7.0).abs() < 1e-5);
+        assert!((sq - 12.0).abs() < 1e-5);
+        assert_eq!(
+            bubble_radius_px(0.0, RadiusScale::Linear, 2.0, 22.0, 100),
+            2.0
+        );
+        assert_eq!(
+            bubble_radius_px(1.0, RadiusScale::Linear, 2.0, 22.0, 100),
+            22.0
+        );
+    }
+
+    #[test]
+    fn radius_is_capped_and_handles_bad_input() {
+        assert_eq!(
+            bubble_radius_px(1.0, RadiusScale::Linear, 2.0, 22.0, 200),
+            22.0
+        );
+        assert_eq!(
+            bubble_radius_px(f32::NAN, RadiusScale::Sqrt, 2.0, 22.0, 100),
+            2.0
+        );
+        assert_eq!(
+            bubble_radius_px(5.0, RadiusScale::Linear, 2.0, 22.0, 100),
+            22.0
+        );
+    }
+
+    #[test]
+    fn intensity_shaping() {
+        assert_eq!(shape_intensity(0.0, false, 1.0), 0.0);
+        assert!((shape_intensity(1.0, false, 1.0) - 1.0).abs() < 1e-6);
+        assert!((shape_intensity(0.5, false, 2.0) - 0.25).abs() < 1e-6);
+        // log lifts small values and keeps the endpoints
+        assert!(shape_intensity(0.05, true, 1.0) > 0.2);
+        assert!((shape_intensity(1.0, true, 1.0) - 1.0).abs() < 1e-5);
+        assert_eq!(shape_intensity(2.0, false, 1.0), 1.0);
+    }
+
+    #[test]
+    fn viridis_endpoints_and_range() {
+        let lo = viridis(0.0);
+        let hi = viridis(1.0);
+        assert!(
+            lo[2] > lo[0] && lo[2] > lo[1],
+            "dark purple/blue start: {lo:?}"
+        );
+        assert!(
+            hi[0] > 0.9 && hi[1] > 0.9 && hi[2] < 0.3,
+            "yellow end: {hi:?}"
+        );
+        for i in 0..=20 {
+            assert!(
+                viridis(i as f32 / 20.0)
+                    .iter()
+                    .all(|c| (0.0..=1.0).contains(c))
+            );
+        }
+    }
+
+    #[test]
+    fn percentile_nearest_rank() {
+        let mut v: Vec<f32> = (1..=100).map(|x| x as f32).collect();
+        assert_eq!(percentile(&mut v, 0.95), 95.0);
+        assert_eq!(percentile(&mut v, 0.99), 99.0);
+        assert_eq!(percentile(&mut v, 1.0), 100.0);
+        assert_eq!(percentile(&mut [], 0.5), 0.0);
+        assert_eq!(percentile(&mut [3.0], 0.01), 3.0);
     }
 }
