@@ -25,6 +25,8 @@ cargo run --release
 cargo check --workspace         # 只做型別檢查，最快
 ```
 
+打包成 macOS `.app`／DMG：`bash scripts/build-macos.sh aarch64 && bash scripts/package-macos.sh aarch64`（只打包 Apple Silicon；不帶參數則打包 universal）。完整流程與注意事項見 `.claude/skills/package-macos/SKILL.md`。
+
 套件名稱與目錄名不同：`data/` → `flowsurface-data`、`exchange/` → `flowsurface-exchange`、`indicator-engine/` → `flowsurface-indicator-engine`。在其他 crate 裡分別以 `data`、`exchange`、`indicator_engine` 引用。所有 `-p` 參數都要用套件名稱。
 
 ## Rust Lint
