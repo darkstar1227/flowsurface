@@ -216,7 +216,7 @@ fn save_in(
             )
         }
     };
-    write_atomically(&destination, source.as_bytes()).map_err(general)?;
+    write_atomically(&destination, source.as_bytes(), !created).map_err(general)?;
     Ok(SavedSource {
         id,
         path: destination,
@@ -234,12 +234,29 @@ fn installed_path(directory: &Path, id: &IndicatorId) -> Result<Option<PathBuf>,
         .map(|loaded| loaded.path))
 }
 
-fn write_atomically(destination: &Path, contents: &[u8]) -> Result<(), String> {
+/// Write `contents` through a temporary file. With `replace`, an existing destination is
+/// replaced; otherwise the write fails if anything already exists there, including a source
+/// that could not be loaded and so was not found as an installed indicator.
+fn write_atomically(destination: &Path, contents: &[u8], replace: bool) -> Result<(), String> {
     use std::io::Write;
 
     let parent = destination
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", destination.display()))?;
+    // Source discovery skips symlinked directories; writing through one would leave the
+    // indicators directory.
+    if fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!(
+            "{} is a symbolic link; indicators are only saved into real directories",
+            parent.display()
+        ));
+    }
+    if !replace && fs::symlink_metadata(destination).is_ok() {
+        return Err(format!(
+            "{} already exists but is not a loadable indicator with this ID; move or fix it first",
+            destination.display()
+        ));
+    }
     fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     // A non-source extension keeps an interrupted write out of source discovery.
     let temporary = parent.join(format!(".edit-{}.part", uuid::Uuid::new_v4()));
@@ -251,9 +268,14 @@ fn write_atomically(destination: &Path, contents: &[u8]) -> Result<(), String> {
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, destination)
+        if replace {
+            fs::rename(&temporary, destination)
+        } else {
+            // A hard link publishes the file atomically and refuses to replace an existing path.
+            fs::hard_link(&temporary, destination)
+        }
     })();
-    if result.is_err() {
+    if result.is_err() || !replace {
         let _ = fs::remove_file(&temporary);
     }
     result.map_err(|error| format!("{}: {error}", destination.display()))
@@ -397,6 +419,62 @@ mod tests {
             "nothing should be written"
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn new_source_never_replaces_an_unloadable_or_mismatched_file() {
+        let directory = temp_dir("unloadable");
+        let broken = directory.join("user").join("foo.ind");
+        fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        fs::write(&broken, "language(1)\nindicator(").unwrap();
+        let error = save_in(
+            &directory,
+            &template("user.foo", "Foo"),
+            None,
+            never_bundled,
+        )
+        .unwrap_err();
+        assert!(error[0].message.contains("already exists"), "{error:?}");
+        assert_eq!(
+            fs::read_to_string(&broken).unwrap(),
+            "language(1)\nindicator("
+        );
+
+        // A file named foo.ind that declares another namespace still loads under that ID.
+        let other = directory.join("user").join("bar.ind");
+        fs::write(&other, template("other.bar", "Other")).unwrap();
+        let error = save_in(
+            &directory,
+            &template("user.bar", "Bar"),
+            None,
+            never_bundled,
+        )
+        .unwrap_err();
+        assert!(error[0].message.contains("already exists"), "{error:?}");
+        assert_eq!(
+            fs::read_to_string(&other).unwrap(),
+            template("other.bar", "Other")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_symlinked_namespace_directory() {
+        let directory = temp_dir("symlink");
+        let outside = temp_dir("outside");
+        std::os::unix::fs::symlink(&outside, directory.join("user")).unwrap();
+        let error = save_in(
+            &directory,
+            &template("user.foo", "Foo"),
+            None,
+            never_bundled,
+        )
+        .unwrap_err();
+        assert!(error[0].message.contains("symbolic link"), "{error:?}");
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
