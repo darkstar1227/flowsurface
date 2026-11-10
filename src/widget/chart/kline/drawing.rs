@@ -11,6 +11,7 @@ use super::{
 };
 use crate::style;
 
+use data::chart::kline::drawing::{FIB_LEVELS, fib_level_y_unit};
 use data::config::theme::{ACCENT_COUNT, ThemeColor, ThemeColorRole};
 use exchange::UnixMs;
 
@@ -412,6 +413,45 @@ impl DrawingView<'_> {
         Some((origin, size, clip_bounds, visible_bounds))
     }
 
+    /// Pixel rows of every Fib level plus the horizontal span, which runs from the earlier
+    /// anchor to the later one.
+    fn drawing_fib_geometry(
+        &self,
+        start: DrawingAnchor,
+        end: DrawingAnchor,
+    ) -> Option<FibGeometry> {
+        if start.panel_id != end.panel_id {
+            return None;
+        }
+
+        let clip = self.drawing_object_clip_bounds(start.panel_id)?;
+        let start_x = self.x_overlay_for_anchor(start.x)?;
+        let end_x = self.x_overlay_for_anchor(end.x)?;
+        let left = start_x.min(end_x).max(clip.x);
+        let right = start_x.max(end_x).min(clip.x + clip.width);
+        if right < left {
+            return None;
+        }
+
+        let mut levels = Vec::with_capacity(FIB_LEVELS.len());
+        for ratio in FIB_LEVELS {
+            let y_unit = fib_level_y_unit(start.y_unit, end.y_unit, ratio);
+            levels.push(FibLevel {
+                ratio,
+                y_unit,
+                y: self.y_overlay_for_value(start.panel_id, y_unit)?,
+            });
+        }
+
+        Some(FibGeometry {
+            panel_id: start.panel_id,
+            clip,
+            left,
+            right,
+            levels,
+        })
+    }
+
     fn drawing_horizontal_line_geometry(
         &self,
         panel_id: PanelId,
@@ -567,6 +607,49 @@ impl DrawingView<'_> {
                     )
                 });
             }
+            DrawingObject::FibRetracement { start, end } => {
+                let Some(geometry) = self.drawing_fib_geometry(*start, *end) else {
+                    return;
+                };
+                let color = iced_color(style.stroke_color, palette, generated_accents);
+                let rows: Vec<f32> = geometry
+                    .levels
+                    .iter()
+                    .map(|level| pixels.snap_stroke_center_y(level.y, stroke_width_phys))
+                    .collect();
+                let left = pixels.snap_stroke_center_x(geometry.left, stroke_width_phys);
+                frame.with_clip(geometry.clip, |frame| {
+                    for pair in rows.windows(2) {
+                        let (top, bottom) = (pair[0].min(pair[1]), pair[0].max(pair[1]));
+                        frame.fill_rectangle(
+                            Point::new(left, top),
+                            Size::new((geometry.right - left).max(0.0), bottom - top),
+                            color.scale_alpha(FIB_FILL_ALPHA),
+                        );
+                    }
+                    for (level, y) in geometry.levels.iter().zip(&rows) {
+                        frame.stroke(
+                            &canvas::Path::line(
+                                Point::new(left, *y),
+                                Point::new(geometry.right, *y),
+                            ),
+                            stroke,
+                        );
+                        let price = self
+                            .format_y_label(geometry.panel_id, level.y_unit)
+                            .unwrap_or_default();
+                        frame.fill_text(canvas::Text {
+                            content: format!("{} ({price})", fib_ratio_label(level.ratio)),
+                            position: Point::new(left + 4.0, *y - 2.0),
+                            color,
+                            size: TEXT_SIZE.into(),
+                            align_y: iced::alignment::Vertical::Bottom,
+                            font: style::AZERET_MONO,
+                            ..Default::default()
+                        });
+                    }
+                });
+            }
             DrawingObject::VerticalLine { x } => {
                 let Some((bounds, x)) = self.drawing_vertical_line_geometry(*x) else {
                     return;
@@ -587,7 +670,8 @@ impl DrawingView<'_> {
 
     fn drawing_handle_points(&self, object: &DrawingObject) -> Vec<(DrawingHandleKind, Point)> {
         match object {
-            DrawingObject::Trendline { start, end } => {
+            DrawingObject::Trendline { start, end }
+            | DrawingObject::FibRetracement { start, end } => {
                 let mut points = Vec::with_capacity(2);
 
                 if let Some(start_point) = self.anchor_to_overlay_point(*start) {
@@ -1028,6 +1112,14 @@ impl DrawingView<'_> {
                 point.x >= (start_x - tolerance)
                     && point.x <= (bounds.x + bounds.width + tolerance)
                     && (point.y - y).abs() <= tolerance
+            }
+            DrawingObject::FibRetracement { start, end } => {
+                let Some(geometry) = self.drawing_fib_geometry(*start, *end) else {
+                    return false;
+                };
+                let rows: Vec<f32> = geometry.levels.iter().map(|level| level.y).collect();
+
+                fib_lines_hit(point, &rows, geometry.left, geometry.right, tolerance)
             }
             DrawingObject::VerticalLine { x } => {
                 let Some((plot, x)) = self.drawing_vertical_line_geometry(*x) else {
@@ -1616,6 +1708,34 @@ fn clip_segment_to_bounds(start: Point, end: Point, bounds: Rectangle) -> Option
     ))
 }
 
+const FIB_FILL_ALPHA: f32 = 0.08;
+
+struct FibLevel {
+    ratio: f64,
+    y_unit: YUnit,
+    y: f32,
+}
+
+struct FibGeometry {
+    panel_id: PanelId,
+    clip: Rectangle,
+    left: f32,
+    right: f32,
+    levels: Vec<FibLevel>,
+}
+
+fn fib_ratio_label(ratio: f64) -> String {
+    let text = format!("{ratio:.3}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// Whether `point` is within `tolerance` of any level row spanning `left..=right`.
+fn fib_lines_hit(point: Point, rows: &[f32], left: f32, right: f32, tolerance: f32) -> bool {
+    point.x >= left - tolerance
+        && point.x <= right + tolerance
+        && rows.iter().any(|y| (point.y - y).abs() <= tolerance)
+}
+
 fn point_segment_distance(point: Point, a: Point, b: Point) -> f32 {
     let vx = b.x - a.x;
     let vy = b.y - a.y;
@@ -1651,4 +1771,53 @@ pub(super) fn fill_marquee_rectangle(
             .with_color(palette.primary.base.color.scale_alpha(0.6))
             .with_width(1.0),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fib_hit_test_follows_level_rows_and_span() {
+        let rows = [100.0, 150.0, 200.0];
+        assert!(fib_lines_hit(
+            Point::new(50.0, 152.0),
+            &rows,
+            10.0,
+            90.0,
+            7.0
+        ));
+        assert!(fib_lines_hit(
+            Point::new(96.0, 100.0),
+            &rows,
+            10.0,
+            90.0,
+            7.0
+        ));
+        // Between two levels, away from both rows.
+        assert!(!fib_lines_hit(
+            Point::new(50.0, 125.0),
+            &rows,
+            10.0,
+            90.0,
+            7.0
+        ));
+        // Right row, but beyond the horizontal span.
+        assert!(!fib_lines_hit(
+            Point::new(120.0, 150.0),
+            &rows,
+            10.0,
+            90.0,
+            7.0
+        ));
+    }
+
+    #[test]
+    fn fib_ratio_labels_drop_trailing_zeros() {
+        let labels: Vec<String> = FIB_LEVELS.iter().map(|r| fib_ratio_label(*r)).collect();
+        assert_eq!(
+            labels,
+            ["0", "0.236", "0.382", "0.5", "0.618", "0.786", "1"]
+        );
+    }
 }

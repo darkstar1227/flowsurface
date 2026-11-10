@@ -1351,6 +1351,7 @@ impl DrawingTools {
                 DrawingTool::HorizontalLine => style::Icon::HorizontalLine,
                 DrawingTool::VerticalLine => style::Icon::VerticalLine,
                 DrawingTool::Measure => style::Icon::Ruler,
+                DrawingTool::FibRetracement => style::Icon::Layers,
             };
 
             let btn =
@@ -1773,6 +1774,17 @@ impl DrawingTools {
                     current: anchor,
                     style: settings.style_defaults.style_for(DrawingTool::Box),
                     extend_right: settings.box_extend_right,
+                });
+                self.selected_drawings.clear();
+                true
+            }
+            DrawingTool::FibRetracement => {
+                self.interaction = DrawingInteraction::Drafting(DrawingDraft::FibRetracement {
+                    start: anchor,
+                    current: anchor,
+                    style: settings
+                        .style_defaults
+                        .style_for(DrawingTool::FibRetracement),
                 });
                 self.selected_drawings.clear();
                 true
