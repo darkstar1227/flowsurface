@@ -19,7 +19,7 @@ If either fails, stop and return REFUTED with the exact failing lines.
 **Then, scoped to the diff:**
 - `cargo test -p <affected package> --locked` for each touched crate (`flowsurface-indicator-engine`, `flowsurface-data`, `flowsurface --bin flowsurface`).
 - `.ind` sources or indicator language touched → also run the CLI `test data/indicators/sources --namespace core` smoke check.
-- `Cargo.toml` changed or files added to a published crate → `T=$(mktemp -d); cargo package --workspace --locked --target-dir "$T"; rm -rf "$T"`. Delete every `mktemp -d` directory you create (package target dirs are ~4 GB each, `FLOWSURFACE_DATA_PATH` dirs too) before finishing.
+- `Cargo.toml` changed or files added to a published crate → `cargo package --workspace --locked --target-dir target/package-check` (fixed, gitignored dir that reuses compiled dependencies; do not switch back to `mktemp -d`). Delete every `mktemp -d` directory you create (such as `FLOWSURFACE_DATA_PATH` dirs) before finishing.
 - Use `codegraph explore` to find callers of changed symbols and check they still hold.
 - Serialized state types changed → confirm an existing `saved-state.json` shape still deserializes (serde defaults present).
 - GUI-only behavior you cannot exercise → return INCONCLUSIVE for that part and list the manual `cargo run` steps.
