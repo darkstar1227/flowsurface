@@ -39,7 +39,10 @@ impl SignedHttp {
             .https_only(true);
         let builder = match &proxy {
             ProxyState::Broken => return Err(AccountError::ProxyBroken),
-            ProxyState::Direct => builder,
+            // `no_proxy` matters: without it reqwest reads HTTPS_PROXY / ALL_PROXY from the
+            // environment, so a "direct" client could leave through a proxy the user never
+            // chose while the websocket (which ignores them) connects directly.
+            ProxyState::Direct => builder.no_proxy(),
             ProxyState::Proxied(p) => crate::adapter::proxy::apply_proxy_strict(builder, Some(p))
                 .map_err(|_| AccountError::ClientBuild)?,
         };
@@ -110,5 +113,98 @@ mod tests {
         for secret in ["alice", "hunter2", "proxy.example"] {
             assert!(!text.contains(secret), "{text}");
         }
+    }
+
+    // The environment is process-wide, so the check runs in child processes whose variables
+    // are set by `Command::env` (no `set_var` in a parallel test run). `PROXY_PROBE` selects
+    // the mode in the child; without it the probe tests return at once.
+    const PROBE_VAR: &str = "FLOWSURFACE_PROXY_PROBE";
+
+    /// Child side: send one request to a closed local port with the chosen client.
+    fn probe(mode: &str) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _guard = rt.enter();
+        let client = match mode {
+            "direct" => SignedHttp::build(ProxyState::Direct)
+                .expect("direct")
+                .client()
+                .clone(),
+            // Control: a client built without `no_proxy` must be seen using the environment.
+            _ => reqwest::Client::builder()
+                .https_only(true)
+                .build()
+                .expect("plain"),
+        };
+        let _ = rt.block_on(client.get("https://127.0.0.1:9/").send());
+    }
+
+    #[test]
+    fn direct_probe_child() {
+        if std::env::var(PROBE_VAR).as_deref() == Ok("direct") {
+            probe("direct");
+        }
+    }
+
+    #[test]
+    fn control_probe_child() {
+        if std::env::var(PROBE_VAR).as_deref() == Ok("control") {
+            probe("control");
+        }
+    }
+
+    /// Whether the fake proxy saw a connection from a child running `test` with `mode`. The
+    /// fake proxy closes every connection at once, so the child fails fast instead of waiting.
+    fn proxy_was_contacted(test: &str, mode: &str) -> bool {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (stop, seen) = (stop.clone(), seen.clone());
+            std::thread::spawn(move || {
+                while let Ok(_conn) = listener.accept() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    seen.store(true, Ordering::SeqCst);
+                }
+            })
+        };
+        let status = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args(["--exact", test, "--test-threads=1"])
+            .env(PROBE_VAR, mode)
+            .env("HTTPS_PROXY", &url)
+            .env("https_proxy", &url)
+            .env("ALL_PROXY", &url)
+            .env("all_proxy", &url)
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .status()
+            .expect("child");
+        // Wake the watcher with a connection that is not counted, then join it.
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
+        watcher.join().expect("watcher");
+        assert!(status.success(), "{test} failed in the child");
+        seen.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_direct_client_ignores_the_proxy_environment() {
+        // The control shows the probe can see a proxy being used at all.
+        assert!(
+            proxy_was_contacted("signed_http::tests::control_probe_child", "control"),
+            "the control client did not use the environment proxy: the probe proves nothing"
+        );
+        assert!(
+            !proxy_was_contacted("signed_http::tests::direct_probe_child", "direct"),
+            "a direct SignedHttp connected through the environment proxy"
+        );
     }
 }

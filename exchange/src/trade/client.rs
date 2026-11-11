@@ -465,8 +465,10 @@ impl TradeClient {
         token: ConfirmToken,
         intent: OrderIntent,
     ) -> Result<Submitted, SubmitError<G::Refusal>> {
-        self.submit_spent(gate, risk, journal, token.spend(), intent)
-            .await
+        let spent = token
+            .spend_order()
+            .map_err(|_| SubmitError::ConfirmationMismatch)?;
+        self.submit_spent(gate, risk, journal, spent, intent).await
     }
 
     /// An automatic path (condition 71): pre-authorised, and only ever reducing.

@@ -22,7 +22,7 @@ pub struct JournalError;
 
 /// Where unresolved sends are recorded. Calls are synchronous and short; they are made from the
 /// send path, so an implementation must not block on the network.
-pub trait UnknownJournal {
+pub trait UnknownJournal: Sync {
     /// Write `record` durably. An `Err` stops a new entry (nothing goes out); a reducing or
     /// closing send goes out anyway.
     fn record(&self, record: &UnknownRecord) -> Result<(), JournalError>;

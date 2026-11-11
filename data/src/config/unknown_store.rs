@@ -29,6 +29,8 @@
 //!
 //! Nothing here reads a clock: the time is the caller's.
 
+use super::exchange_accounts::AccountMeta;
+use super::risk_log::{LogAction, RiskLog, RiskLogEntry};
 use exchange::account::AccountKey;
 use exchange::trade::{DiscardToken, UnknownRecord};
 use serde::{Deserialize, Serialize};
@@ -73,6 +75,15 @@ struct Line {
 struct File {
     version: u32,
     entries: Vec<Line>,
+}
+
+/// What [`UnknownStore::discard_invalid_logged_async`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscardOutcome {
+    /// A line was removed (`false`: it was already gone).
+    pub discarded: bool,
+    /// The audit line was written, or none was needed (nothing was removed).
+    pub logged: bool,
 }
 
 #[derive(Debug)]
@@ -304,6 +315,40 @@ impl UnknownStore {
     pub async fn discard_invalid_async(&self, token: DiscardToken) -> Result<bool, StoreError> {
         let this = self.clone();
         blocking(move || this.discard_invalid(token)).await
+    }
+
+    /// [`UnknownStore::discard_invalid_async`] followed by the audit line (review S5): after a
+    /// successful removal an `UnknownDiscarded` entry goes to the risk log, with the symbol
+    /// and the action only (no client id). The token must belong to the account `meta`
+    /// describes, otherwise nothing is touched and `StoreError::Corrupt` comes back. A log
+    /// write that fails does not undo the removal: it is reported in
+    /// [`DiscardOutcome::logged`] so the caller can show it.
+    pub async fn discard_invalid_logged_async(
+        &self,
+        token: DiscardToken,
+        meta: AccountMeta,
+        at_ms: i64,
+        log: RiskLog,
+    ) -> Result<DiscardOutcome, StoreError> {
+        if token.account() != AccountKey::from_bytes(*meta.id.as_bytes()) {
+            return Err(StoreError::Corrupt("discard token is for another account"));
+        }
+        let this = self.clone();
+        let symbol = token.symbol().to_string();
+        blocking(move || {
+            let discarded = this.discard_invalid(token)?;
+            let logged = !discarded
+                || log
+                    .append(&RiskLogEntry::unknown_event(
+                        &meta,
+                        at_ms,
+                        &symbol,
+                        LogAction::UnknownDiscarded,
+                    ))
+                    .is_ok();
+            Ok(DiscardOutcome { discarded, logged })
+        })
+        .await
     }
 
     fn read_file(&self) -> Result<File, StoreError> {
@@ -767,5 +812,85 @@ mod tests {
             let token = challenge.confirm(&phrase).unwrap();
             assert!(store.discard_invalid_async(token).await.unwrap());
         });
+    }
+
+    fn discard_meta(account: [u8; 16]) -> AccountMeta {
+        AccountMeta {
+            id: Uuid::from_bytes(account),
+            alias: "main".into(),
+            ..AccountMeta::default()
+        }
+    }
+
+    fn discard_token(rec: &UnknownRecord) -> DiscardToken {
+        let challenge = rec.begin_discard().unwrap();
+        let phrase = challenge.phrase().to_string();
+        challenge.confirm(&phrase).unwrap()
+    }
+
+    fn run<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn a_discard_writes_one_audit_line_with_the_symbol_and_no_client_id() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        let log = RiskLog::in_dir(dir.0.clone(), 1 << 20);
+        let bad = record("not-an-id-123");
+        store.add(&bad).unwrap();
+
+        let out = run(store.discard_invalid_logged_async(
+            discard_token(&bad),
+            discard_meta([5; 16]),
+            42,
+            log.clone(),
+        ))
+        .unwrap();
+        assert_eq!(
+            out,
+            DiscardOutcome {
+                discarded: true,
+                logged: true
+            }
+        );
+        assert!(store.load().unwrap().is_empty());
+        let text = fs::read_to_string(log.path()).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains("unknown_discarded"), "{text}");
+        assert!(text.contains("BTC-USDT-SWAP"), "{text}");
+        assert!(!text.contains("not-an-id"), "{text}");
+    }
+
+    #[test]
+    fn nothing_is_logged_when_nothing_was_removed_or_the_account_differs() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        let log = RiskLog::in_dir(dir.0.clone(), 1 << 20);
+        let bad = record("not-an-id-123");
+        // Never saved: nothing to remove, so no audit line.
+        let out = run(store.discard_invalid_logged_async(
+            discard_token(&bad),
+            discard_meta([5; 16]),
+            1,
+            log.clone(),
+        ))
+        .unwrap();
+        assert!(!out.discarded && out.logged);
+        // A token for another account is refused before the file is touched.
+        store.add(&bad).unwrap();
+        let err = run(store.discard_invalid_logged_async(
+            discard_token(&bad),
+            discard_meta([9; 16]),
+            1,
+            log.clone(),
+        ))
+        .unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)));
+        assert_eq!(store.load().unwrap().len(), 1);
+        assert!(!log.path().exists());
     }
 }

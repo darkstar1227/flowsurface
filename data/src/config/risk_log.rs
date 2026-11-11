@@ -118,6 +118,7 @@ fn refusal_reason(r: RiskRefusal) -> &'static str {
         RiskRefusal::SettingsInvalid => "settings_invalid",
         RiskRefusal::WrongAccount => "wrong_account",
         RiskRefusal::SnapshotNotApplied => "snapshot_not_applied",
+        RiskRefusal::StateUnavailable => "state_unavailable",
     }
 }
 

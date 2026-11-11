@@ -109,15 +109,18 @@ fn crate_src() -> PathBuf {
 }
 
 #[test]
-fn only_the_risk_snapshot_implements_the_risk_hook() {
+fn only_the_risk_snapshot_and_shared_risk_implement_the_risk_hook() {
     // The trait is sealed (only this crate can implement it); this scan is a second alarm.
     let h = hits(&crate_src(), "RiskHook for");
-    assert_eq!(h.len(), 1, "{h:?}");
+    assert_eq!(h.len(), 2, "{h:?}");
+    assert!(h.iter().all(|x| x.contains("risk.rs")), "{h:?}");
     let src = fs::read_to_string(crate_src().join("trade/risk.rs")).unwrap();
-    assert!(production_part(&src).contains("impl RiskHook for RiskSnapshot"));
+    let prod = production_part(&src);
+    assert!(prod.contains("impl RiskHook for RiskSnapshot"));
+    assert!(prod.contains("impl RiskHook for SharedRisk"));
     let s = hits(&crate_src(), "Sealed for");
-    assert_eq!(s.len(), 1, "{s:?}");
-    assert!(s[0].contains("risk.rs"), "{s:?}");
+    assert_eq!(s.len(), 2, "{s:?}");
+    assert!(s.iter().all(|x| x.contains("risk.rs")), "{s:?}");
 }
 
 #[test]

@@ -71,6 +71,46 @@ pub(crate) fn claim(account: AccountKey, token: u64, api_key: &str) -> Option<Ke
     })
 }
 
+/// Claim `api_key` into `slot` (the stream's one held claim) without ever giving the key back
+/// first. A reconnect re-claims the same key; releasing before claiming would let another
+/// account take the key in between. The old claim is dropped only after the new one is held
+/// (a no-op when it is the same key, whose claim stays as it is). `false` when another account
+/// holds the key: the slot is left unchanged.
+pub(crate) fn claim_into(
+    slot: &mut Option<KeyClaim>,
+    account: AccountKey,
+    token: u64,
+    api_key: &str,
+) -> bool {
+    let wanted = digest_of(api_key);
+    if slot
+        .as_ref()
+        .is_some_and(|c| c.digest == wanted && c.token == token)
+    {
+        // Re-check under the lock: the entry must still be ours. A same-account entry with
+        // another token (a newer stream took over) is left as it is: writing our token back
+        // would make our drop delete the newer stream's entry.
+        return with(|m| match m.get(&wanted) {
+            Some(o) if o.account != account => false,
+            Some(o) if o.token != token => false,
+            Some(_) => true,
+            None => {
+                m.insert(wanted, Owner { account, token });
+                true
+            }
+        });
+    }
+    match claim(account, token, api_key) {
+        Some(new) => {
+            // Dropping the old claim (another key, or an older token) removes only its own
+            // entry; the new one was inserted first.
+            *slot = Some(new);
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +146,46 @@ mod tests {
     fn debug_shows_nothing_derived_from_the_key() {
         let c = claim(acct(5), 1, "claims-test-key-4").expect("free key");
         assert_eq!(format!("{c:?}"), "KeyClaim(<redacted>)");
+    }
+
+    #[test]
+    fn a_reclaim_of_the_same_key_never_leaves_a_gap() {
+        let key = "claims-test-key-5";
+        let mut slot = None;
+        assert!(claim_into(&mut slot, acct(6), 1, key));
+        // Re-claiming the same key keeps it held; another account is still refused.
+        assert!(claim_into(&mut slot, acct(6), 1, key));
+        assert!(claim(acct(7), 2, key).is_none());
+        // A replaced key is released only after the new one is held.
+        assert!(claim_into(&mut slot, acct(6), 1, "claims-test-key-6"));
+        assert!(claim(acct(7), 2, key).is_some());
+        assert!(claim(acct(7), 3, "claims-test-key-6").is_none());
+    }
+
+    #[test]
+    fn a_reclaim_does_not_take_back_a_key_a_newer_stream_of_the_same_account_holds() {
+        let key = "claims-test-key-9";
+        let mut slot = None;
+        assert!(claim_into(&mut slot, acct(11), 1, key));
+        // A replacement stream of the same account takes the key over.
+        let newer = claim(acct(11), 2, key).expect("same account");
+        // The old stream reconnecting does not overwrite the entry.
+        assert!(!claim_into(&mut slot, acct(11), 1, key));
+        // Dropping the old claim leaves the newer entry in place.
+        drop(slot);
+        assert!(claim(acct(12), 3, key).is_none());
+        drop(newer);
+        assert!(claim(acct(12), 3, key).is_some());
+    }
+
+    #[test]
+    fn a_refused_reclaim_leaves_the_slot_unchanged() {
+        let other = claim(acct(8), 1, "claims-test-key-7").expect("free key");
+        let mut slot = None;
+        assert!(claim_into(&mut slot, acct(9), 1, "claims-test-key-8"));
+        assert!(!claim_into(&mut slot, acct(9), 1, "claims-test-key-7"));
+        // The old key is still held by the slot.
+        assert!(claim(acct(10), 2, "claims-test-key-8").is_none());
+        drop(other);
     }
 }

@@ -121,6 +121,40 @@ impl PrivateStream {
     /// round, the credentials cannot be loaded and the key is left to expire. A stream that
     /// has already stopped (authentication failed, spot) closes nothing.
     pub async fn shutdown(self) {
+        self.closer().shutdown().await;
+    }
+
+    /// A cloneable handle that can close this stream while something else owns it (an iced
+    /// subscription owns the stream, the GUI keeps the closer).
+    pub fn closer(&self) -> StreamCloser {
+        StreamCloser {
+            ctl: self.ctl.clone(),
+        }
+    }
+}
+
+/// Closes one [`PrivateStream`] from outside it. Cloneable; it holds only the control channel
+/// of the stream's supervisor, so it keeps nothing alive: when the stream is gone (dropped, or
+/// already stopped) [`StreamCloser::shutdown`] returns at once and closes nothing, because the
+/// supervisor that would have sent the DELETE no longer exists. Close **before** dropping the
+/// stream (before the subscription is removed) if the listenKey should be closed.
+#[derive(Clone)]
+pub struct StreamCloser {
+    ctl: UnboundedSender<Msg>,
+}
+
+impl std::fmt::Debug for StreamCloser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StreamCloser(..)")
+    }
+}
+
+impl StreamCloser {
+    /// Same as [`PrivateStream::shutdown`]: stop the stream, close the listenKey (futures
+    /// only) and return once that has been answered. Idempotent: the supervisor handles one
+    /// shutdown and ends, so a second call (or one racing the first) sends nothing again; a
+    /// racing call returns when the first one has finished.
+    pub async fn shutdown(&self) {
         let (ack, done) = oneshot::channel();
         if self.ctl.unbounded_send(Msg::Shutdown(ack)).is_ok() {
             let _ = done.await;
@@ -229,13 +263,17 @@ const BINANCE_FUTURES_SILENCE: Duration = Duration::from_secs(210);
 
 /// Start the private stream of one account. Must be called inside a tokio runtime.
 pub fn run(ctx: StreamContext) -> PrivateStream {
+    let status_token = status::register(ctx.key.account);
+    let mut shared = Shared::new(ctx);
+    shared.status_token = Some(status_token);
+    start(shared, status_token)
+}
+
+fn start(shared: Shared, status_token: u64) -> PrivateStream {
     let (out_tx, rx) = unbounded();
     let (msg_tx, msg_rx) = unbounded();
     let unread = Arc::new(AtomicUsize::new(0));
-    let account = ctx.key.account;
-    let status_token = status::register(account);
-    let mut shared = Shared::new(ctx);
-    shared.status_token = Some(status_token);
+    let account = shared.ctx.key.account;
     let task = tokio::spawn(supervise(
         Arc::new(shared),
         msg_tx.clone(),
@@ -626,15 +664,43 @@ async fn make_client(ctx: &StreamContext, clock_offset_ms: i64) -> Result<TradeC
     Ok(client)
 }
 
-/// How a failed REST call is treated by the machine.
+/// Binance error codes that mean the API key itself is refused (allowlist, review S1-a):
+/// `-2014` API-key format invalid, `-2015` invalid API-key / IP / permissions, `-1022` invalid
+/// signature, `-2008` invalid API-key id. Source: Binance error-code docs as already used for
+/// this client in `docs/trading-security.md`; to be re-checked by security-review.
+const BINANCE_AUTH_CODES: [&str; 4] = ["-2014", "-2015", "-1022", "-2008"];
+
+/// OKX codes that mean the credential is refused for every request. Everything else is
+/// transient (`Network`, with backoff), because a wrong `Auth` also blocks closing orders
+/// (review S1-a). Source: the OKX API v5 error-code tables,
+/// <https://www.okx.com/docs-v5/en/#error-code-rest-api-public> (REST 501xx) and
+/// <https://www.okx.com/docs-v5/en/#error-code-websocket-public> (WebSocket 600xx).
+///
+/// - `50100` API frozen; `50101` APIKey does not match the environment; `50105` wrong
+///   passphrase; `50111` invalid OK-ACCESS-KEY; `50113` invalid signature; `50119` API key
+///   does not exist.
+/// - WebSocket login: `60005` invalid apiKey; `60007` invalid sign; `60024` wrong passphrase;
+///   `60032` API key does not exist.
+///
+/// Not listed on purpose: `50110` (the IP is refused, not the credential, and it can recover
+/// when the egress IP changes back), `50114` and `50120` (scope unclear / one function only),
+/// `50103`, `50104`, `50106`, `50107` (empty header, a local bug), `60009` (generic login
+/// failure), `63999` (transient internal error), `60011`, `60026`, `60031` (login flow), and
+/// the clock codes `50102`, `50112`, `60004`, `60006` (handled as `ClockSkew`).
+const OKX_AUTH_CODES: [&str; 10] = [
+    "50100", "50101", "50105", "50111", "50113", "50119", "60005", "60007", "60024", "60032",
+];
+
+fn is_auth_code(code: &str) -> bool {
+    BINANCE_AUTH_CODES.contains(&code) || OKX_AUTH_CODES.contains(&code)
+}
+
+/// How a failed REST call is treated by the machine. `Auth` is an allowlist: a bare HTTP
+/// 401/403 (Binance uses 403 for WAF limits) or an unknown code is `Network`.
 pub(crate) fn classify_rest(e: &AccountError) -> DownCause {
     match e {
-        AccountError::Exchange { code, .. }
-            if matches!(code.as_str(), "-2014" | "-2015" | "-1022" | "-2008") =>
-        {
-            DownCause::Auth
-        }
-        AccountError::Http(401 | 403) | AccountError::InvalidCredentials => DownCause::Auth,
+        AccountError::Exchange { code, .. } if is_auth_code(code) => DownCause::Auth,
+        AccountError::InvalidCredentials => DownCause::Auth,
         AccountError::ClockSkew => DownCause::ClockSkew,
         AccountError::ProxyChanged | AccountError::ProxyBroken => DownCause::Proxy,
         _ => DownCause::Network,
@@ -714,8 +780,10 @@ pub(crate) fn login_step(frame: &[u8]) -> LoginStep {
             log::warn!("okx login refused (code {code})");
             if is_clock_error(&code) {
                 LoginStep::Fail(DownCause::ClockSkew)
-            } else {
+            } else if OKX_AUTH_CODES.contains(&code.as_str()) {
                 LoginStep::Fail(DownCause::Auth)
+            } else {
+                LoginStep::Fail(DownCause::Network)
             }
         }
         Ok(OkxMessage::Notice) => LoginStep::Fail(DownCause::Network),
@@ -842,20 +910,18 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
             // share this listenKey and split the locks and limits.
             {
                 let mut held = shared.key_claim.lock().unwrap_or_else(|p| p.into_inner());
-                // Release a claim on an old key first (the Keychain item was replaced).
-                *held = None;
-                match key_claims::claim(
+                // The old claim (if the Keychain item was replaced) is released only after the
+                // new one is held, so a reconnect never opens a gap for another account.
+                if !key_claims::claim_into(
+                    &mut held,
                     key.account,
                     shared.status_token.unwrap_or(0),
                     creds.key().expose_secret(),
                 ) {
-                    Some(c) => *held = Some(c),
-                    None => {
-                        log::warn!(
-                            "private stream: this API key is already in use by another account"
-                        );
-                        return DownCause::Unavailable;
-                    }
+                    log::warn!("private stream: this API key is already in use by another account");
+                    // Retryable, not terminal: the holder may be a stream that is still shutting
+                    // down (an account deleted and re-added), and the backoff gives it time.
+                    return DownCause::Network;
                 }
             }
             let client = TradeClient::new(
@@ -1130,11 +1196,29 @@ mod tests {
             code: c.into(),
             msg: String::new(),
         };
-        for c in ["-2014", "-2015", "-1022", "-2008"] {
+        for c in [
+            "-2014", "-2015", "-1022", "-2008", "50100", "50101", "50105", "50111", "50113",
+            "50119", "60005", "60007", "60024", "60032",
+        ] {
             assert_eq!(classify_rest(&ex(c)), DownCause::Auth, "{c}");
         }
-        assert_eq!(classify_rest(&AccountError::Http(401)), DownCause::Auth);
-        assert_eq!(classify_rest(&AccountError::Http(403)), DownCause::Auth);
+        // A bare 401/403 (WAF limit) and unknown codes are transient, not an auth failure.
+        for e in [
+            AccountError::Http(401),
+            AccountError::Http(403),
+            ex("-1003"),
+            ex("-2010"),
+            ex("60009"),
+            ex("50110"),
+            ex("50114"),
+            ex("50120"),
+            ex("50103"),
+            ex("63999"),
+            ex("50011"),
+            ex(""),
+        ] {
+            assert_eq!(classify_rest(&e), DownCause::Network, "{e:?}");
+        }
         assert_eq!(
             classify_rest(&AccountError::InvalidCredentials),
             DownCause::Auth
@@ -1184,9 +1268,28 @@ mod tests {
             LoginStep::Fail(DownCause::ClockSkew)
         );
         assert_eq!(
-            login_step(br#"{"event":"error","code":"60009","msg":"x"}"#),
+            login_step(br#"{"event":"error","code":"50111","msg":"x"}"#),
             LoginStep::Fail(DownCause::Auth)
         );
+        for code in ["60005", "60007", "60024", "60032"] {
+            let frame = format!(r#"{{"event":"error","code":"{code}","msg":"x"}}"#);
+            assert_eq!(
+                login_step(frame.as_bytes()),
+                LoginStep::Fail(DownCause::Auth),
+                "{code}"
+            );
+        }
+        // Unknown login codes are transient: a wrong Auth would also refuse closing orders.
+        for code in [
+            "60009", "63999", "60011", "60031", "50011", "50013", "60001",
+        ] {
+            let frame = format!(r#"{{"event":"error","code":"{code}","msg":"x"}}"#);
+            assert_eq!(
+                login_step(frame.as_bytes()),
+                LoginStep::Fail(DownCause::Network),
+                "{code}"
+            );
+        }
         assert_eq!(login_step(b"not json"), LoginStep::Fail(DownCause::Network));
         assert_eq!(login_step(br#"{"event":"subscribe"}"#), LoginStep::Wait);
     }
@@ -1194,10 +1297,10 @@ mod tests {
     #[test]
     fn a_refused_login_logs_no_credential() {
         capture_logs();
-        let frame = br#"{"event":"error","code":"60009","msg":"Login failed apiKey=FAKEAPIKEY passphrase=FAKEPASS sign=FAKESIGN"}"#;
+        let frame = br#"{"event":"error","code":"50111","msg":"Login failed apiKey=FAKEAPIKEY passphrase=FAKEPASS sign=FAKESIGN"}"#;
         assert_eq!(login_step(frame), LoginStep::Fail(DownCause::Auth));
         let logs = LOGGED.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
-        assert!(logs.contains("60009"));
+        assert!(logs.contains("50111"));
         for secret in ["FAKEAPIKEY", "FAKEPASS", "FAKESIGN"] {
             assert!(!logs.contains(secret), "{secret} reached a log");
         }
@@ -1607,6 +1710,90 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), stream.shutdown())
                 .await
                 .expect("shutdown answers");
+        });
+    }
+
+    /// A running stream whose supervisor believes it made a listenKey; the credential loader
+    /// counts the DELETE attempts (the DELETE loads the credentials once, as in the tests above).
+    fn stream_with_a_key(byte: u8, loads: &Arc<AtomicUsize>) -> PrivateStream {
+        let mut ctx = counting(loads, Duration::ZERO);
+        ctx.key.account = AccountKey::from_bytes([byte; 16]);
+        let token = status::register(ctx.key.account);
+        let mut shared = Shared::new(ctx);
+        shared.status_token = Some(token);
+        shared.key_created.store(true, Ordering::Relaxed);
+        start(shared, token)
+    }
+
+    #[test]
+    fn a_closer_shuts_the_stream_down_once_while_something_else_owns_it() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        runtime().block_on(async {
+            let stream = stream_with_a_key(0xC1, &loads);
+            let account = stream.account;
+            let closer = stream.closer();
+            let other = closer.clone();
+            // The stream is "owned elsewhere" (here: still held, never polled by the caller).
+            tokio::time::timeout(Duration::from_secs(10), closer.shutdown())
+                .await
+                .expect("shutdown answers");
+            assert_eq!(loads.load(Ordering::SeqCst), 1, "one DELETE");
+            assert_eq!(status::stream_state(account), StreamState::Unavailable);
+            // A second call, from a clone, returns at once and sends nothing more.
+            tokio::time::timeout(Duration::from_secs(10), other.shutdown())
+                .await
+                .expect("a second shutdown answers");
+            tokio::time::timeout(Duration::from_secs(10), closer.shutdown())
+                .await
+                .expect("a third shutdown answers");
+            assert_eq!(loads.load(Ordering::SeqCst), 1, "no second DELETE");
+            drop(stream);
+        });
+    }
+
+    #[test]
+    fn two_racing_closers_send_one_delete_and_both_return() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        runtime().block_on(async {
+            let stream = stream_with_a_key(0xC2, &loads);
+            let (a, b) = (stream.closer(), stream.closer());
+            let both = async { futures::join!(a.shutdown(), b.shutdown()) };
+            tokio::time::timeout(Duration::from_secs(10), both)
+                .await
+                .expect("both return");
+            assert_eq!(loads.load(Ordering::SeqCst), 1);
+            drop(stream);
+        });
+    }
+
+    #[test]
+    fn a_closer_of_a_dropped_or_ended_stream_returns_at_once_and_closes_nothing() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        runtime().block_on(async {
+            let stream = stream_with_a_key(0xC3, &loads);
+            let closer = stream.closer();
+            drop(stream);
+            // The task is aborted: it may not have run its last step, so give it the chance.
+            tokio::task::yield_now().await;
+            tokio::time::timeout(Duration::from_secs(10), closer.shutdown())
+                .await
+                .expect("returns");
+            assert_eq!(loads.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn the_consuming_shutdown_still_closes_the_key_once() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        runtime().block_on(async {
+            let stream = stream_with_a_key(0xC4, &loads);
+            let closer = stream.closer();
+            tokio::time::timeout(Duration::from_secs(10), stream.shutdown())
+                .await
+                .expect("shutdown answers");
+            assert_eq!(loads.load(Ordering::SeqCst), 1);
+            closer.shutdown().await;
+            assert_eq!(loads.load(Ordering::SeqCst), 1);
         });
     }
 

@@ -170,8 +170,12 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
   - 驗證：狀態機單元測試，用假時鐘模擬到期事件與 PUT 失敗。手動：測試網上等待超過延長週期。
 - **50（b）**：重連沿用 `ReconnectBackoff`（500 ms 起、倍增、上限 30 秒、含抖動，`ws.rs:937-956`）。OKX 需要 `private` 與 `business` 兩條登入連線，各自 backoff；每條連線開始前先向 limiter 取得連線配額（每 IP 每秒 3 條）。
   - 驗證：backoff 序列有上限且帶抖動；同時斷線時，連線請求速率不超過配額。
-- **51（b、c）**：每個帳戶的私有流狀態為 `Connected`／`Reconnecting`／`Resyncing`／`AuthFailed`／`Unavailable`，在 UI 明顯顯示。狀態不是「`Connected` 且已重新同步」時：委託與持倉列表標為「可能過期」；**禁止新進場單與拖曳改單**；撤單、平倉、撤全部、全平仍允許；「一張成交撤另一張」暫停，重連後先以 REST 同步再補做。重新同步的端點：Binance 合約 `positionRisk v3`、`openOrders`、`openAlgoOrders`；現貨 `openOrders`、`openOrderList`、`account`；OKX `positions`、`orders-pending`、`orders-algo-pending`（`orders-algo` 不推快照）。睡眠喚醒視同斷線。
+- **51（b、c）**：每個帳戶的私有流狀態為 `Connected`／`Reconnecting`／`Resyncing`／`AuthFailed`／`Unavailable`，在 UI 明顯顯示。狀態不是「`Connected` 且已重新同步」時：委託與持倉列表標為「可能過期」；**禁止新進場單與拖曳改單**；撤單、平倉、撤全部、全平仍允許，**唯一例外是 `AuthFailed`：依條件 57，`approve` 拒絕所有單，含撤單、撤全部、平倉、減倉、全平與自動平倉（憑證被拒代表 session 作廢）**；「一張成交撤另一張」暫停，重連後先以 REST 同步再補做。重新同步的端點：Binance 合約 `positionRisk v3`、`openOrders`、`openAlgoOrders`；現貨 `openOrders`、`openOrderList`、`account`；OKX `positions`、`orders-pending`、`orders-algo-pending`（`orders-algo` 不推快照）。睡眠喚醒視同斷線。
   - 依據：依過期資料下單或拖曳，會撤錯單，或在已平倉時又掛出新單。
+  - `AuthFailed` 的判定採**允許清單**（c2b 前置，review S1-a）：誤判會把「擋進場」放大成「擋出場」，所以只有確定代表憑證被拒的回應才算。
+    - Binance：錯誤碼 `-2014`、`-2015`、`-1022`、`-2008`（含帶這些碼的 401／403）。單純的 403（WAF 限流）、沒有錯誤碼的 401／403、其他碼，一律當暫時性錯誤（`Network`，走 backoff）。
+    - OKX（依官方錯誤碼表核對，REST 501xx：https://www.okx.com/docs-v5/en/#error-code-rest-api-public ，WebSocket 600xx：https://www.okx.com/docs-v5/en/#error-code-websocket-public ）：`50100`（API 被凍結）、`50101`（key 與環境不符）、`50105`（passphrase 錯）、`50111`（key 錯）、`50113`（簽名錯）、`50119`（key 不存在）；WS 登入 `60005`、`60007`、`60024`、`60032`。刻意不列：`50110`（拒絕的是出口 IP，不是憑證，出口恢復後應自行重連）、`50114`、`50120`（只針對單一功能）、`50103`／`50104`／`50106`／`50107`（本機 header 錯誤）、`60009`、`63999`、`60011`、`60026`、`60031`，一律當暫時性錯誤。時間戳類的碼（`50102`、`50112`、`60004`、`60006`）仍是 `ClockSkew`，不是 `AuthFailed`。未驗證：真實 OKX 憑證錯誤時 WS 登入是回上列具體碼還是泛用的 `60009`，列入測試網手動驗證。
+    - 實作與表格測試：`exchange/src/trade/stream/driver.rs` 的 `classify_rest`、`login_step`。
   - 驗證：狀態機測試，每個狀態下哪些動作允許、哪些拒絕。手動：測試網斷網 30 秒後恢復，確認重新同步完成前不能新進場。
 - **52（b）**：私有事件是不受信任的輸入：不得 `unwrap`、不得 panic；數值以十進位字串解析，不經過 f32；未知事件型別只記型別名稱並忽略；未知訂單狀態一律觸發重新同步，不猜測語意。單一 frame 大小上限沿用既有 WS 設定（是否有上限**未核對**）。
   - 依據：R7。adapter task 崩潰會讓私有流中斷，而 UI 未必察覺。
@@ -459,3 +463,14 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 - **重複 API key**：`ApiCredentials::same_key_as` 只比對 key；GUI 儲存前以 `check_key_not_bound` 檢查同 venue／env／product 的其他帳戶，Keychain 讀取失敗視為無法驗證而拒絕。driver 以程序內 `key_claims`（SHA-256 摘要為 key）防止兩個帳戶共用同一把 key 的 listenKey。
 - **Unknown store I/O**：拒絕 symlink 與非一般檔案（FIFO），rename 後 fsync 目錄；GUI 使用 `*_async`（`spawn_blocking`）包裝。殘餘風險：檢查後才被換成 FIFO 仍可能卡住（未用 `O_NONBLOCK`）。
 - **冪等**：同一紀錄重複 `lock_from_record` 只需一次釋放。
+
+## c2b0-2 補充：給 GUI 接線的 exchange 縫
+
+這些只加縫，不開放下單：`LIVE_SENDING_ENABLED` 仍為 false；host 白名單、https_only、redirect none、proxy fail closed 與 Keychain 都沒改。以下型別維持不可 `Clone`：`ClientId`、請求、`Prepared`、`ConfirmToken`、`Submitted`、`PendingUnknown`、`ApprovedOrder`、`EquityTracker`。
+
+- **Send**：`RiskHook: Sealed + Sync`、`UnknownJournal: Sync`，所以 `submit`／`submit_auto`／`resolve_unknown`／`cancel_all`／`flatten`／`auto_close` 的 future 是 `Send`（測試 `every_send_path_future_is_send` 在編譯期檢查）。`G: SendGate` 沒有 `Sync` 約束，GUI 的 gate 實作（`SessionGate`）自己要是 `Sync`，future 才會是 `Send`。
+- **`SharedRisk`**：第二個 sealed `RiskHook`，持有 `Arc<Mutex<EquityTracker>>` 與注入的時間來源，可 `Clone`（同一個 tracker）。判斷邏輯與 `RiskSnapshot` 共用同一個函式 `check_entry`，不會分歧（對照測試 `the_shared_hook_judges_exactly_like_the_snapshot`）。鎖只在各方法內取、不跨 `.await`（方法都是同步的）。**鎖 poisoned 時 fail closed**：進場回 `RiskRefusal::StateUnavailable`，平倉、撤單照常通過（條件 72）；會改狀態的方法回 `Err(RiskPoisoned)`，GUI 要顯示成風控狀態不可用。快照與事件走 `snapshot_applied`／`observe`／`set_positions`／`set_limits`，同一把鎖。`RiskRefusal` 新增 `StateUnavailable`（`data` 的風控日誌對應為 `state_unavailable`）。
+- **`StreamCloser`**：`PrivateStream::closer()` 回傳可 `Clone` 的控制把手，`shutdown(&self)` 與 `PrivateStream::shutdown(self)` 語意相同（等 listenKey DELETE 回覆才回傳）。冪等：supervisor 只處理一次 shutdown，之後的呼叫（含同時發出的）不再送 DELETE。**殘餘風險／用法**：stream 已被 drop（subscription 已移除）或已結束時，closer 立即回傳且不關 listenKey，所以必須在移除 subscription **之前** `await closer.shutdown()`，再刪 Keychain。
+- **送出值預覽與權杖雜湊（條件 69）**：`OrderIntent::preview() -> OrderPreview`（可 `Clone`、唯讀）列出 builder 取整後的實際參數：Binance 依送出順序，OKX 的 JSON body 攤平（`attachAlgoOrds[0].slTriggerPx`）並依名稱排序。client id 只顯示末四碼（`…AAAA`）；簽名、timestamp、憑證不在其中。`ConfirmToken::for_preview(&preview)` 綁定預覽的 SHA-256（涵蓋帳戶、產品、method、path、symbol 與完整參數，含完整 client id）；`approve` 內比對，不符回 `SubmitError::ConfirmationMismatch`，什麼都不送。雜湊欄位是 crate 私有，複製後被改過的預覽仍只能確認原本的請求。重建請求（連 client id 都會變）就需要重新確認。
+- **取消全部／全平**：`ConfirmToken::for_bulk()`。訂單權杖不能用在 `cancel_all`／`flatten`，批次權杖也不能用在 `submit`（皆拒絕）。`ConfirmToken::user_confirmed()`（沒有綁定的權杖）已移除。
+- **測試對應**：`the_preview_equals_the_form_the_binance_server_receives`、`the_preview_equals_the_json_the_okx_server_receives`（逐欄比對假伺服器收到的 body）、`a_token_for_another_quantity_is_refused_and_nothing_is_sent`、`a_token_for_another_client_id_or_another_kind_of_action_is_refused`、`a_closer_*`、`two_racing_closers_*`、`a_poisoned_shared_hook_*`。

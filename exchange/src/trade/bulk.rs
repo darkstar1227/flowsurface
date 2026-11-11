@@ -6,7 +6,7 @@
 use super::binance_futures as fut;
 use super::client::{OpenKind, OpenOrder, Position, ReadError, TradeClient};
 use super::client_id::{ClientId, Role};
-use super::gate::{AutoIntent, ConfirmToken, OrderIntent, RiskHook, SendGate, Spent};
+use super::gate::{AutoIntent, BulkAction, ConfirmToken, OrderIntent, RiskHook, SendGate, Spent};
 use super::journal::UnknownJournal;
 use super::okx::{self, OkxAlgoType};
 use super::outcome::Outcome;
@@ -159,7 +159,11 @@ impl TradeClient {
             gate,
             risk,
             journal,
-            &Route::User(confirm.spend()),
+            &Route::User(
+                confirm
+                    .spend_bulk(self.account, BulkAction::CancelAll)
+                    .map_err(|_| BulkError::Trade(TradeError::Unsupported))?,
+            ),
             table,
             true,
         )
@@ -271,7 +275,11 @@ impl TradeClient {
             gate,
             risk,
             journal,
-            &Route::User(confirm.spend()),
+            &Route::User(
+                confirm
+                    .spend_bulk(self.account, BulkAction::Flatten)
+                    .map_err(|_| BulkError::Trade(TradeError::Unsupported))?,
+            ),
             table,
             margin,
             true,

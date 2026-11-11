@@ -178,6 +178,15 @@ impl BinanceRequest {
         self.path
     }
 
+    /// Every parameter with its value, in the order they are signed and sent (the preview, and
+    /// its hash, are made from this).
+    pub(crate) fn preview_fields(&self) -> Vec<(String, String)> {
+        self.params
+            .iter()
+            .map(|(n, v)| ((*n).to_string(), v.clone()))
+            .collect()
+    }
+
     /// Parameter names in order (for tests and audit; values are not exposed here).
     pub fn param_names(&self) -> Vec<&'static str> {
         self.params.iter().map(|(n, _)| *n).collect()
@@ -336,6 +345,16 @@ impl OkxRequest {
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// The JSON body flattened into name and value pairs (see `preview`).
+    pub(crate) fn preview_fields(&self) -> Vec<(String, String)> {
+        match &self.body {
+            Some(body) => serde_json::to_value(body)
+                .map(|v| super::preview::flatten_json(&v))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     /// Serialise the body once, sign that exact string, and return both.

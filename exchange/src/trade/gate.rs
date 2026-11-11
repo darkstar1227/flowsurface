@@ -29,6 +29,7 @@
 //! async fn go(c: &TradeClient, a: ApprovedOrder) { let _ = c.send_approved(a).await; }
 //! ```
 
+use super::preview::{OrderPreview, PreviewHash};
 use super::request::{BinanceRequest, Exposure, Method, OkxRequest};
 use super::rules::{FreshRules, SymbolRules, TradeProduct};
 use super::stream::{StreamState, TradeAction, allows, stream_state_for};
@@ -176,6 +177,25 @@ impl OrderIntent {
             Prepared::Okx(r) => r.client_ids(),
         }
     }
+
+    /// The request as it will be sent, for the confirmation window (condition 69): the values
+    /// are the builder's, after rounding. Read-only; give it to
+    /// [`ConfirmToken::for_preview`] when the user confirms.
+    pub fn preview(&self) -> OrderPreview {
+        let (method, path, fields) = match &self.prepared {
+            Prepared::Binance(r) => (r.method(), r.path(), r.preview_fields()),
+            Prepared::Okx(r) => (r.method(), r.path(), r.preview_fields()),
+        };
+        OrderPreview::build(
+            self.account,
+            self.rules.product(),
+            method,
+            path,
+            &self.symbol,
+            self.exposure(),
+            fields,
+        )
+    }
 }
 
 // ── Gate, risk, confirmation ────────────────────────────────────────────
@@ -263,6 +283,8 @@ pub enum RiskRefusal {
     /// The account's private stream sent a new snapshot that the risk tracker has not applied
     /// yet: its positions and equity are from before the reconnect.
     SnapshotNotApplied,
+    /// The shared risk state is unusable (its lock was poisoned): no entries.
+    StateUnavailable,
 }
 
 /// Local risk controls (`risk::RiskSnapshot` is the implementation the app wires). Only
@@ -281,7 +303,7 @@ pub enum RiskRefusal {
 ///     fn check(&self, _: &RiskView<'_>) -> Result<(), RiskRefusal> { Ok(()) }
 /// }
 /// ```
-pub trait RiskHook: sealed::Sealed {
+pub trait RiskHook: sealed::Sealed + Sync {
     fn check(&self, view: &RiskView<'_>) -> Result<(), RiskRefusal>;
 }
 
@@ -289,32 +311,104 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
-/// The user's confirmation of one order. Single use: `submit` takes it by value, so a second
-/// confirmation of the same order needs a second token (condition 61). The confirmation
-/// window (segment c) is the only place that should call [`ConfirmToken::user_confirmed`].
+/// What a confirmation covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Binding {
+    /// One request, by the hash of its preview.
+    Order(PreviewHash),
+    /// A cancel-all or a close-all of one account: the requests are built from the account's
+    /// open orders and positions when it runs, so there is no single request to preview.
+    Bulk(AccountKey, BulkAction),
+}
+
+/// Which bulk action a [`ConfirmToken::for_bulk`] confirmation is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkAction {
+    CancelAll,
+    Flatten,
+}
+
+/// The user's confirmation. Single use: `submit` takes it by value, so a second confirmation
+/// of the same order needs a second token (condition 61). It is bound to what the user saw: a
+/// token from [`ConfirmToken::for_preview`] is accepted only for the request that preview came
+/// from, and not for a cancel-all or close-all (and the reverse). The confirmation window
+/// (segment c) is the only place that should make one.
+///
+/// ```compile_fail,E0599
+/// use flowsurface_exchange::trade::ConfirmToken;
+/// // There is no unbound token.
+/// let _ = ConfirmToken::user_confirmed();
+/// ```
 #[derive(Debug)]
-pub struct ConfirmToken(());
+pub struct ConfirmToken(Binding);
 
 impl ConfirmToken {
-    pub fn user_confirmed() -> Self {
-        ConfirmToken(())
+    /// The user confirmed the order shown in `preview`.
+    pub fn for_preview(preview: &OrderPreview) -> Self {
+        ConfirmToken(Binding::Order(preview.hash))
     }
 
-    pub(crate) fn spend(self) -> Spent {
-        Spent(())
+    /// The user confirmed `action` for `account`. The token is refused for any other account
+    /// or the other bulk action.
+    pub fn for_bulk(account: AccountKey, action: BulkAction) -> Self {
+        ConfirmToken(Binding::Bulk(account, action))
+    }
+
+    /// For `submit`: only an order confirmation counts.
+    pub(crate) fn spend_order(self) -> Result<Spent, ConfirmationMismatch> {
+        match self.0 {
+            Binding::Order(h) => Ok(Spent(Kind::Order(h))),
+            Binding::Bulk(..) => Err(ConfirmationMismatch),
+        }
+    }
+
+    /// For `cancel_all` and `flatten`: only a bulk confirmation for this account and this
+    /// action counts.
+    pub(crate) fn spend_bulk(
+        self,
+        account: AccountKey,
+        action: BulkAction,
+    ) -> Result<Spent, ConfirmationMismatch> {
+        match self.0 {
+            Binding::Bulk(a, act) if a == account && act == action => Ok(Spent(Kind::Bulk)),
+            Binding::Bulk(..) | Binding::Order(_) => Err(ConfirmationMismatch),
+        }
     }
 }
 
-/// A confirmation that has been used up. Only [`ConfirmToken::spend`] (a user confirmation) or
-/// [`Spent::pre_authorised`] (an automatic path) makes one. `Clone` so one confirmation can
-/// cover the several requests of a cancel-all or close-all.
+/// The confirmation is not for this kind of action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConfirmationMismatch;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Order(PreviewHash),
+    Bulk,
+    Auto,
+}
+
+/// A confirmation that has been used up. Only [`ConfirmToken::spend_order`] /
+/// [`ConfirmToken::spend_bulk`] (a user confirmation) or [`Spent::pre_authorised`] (an
+/// automatic path) makes one. `Clone` so one confirmation can cover the several requests of a
+/// cancel-all or close-all.
 #[derive(Debug, Clone)]
-pub(crate) struct Spent(());
+pub(crate) struct Spent(Kind);
 
 impl Spent {
     /// For the three automatic paths, which `AutoIntent` already restricts to reducing.
     pub(crate) fn pre_authorised() -> Self {
-        Spent(())
+        Spent(Kind::Auto)
+    }
+
+    /// Does this confirmation cover `intent`? An order confirmation covers only the request it
+    /// was made for.
+    fn covers(&self, intent: &OrderIntent) -> bool {
+        match self.0 {
+            Kind::Order(h) => h == intent.preview().hash,
+            // A bulk confirmation never covers a request that adds exposure.
+            Kind::Bulk => !matches!(intent.exposure(), Exposure::Adds { .. }),
+            Kind::Auto => true,
+        }
     }
 }
 
@@ -383,6 +477,9 @@ pub enum SubmitError<R> {
     Malformed(TradeError),
     /// The intent was built for another account than the client that was asked to send it.
     AccountMismatch,
+    /// The confirmation was made for another request than this one (its preview hash differs,
+    /// or it is a cancel-all / close-all confirmation). Nothing was sent.
+    ConfirmationMismatch,
 }
 
 /// An order that passed the gate. No `Clone`, no public constructor: only [`approve`] makes
@@ -403,11 +500,14 @@ impl fmt::Debug for ApprovedOrder {
 pub(crate) fn approve<G: SendGate>(
     gate: &G,
     risk: &dyn RiskHook,
-    _confirmation: Spent,
+    confirmation: Spent,
     intent: OrderIntent,
     now_ms: i64,
     target: Target,
 ) -> Result<ApprovedOrder, SubmitError<G::Refusal>> {
+    if !confirmation.covers(&intent) {
+        return Err(SubmitError::ConfirmationMismatch);
+    }
     target.check(&intent)?;
     let exposure = intent.exposure();
     let class = match exposure {
