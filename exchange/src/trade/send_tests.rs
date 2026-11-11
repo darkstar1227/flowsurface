@@ -210,6 +210,14 @@ impl SendGate for OpenGate {
     }
 }
 
+struct ClosedGate;
+impl SendGate for ClosedGate {
+    type Refusal = &'static str;
+    fn check(&self, _: GateRequest) -> Result<(), &'static str> {
+        Err("closed")
+    }
+}
+
 fn set_stream(c: &TradeClient, st: super::stream::StreamState) {
     super::stream::status::set_for_test(c.account(), st);
 }
@@ -1608,6 +1616,73 @@ async fn cancel_all_keeps_going_after_one_symbol_fails_and_still_requeries() {
     assert!(!rep.is_clear());
     assert_eq!(fake.count("DELETE /fapi/v1/allOpenOrders"), 1);
     assert_eq!(fake.count("GET /fapi/v1/openOrders"), 2);
+}
+
+/// A gate that refuses every request: cancel all writes nothing and counts each cancel as failed.
+#[tokio::test]
+async fn cancel_all_under_a_closed_gate_writes_nothing_and_reports_failed() {
+    let fake = serve(|m, p| match (m, p) {
+        ("GET", "/fapi/v1/openOrders") => (
+            200,
+            json!([{"symbol": "BTCUSDT", "orderId": 1}]).to_string(),
+        ),
+        ("GET", "/fapi/v1/openAlgoOrders") => (200, "[]".to_string()),
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let rep = c
+        .cancel_all(
+            &ClosedGate,
+            &NoRisk,
+            &NoJournal,
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
+            &futures(),
+        )
+        .await
+        .unwrap();
+    assert!(rep.failed >= 1, "{rep:?}");
+    assert_eq!(rep.sent, 0);
+    assert!(!rep.is_clear());
+    assert_eq!(fake.count("DELETE /fapi/v1/allOpenOrders"), 0);
+    assert!(
+        fake.all().iter().all(|r| r.starts_with("GET ")),
+        "only reads: {:?}",
+        fake.all()
+    );
+}
+
+#[tokio::test]
+async fn flatten_under_a_closed_gate_writes_nothing_and_reports_failed() {
+    let fake = serve(|m, p| match (m, p) {
+        ("GET", "/fapi/v3/positionRisk") => (
+            200,
+            json!([{"symbol": "BTCUSDT", "positionAmt": "-0.002", "positionSide": "BOTH",
+                    "marginType": "cross", "leverage": "10"}])
+            .to_string(),
+        ),
+        _ => (404, "{}".to_string()),
+    });
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let rep = c
+        .flatten(
+            &ClosedGate,
+            &NoRisk,
+            &NoJournal,
+            ConfirmToken::for_bulk(c.account(), BulkAction::Flatten),
+            &futures(),
+            MarginMode::Cross,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rep.failed, 1, "{rep:?}");
+    assert_eq!(rep.sent, 0);
+    assert!(!rep.is_clear());
+    assert_eq!(fake.count("POST /fapi/v1/order"), 0);
+    assert!(
+        fake.all().iter().all(|r| r.starts_with("GET ")),
+        "only reads: {:?}",
+        fake.all()
+    );
 }
 
 #[tokio::test]
@@ -4181,12 +4256,18 @@ async fn a_bulk_token_for_another_account_sends_nothing() {
     let res = b
         .cancel_all(&OpenGate, &NoRisk, &NoJournal, token, &t)
         .await;
-    assert!(res.is_err());
+    assert!(
+        matches!(res, Err(crate::trade::BulkError::ConfirmationMismatch)),
+        "{res:?}"
+    );
     let token = ConfirmToken::for_bulk(a.account(), BulkAction::Flatten);
     let res = b
         .flatten(&OpenGate, &NoRisk, &NoJournal, token, &t, MarginMode::Cross)
         .await;
-    assert!(res.is_err());
+    assert!(
+        matches!(res, Err(crate::trade::BulkError::ConfirmationMismatch)),
+        "{res:?}"
+    );
     assert!(fake.all().is_empty(), "{:?}", fake.all());
 }
 
@@ -4205,7 +4286,10 @@ async fn a_cancel_all_token_cannot_flatten_and_the_reverse() {
             MarginMode::Cross,
         )
         .await;
-    assert!(res.is_err());
+    assert!(
+        matches!(res, Err(crate::trade::BulkError::ConfirmationMismatch)),
+        "{res:?}"
+    );
     let res = c
         .cancel_all(
             &OpenGate,
@@ -4215,7 +4299,10 @@ async fn a_cancel_all_token_cannot_flatten_and_the_reverse() {
             &t,
         )
         .await;
-    assert!(res.is_err());
+    assert!(
+        matches!(res, Err(crate::trade::BulkError::ConfirmationMismatch)),
+        "{res:?}"
+    );
     assert!(fake.all().is_empty(), "{:?}", fake.all());
 }
 

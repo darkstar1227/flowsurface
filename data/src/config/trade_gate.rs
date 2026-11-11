@@ -309,6 +309,39 @@ mod tests {
         assert_eq!(run(true, &m, Some(&good(&m))), Ok(()));
     }
 
+    /// Cancel all and close all send reducing requests: a Live account is refused for those too
+    /// while the switch is off, so `cancel_all` / `flatten` under this gate write nothing.
+    #[test]
+    fn a_live_account_is_refused_for_reducing_requests_too() {
+        let m = meta(
+            AccountVenue::Binance,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+        );
+        let entry = good(&m);
+        let keychain = Ok(m.identity());
+        let gate = SessionGate {
+            session: Some(&entry),
+            keychain: &keychain,
+            saved: &m,
+            proxy_ok: true,
+        };
+        for class in [GateClass::Reduce, GateClass::Entry] {
+            let request = GateRequest {
+                account: AccountKey::from_bytes(*m.id.as_bytes()),
+                venue: m.venue,
+                env: m.env,
+                product: m.product,
+                class,
+                contract: true,
+            };
+            assert_eq!(
+                gate.check(request),
+                Err(GateRejection::LiveTradingNotYetEnabled)
+            );
+        }
+    }
+
     #[test]
     fn verdict_rules_by_environment() {
         let cases = [

@@ -1,6 +1,8 @@
-//! Trading state of the GUI (M5 c2b-1): startup, private streams, account state, standing
-//! alerts. **No order is sent from here**: nothing in this module calls `submit`, `cancel_all`,
-//! `flatten` or `auto_close`, and the only requests it makes are signed reads (equity).
+//! Trading state of the GUI (M5 c2b-1, c2b-3): startup, private streams, account state, saved
+//! unresolved sends and their phases, standing alerts. **No order is sent from here**: nothing in
+//! this module calls `submit`, `cancel_all`, `flatten`, `resolve_unknown` or `auto_close`
+//! (the background steps that do are in `order_flow` and `account_flow`), and the only requests
+//! it makes are signed reads (equity).
 //!
 //! Everything is held in memory. Nothing of it is written to `saved-state.json` (condition
 //! 78); the risk settings that are saved live in `AccountMeta::risk`.
@@ -58,7 +60,7 @@ pub fn account_key(id: Uuid) -> AccountKey {
 // ── Messages ────────────────────────────────────────────────────────────
 
 /// Carries no credential, listenKey or client id: `StreamOutput` and `StreamKey` print neither,
-/// and the boot report holds no client id.
+/// and the boot report's records print a redacted `Debug`.
 #[derive(Debug, Clone)]
 pub enum Message {
     Booted(BootReport),
@@ -82,7 +84,23 @@ pub struct Effects {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoadFailed;
 
-/// A saved record as the user may see it: no client id.
+/// Where a saved record stands in this run (c2b-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordPhase {
+    /// Waits for the account's connection test of this session: no client exists yet, so the
+    /// order cannot be looked up. The symbol stays locked ("pending verification").
+    AwaitingTest,
+    /// The lookup by client id is running.
+    Looking,
+    /// The lookup ended without an answer. Locked until released by hand or until restart.
+    StillUnknown,
+    /// An invalid record the user dropped from the file. The exchange layer still blocks the
+    /// account's new entries until restart, so the view keeps blocking them too.
+    Discarded,
+}
+
+/// A saved record. The record carries its client id (needed to look it up, release or discard
+/// it); its `Debug` hides the id, and nothing here is ever shown with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordView {
     pub account: AccountKey,
@@ -90,6 +108,106 @@ pub struct RecordView {
     /// `Some`: the record could not be turned into a lock by symbol. It is kept, and entries
     /// of its account stay blocked until restart.
     pub error: Option<RestoreError>,
+    pub record: UnknownRecord,
+    pub phase: RecordPhase,
+}
+
+impl RecordView {
+    pub fn new(record: UnknownRecord, error: Option<RestoreError>) -> Self {
+        Self {
+            account: record.account,
+            symbol: record.symbol.clone(),
+            error,
+            record,
+            phase: RecordPhase::AwaitingTest,
+        }
+    }
+}
+
+/// How the lookup of a saved record ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupEnd {
+    /// The exchange knows the order. Not a fill.
+    Found,
+    /// Presumed not placed. Nothing was resent.
+    NotPlaced,
+    /// No answer, or the lookup could not be set up. The lock stays.
+    StillUnknown,
+}
+
+/// What the unknown list says about one stored record (no client id in the text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordStatus {
+    /// The id is invalid: only discarding is possible; the account is blocked until restart.
+    Invalid,
+    /// Restored at startup; verified only after this session's test of the account.
+    AwaitingTest,
+    Looking,
+    /// The lookup found nothing conclusive; only a manual release or a restart clears it.
+    StillUnknown,
+    /// Made by a send of this run whose result stayed unknown.
+    SessionUnknown,
+}
+
+impl RecordStatus {
+    pub fn text(self) -> &'static str {
+        match self {
+            RecordStatus::Invalid => {
+                "Invalid id, kept. The account is blocked for new entries until the app restarts."
+            }
+            RecordStatus::AwaitingTest => {
+                "Pending verification: test the account in Exchange accounts first. The symbol \
+                 stays locked."
+            }
+            RecordStatus::Looking => "Looking it up on the exchange…",
+            RecordStatus::StillUnknown => {
+                "Still unknown after the lookups. The symbol stays locked until you release it \
+                 by hand or the app restarts."
+            }
+            RecordStatus::SessionUnknown => {
+                "Result unknown (a send of this run). The symbol stays locked until you release \
+                 it by hand or the app restarts."
+            }
+        }
+    }
+
+    /// The user may start a manual release (a valid id, and no lookup running). Not before the
+    /// account's test of this session: the test is followed by an automatic lookup, which may
+    /// find the order on the exchange, and a release before it would skip that.
+    pub fn may_release(self) -> bool {
+        matches!(
+            self,
+            RecordStatus::StillUnknown | RecordStatus::SessionUnknown
+        )
+    }
+
+    pub fn may_discard(self) -> bool {
+        self == RecordStatus::Invalid
+    }
+}
+
+/// An account as the user is told about it. Two saved accounts with the same alias (a saved
+/// state made before duplicates were refused) are told apart by venue and the end of the id.
+pub fn display_name(saved: &[AccountMeta], meta: &AccountMeta) -> String {
+    let same = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
+    let duplicated = saved
+        .iter()
+        .any(|o| o.id != meta.id && same(&o.alias, &meta.alias));
+    if duplicated {
+        let id = meta.id.simple().to_string();
+        let tail = id.get(id.len().saturating_sub(4)..).unwrap_or(&id);
+        format!("{} [{} …{tail}]", meta.alias, meta.venue)
+    } else {
+        meta.alias.clone()
+    }
+}
+
+/// The name of the saved account behind an exchange-layer account key.
+pub fn name_of(saved: &[AccountMeta], account: AccountKey) -> Option<String> {
+    saved
+        .iter()
+        .find(|m| account_key(m.id) == account)
+        .map(|m| display_name(saved, m))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,11 +238,7 @@ pub fn plan_boot(
             journal_unreadable: false,
             records: records
                 .iter()
-                .map(|r| RecordView {
-                    account: r.account,
-                    symbol: r.symbol.clone(),
-                    error: lock(r).err(),
-                })
+                .map(|r| RecordView::new(r.clone(), lock(r).err()))
                 .collect(),
         },
     }
@@ -415,6 +529,9 @@ pub struct TradingState {
     pairs: BTreeMap<(Uuid, String), PairState>,
     /// Sends that are going now, kept apart so finishing one never erases an unresolved result.
     inflight: BTreeSet<(Uuid, String)>,
+    /// Accounts with a cancel-all or close-all running: no other order of the account is
+    /// prepared or sent meanwhile.
+    bulk_running: BTreeSet<Uuid>,
 }
 
 /// What blocks the buttons of one (account, symbol) (condition 61).
@@ -423,7 +540,7 @@ pub enum PairState {
     /// A send (and the lookup that follows an unknown result) is running.
     InFlight,
     /// The result stayed unknown after the lookups: the symbol is locked for entries until
-    /// the app restarts (manual release and discard come with c2b-3).
+    /// the user releases it by hand (c2b-3) or the app restarts.
     Unresolved,
 }
 
@@ -440,6 +557,7 @@ impl TradingState {
             journal_failed: false,
             pairs: BTreeMap::new(),
             inflight: BTreeSet::new(),
+            bulk_running: BTreeSet::new(),
         }
     }
 
@@ -491,6 +609,162 @@ impl TradingState {
         self.accounts
             .get(&id)
             .map_or(&[], |rt| rt.orders.as_slice())
+    }
+
+    /// The positions of the last snapshot and the events after it (may be stale: see
+    /// `lists_stale`).
+    pub fn positions(&self, id: Uuid) -> &[HeldPosition] {
+        self.accounts
+            .get(&id)
+            .map_or(&[], |rt| rt.positions.as_slice())
+    }
+
+    /// The order and position lists may not match the exchange: no stream, one that is not
+    /// synchronised, or none whose snapshot was applied since it last connected.
+    pub fn lists_stale(&self, id: Uuid) -> bool {
+        self.accounts.get(&id).is_none_or(|rt| {
+            rt.state != Some(StreamState::Connected) || !rt.book_trusted || rt.needs_retest
+        })
+    }
+
+    /// The reason of the account's risk lock, when one is on.
+    pub fn trip_reason(&self, id: Uuid) -> Option<&'static str> {
+        match self.accounts.get(&id)?.risk.is_tripped() {
+            Ok(Some(reason)) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The user acknowledged the risk lock (after a confirmation step in the GUI).
+    pub fn acknowledge_trip(&mut self, id: Uuid) -> bool {
+        let Some(rt) = self.accounts.get_mut(&id) else {
+            return false;
+        };
+        let r = rt.risk.acknowledge_trip();
+        let ok = r.is_ok();
+        rt.note_poisoned(r);
+        ok
+    }
+
+    /// The saved "close everything when a limit trips" setting. Status only: this build does
+    /// not run an automatic close.
+    pub fn auto_close_setting(&self, id: Uuid) -> Option<bool> {
+        self.accounts.get(&id).map(|rt| rt.meta.risk.auto_close)
+    }
+
+    pub fn begin_bulk(&mut self, id: Uuid) {
+        self.bulk_running.insert(id);
+    }
+
+    pub fn finish_bulk(&mut self, id: Uuid) {
+        self.bulk_running.remove(&id);
+    }
+
+    pub fn bulk_running(&self, id: Uuid) -> bool {
+        self.bulk_running.contains(&id)
+    }
+
+    /// What the unknown list says about a stored record.
+    pub fn record_status(&self, id: Uuid, record: &UnknownRecord) -> RecordStatus {
+        if !record.has_valid_client_id() {
+            return RecordStatus::Invalid;
+        }
+        // A bulk run looks its unknown sends up and writes their records meanwhile: until it
+        // ends, nothing of this account may be released by hand.
+        if self.bulk_running.contains(&id) {
+            return RecordStatus::Looking;
+        }
+        let kept = self.boot.as_ref().and_then(|b| {
+            b.records
+                .iter()
+                .find(|r| r.account == record.account && r.record.client_id == record.client_id)
+        });
+        match kept {
+            Some(r) if r.error.is_some() => RecordStatus::Invalid,
+            Some(r) => match r.phase {
+                RecordPhase::AwaitingTest => RecordStatus::AwaitingTest,
+                RecordPhase::Looking => RecordStatus::Looking,
+                RecordPhase::StillUnknown | RecordPhase::Discarded => RecordStatus::StillUnknown,
+            },
+            None => match self.pair_state(id, &record.symbol) {
+                Some(PairState::InFlight) => RecordStatus::Looking,
+                _ => RecordStatus::SessionUnknown,
+            },
+        }
+    }
+
+    /// The account was tested and may be used: the saved records of it that have a valid id and
+    /// no lookup running are looked up now (once; a second call while they run gives none). A
+    /// record with an invalid id is never looked up.
+    pub fn begin_lookup(&mut self, id: Uuid) -> Vec<UnknownRecord> {
+        let account = account_key(id);
+        let Some(boot) = self.boot.as_mut() else {
+            return Vec::new();
+        };
+        boot.records
+            .iter_mut()
+            .filter(|r| {
+                r.account == account
+                    && r.error.is_none()
+                    && matches!(
+                        r.phase,
+                        RecordPhase::AwaitingTest | RecordPhase::StillUnknown
+                    )
+            })
+            .map(|r| {
+                r.phase = RecordPhase::Looking;
+                r.record.clone()
+            })
+            .collect()
+    }
+
+    /// A lookup ended. An answer drops the record from the locked list (the exchange layer
+    /// already released its lock and cleared the file); no answer keeps it locked.
+    pub fn lookup_finished(&mut self, record: &UnknownRecord, end: LookupEnd) {
+        let Some(boot) = self.boot.as_mut() else {
+            return;
+        };
+        let same =
+            |r: &RecordView| r.account == record.account && r.record.client_id == record.client_id;
+        match end {
+            LookupEnd::Found | LookupEnd::NotPlaced => boot.records.retain(|r| !same(r)),
+            LookupEnd::StillUnknown => {
+                for r in boot.records.iter_mut().filter(|r| same(r)) {
+                    r.phase = RecordPhase::StillUnknown;
+                }
+            }
+        }
+    }
+
+    /// The user released a send by hand and its saved record was removed. The symbol stops
+    /// counting as unknown unless another saved record still names it (`still_stored`).
+    pub fn record_released(&mut self, id: Uuid, symbol: &str, client_id: &str, still_stored: bool) {
+        let account = account_key(id);
+        if let Some(boot) = self.boot.as_mut() {
+            boot.records
+                .retain(|r| !(r.account == account && r.record.client_id == client_id));
+        }
+        if !still_stored {
+            let key = (id, symbol.to_string());
+            if self.pairs.get(&key) == Some(&PairState::Unresolved) {
+                self.pairs.remove(&key);
+            }
+        }
+    }
+
+    /// An invalid record was dropped from the file. The account stays blocked until restart
+    /// (the exchange layer keeps its block), so the record stays here as `Discarded`.
+    pub fn record_discarded(&mut self, id: Uuid, client_id: &str) {
+        let account = account_key(id);
+        if let Some(boot) = self.boot.as_mut() {
+            for r in boot
+                .records
+                .iter_mut()
+                .filter(|r| r.account == account && r.record.client_id == client_id)
+            {
+                r.phase = RecordPhase::Discarded;
+            }
+        }
     }
 
     /// A saved unresolved send locks the (account, symbol) (or the whole account) until restart.
@@ -937,8 +1211,13 @@ fn no_limits_set(r: &AccountRiskSettings) -> bool {
 }
 
 /// Every alert that must stay on screen (a toast fades). Shown in the main window and in
-/// popouts. A pure function of the state, so a table of states can be tested.
-pub fn standing_alerts(state: &TradingState, session: &TradeSession) -> Vec<Alert> {
+/// popouts. A pure function of the state, so a table of states can be tested. `saved` is the
+/// saved account list: names come from it (L1), not from the accounts tested this run.
+pub fn standing_alerts(
+    state: &TradingState,
+    session: &TradeSession,
+    saved: &[AccountMeta],
+) -> Vec<Alert> {
     let mut out = Vec::new();
 
     if let Some(boot) = &state.boot {
@@ -950,25 +1229,47 @@ pub fn standing_alerts(state: &TradingState, session: &TradeSession) -> Vec<Aler
             ));
         }
         for rec in &boot.records {
-            let who = state
-                .accounts
-                .values()
-                .find(|rt| rt.account() == rec.account)
-                .map_or("an account", |rt| rt.meta.alias.as_str());
-            out.push(match rec.error {
-                Some(_) => alert(
+            let who = name_of(saved, rec.account).unwrap_or_else(|| "an account".to_string());
+            out.push(match (rec.error, rec.phase) {
+                (_, RecordPhase::Discarded) => alert(
                     Severity::Error,
                     format!(
-                        "A saved unresolved order of {who} ({}) has an invalid id and was kept: \
-                         all new entries of this account are blocked until the app restarts.",
+                        "A saved record of {who} ({}) with an invalid id was discarded: all new \
+                         entries of this account stay blocked until the app restarts.",
                         rec.symbol
                     ),
                 ),
-                None => alert(
+                (Some(_), _) => alert(
+                    Severity::Error,
+                    format!(
+                        "A saved unresolved order of {who} ({}) has an invalid id and was kept: \
+                         all new entries of this account are blocked until the app restarts. \
+                         You can discard the record in the Order ticket.",
+                        rec.symbol
+                    ),
+                ),
+                (None, RecordPhase::AwaitingTest) => alert(
                     Severity::Warning,
                     format!(
                         "An unresolved order of {who} ({}) was restored: this symbol stays \
-                         locked for new entries.",
+                         locked for new entries. It is looked up after you test the account.",
+                        rec.symbol
+                    ),
+                ),
+                (None, RecordPhase::Looking) => alert(
+                    Severity::Warning,
+                    format!(
+                        "An unresolved order of {who} ({}) is being looked up: this symbol \
+                         stays locked for new entries.",
+                        rec.symbol
+                    ),
+                ),
+                (None, RecordPhase::StillUnknown) => alert(
+                    Severity::Error,
+                    format!(
+                        "An unresolved order of {who} ({}) is still unknown after the lookups: \
+                         this symbol stays locked. Check the exchange, then release it in the \
+                         Order ticket or restart the app.",
                         rec.symbol
                     ),
                 ),
@@ -985,22 +1286,25 @@ pub fn standing_alerts(state: &TradingState, session: &TradeSession) -> Vec<Aler
 
     for ((id, symbol), pair) in &state.pairs {
         if *pair == PairState::Unresolved {
-            let who = state
-                .accounts
-                .get(id)
-                .map_or("an account", |rt| rt.meta.alias.as_str());
+            let who = saved
+                .iter()
+                .find(|m| m.id == *id)
+                .or_else(|| state.accounts.get(id).map(|rt| &rt.meta))
+                .map_or_else(|| "an account".to_string(), |m| display_name(saved, m));
             out.push(alert(
                 Severity::Error,
                 format!(
                     "{who}: the result of an order on {symbol} is unknown. New entries on this \
-                     symbol stay blocked until the app restarts; check the exchange."
+                     symbol stay blocked until you release it by hand (Order ticket) or the app \
+                     restarts; check the exchange."
                 ),
             ));
         }
     }
 
     for rt in state.accounts.values() {
-        let who = rt.meta.alias.as_str();
+        let who_owned = display_name(saved, &rt.meta);
+        let who = who_owned.as_str();
         if rt.needs_retest || (session.get(rt.meta.id).is_none() && rt.state.is_some()) {
             out.push(alert(
                 Severity::Warning,
@@ -1342,7 +1646,7 @@ mod tests {
         let _ = t.on_tested(&m, true, signed());
         assert!(t.runs().is_empty());
         assert_eq!(t.accounts[&m.id].state, Some(StreamState::Unavailable));
-        let alerts = standing_alerts(&t, &session_with(&m));
+        let alerts = standing_alerts(&t, &session_with(&m), &[]);
         assert!(texts(&alerts).contains("spot trading is disabled (not verified"));
     }
 
@@ -1416,7 +1720,7 @@ mod tests {
         assert_eq!(rt.state, Some(StreamState::AuthFailed));
         assert_eq!(rt.generation, 1);
         assert_eq!(rt.current_key(), Some(key));
-        let alerts = standing_alerts(&t, &TradeSession::default());
+        let alerts = standing_alerts(&t, &TradeSession::default(), &[]);
         let all = texts(&alerts);
         assert!(all.contains("credentials were rejected"));
         assert!(all.contains("cancels and closes"));
@@ -1760,9 +2064,9 @@ mod tests {
     fn a_proxy_change_after_the_test_is_a_standing_warning() {
         let (t, m, _) = running();
         let session = session_with(&m);
-        assert!(!texts(&standing_alerts(&t, &session)).contains("proxy setting changed"));
+        assert!(!texts(&standing_alerts(&t, &session, &[])).contains("proxy setting changed"));
         t.set_proxy(ProxyState::Broken);
-        let all = texts(&standing_alerts(&t, &session));
+        let all = texts(&standing_alerts(&t, &session, &[]));
         assert!(all.contains("proxy setting changed"), "{all}");
         assert!(all.contains("test the account again"), "{all}");
     }
@@ -1779,7 +2083,7 @@ mod tests {
         assert_eq!(t.pair_state(m.id, "BTCUSDT"), Some(PairState::InFlight));
         t.finish_send(m.id, "BTCUSDT", false);
         assert_eq!(t.pair_state(m.id, "BTCUSDT"), Some(PairState::Unresolved));
-        assert!(texts(&standing_alerts(&t, &session_with(&m))).contains("is unknown"));
+        assert!(texts(&standing_alerts(&t, &session_with(&m), &[])).contains("is unknown"));
         // Another symbol is untouched, and a send that ends well leaves nothing behind.
         t.begin_send(m.id, "ETHUSDT");
         t.finish_send(m.id, "ETHUSDT", false);
@@ -1863,26 +2167,21 @@ mod tests {
             records: vec![],
         });
         assert!(
-            texts(&standing_alerts(&t, &TradeSession::default()))
+            texts(&standing_alerts(&t, &TradeSession::default(), &[]))
                 .contains("could not be read: all new entries are blocked")
         );
 
         t.on_booted(BootReport {
             journal_unreadable: false,
             records: vec![
-                RecordView {
-                    account: AccountKey::from_bytes([9; 16]),
-                    symbol: "BTCUSDT".into(),
-                    error: None,
-                },
-                RecordView {
-                    account: AccountKey::from_bytes([9; 16]),
-                    symbol: "ETHUSDT".into(),
-                    error: Some(RestoreError::BadClientId),
-                },
+                RecordView::new(record(9, "BTCUSDT", SECRET_CID), None),
+                RecordView::new(
+                    record(9, "ETHUSDT", SECRET_CID),
+                    Some(RestoreError::BadClientId),
+                ),
             ],
         });
-        let alerts = standing_alerts(&t, &TradeSession::default());
+        let alerts = standing_alerts(&t, &TradeSession::default(), &[]);
         let all = texts(&alerts);
         assert!(all.contains("BTCUSDT) was restored"));
         assert!(all.contains("ETHUSDT) has an invalid id"));
@@ -1894,10 +2193,11 @@ mod tests {
     #[test]
     fn alert_for_a_damaged_order_journal() {
         let mut t = booted();
-        assert!(!texts(&standing_alerts(&t, &TradeSession::default())).contains("journal"));
+        assert!(!texts(&standing_alerts(&t, &TradeSession::default(), &[])).contains("journal"));
         t.journal_failed = true;
         assert!(
-            texts(&standing_alerts(&t, &TradeSession::default())).contains("journal is damaged")
+            texts(&standing_alerts(&t, &TradeSession::default(), &[]))
+                .contains("journal is damaged")
         );
     }
 
@@ -1927,7 +2227,7 @@ mod tests {
         ];
         for (state, expect, severity) in cases {
             let _ = t.update(Message::Stream(key, StreamOutput::State(state)), 0);
-            let alerts = standing_alerts(&t, &session);
+            let alerts = standing_alerts(&t, &session, &[]);
             let all = texts(&alerts);
             match expect {
                 Some(word) => {
@@ -1962,7 +2262,7 @@ mod tests {
                 .observe(EquityObservation::rest(at, Decimal::from_int(eq), basis));
         }
         assert!(rt.risk.is_tripped().unwrap().is_some(), "the limit tripped");
-        let all = texts(&standing_alerts(&t, &session_with(&m)));
+        let all = texts(&standing_alerts(&t, &session_with(&m), &[]));
         assert!(all.contains("risk lock (daily_loss)"));
     }
 
@@ -1975,7 +2275,7 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = risk.with_tracker(|_| panic!("poison the tracker"));
         }));
-        let all = texts(&standing_alerts(&t, &session_with(&m)));
+        let all = texts(&standing_alerts(&t, &session_with(&m), &[]));
         assert!(all.contains("risk state is unavailable"));
     }
 
@@ -1983,9 +2283,9 @@ mod tests {
     fn alert_when_no_risk_limit_is_set_and_none_once_one_is() {
         let (mut t, m, _) = running();
         let session = session_with(&m);
-        assert!(texts(&standing_alerts(&t, &session)).contains("main: no risk limits set"));
+        assert!(texts(&standing_alerts(&t, &session, &[])).contains("main: no risk limits set"));
         with_limits(&mut t, &m);
-        assert!(!texts(&standing_alerts(&t, &session)).contains("no risk limits set"));
+        assert!(!texts(&standing_alerts(&t, &session, &[])).contains("no risk limits set"));
     }
 
     #[test]
@@ -1995,18 +2295,20 @@ mod tests {
         let fut = meta("f", AccountVenue::Binance, AccountProduct::UsdM);
         let _ = t.on_tested(&spot, true, signed());
         assert!(
-            !texts(&standing_alerts(&t, &TradeSession::default())).contains("share one exchange")
+            !texts(&standing_alerts(&t, &TradeSession::default(), &[]))
+                .contains("share one exchange")
         );
         let _ = t.on_tested(&fut, true, signed());
         assert!(
-            texts(&standing_alerts(&t, &TradeSession::default())).contains("share one exchange")
+            texts(&standing_alerts(&t, &TradeSession::default(), &[]))
+                .contains("share one exchange")
         );
     }
 
     #[test]
     fn alerts_are_pure_state_and_empty_without_accounts_or_boot_trouble() {
         let t = booted();
-        assert!(standing_alerts(&t, &TradeSession::default()).is_empty());
+        assert!(standing_alerts(&t, &TradeSession::default(), &[]).is_empty());
     }
 
     #[test]
@@ -2023,5 +2325,160 @@ mod tests {
             code.matches(".flatten()").count(),
             "an order flatten call must not appear in trading.rs"
         );
+    }
+
+    // ── Unknown results (c2b-3) ─────────────────────────────────────────
+
+    fn boot_with(records: Vec<UnknownRecord>) -> TradingState {
+        let mut t = TradingState::new(ProxyState::Direct);
+        t.on_booted(plan_boot(Ok(records), || {}, |_| Ok(())));
+        t
+    }
+
+    fn id_of(m: &AccountMeta) -> AccountKey {
+        account_key(m.id)
+    }
+
+    fn rec(m: &AccountMeta, symbol: &str, cid: &str) -> UnknownRecord {
+        UnknownRecord {
+            account: id_of(m),
+            symbol: symbol.into(),
+            client_id: cid.into(),
+            kind: "x".into(),
+            recorded_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_saved_record_is_pending_until_the_account_is_tested_and_is_looked_up_once() {
+        let m = meta("a", AccountVenue::Binance, AccountProduct::UsdM);
+        let r = rec(&m, "BTCUSDT", "eAbc123");
+        let mut t = boot_with(vec![r.clone()]);
+        assert_eq!(t.record_status(m.id, &r), RecordStatus::AwaitingTest);
+        assert!(
+            t.record_status(m.id, &r)
+                .text()
+                .contains("Pending verification")
+        );
+        // The test passed: the record is looked up, once.
+        assert_eq!(t.begin_lookup(m.id), vec![r.clone()]);
+        assert!(t.begin_lookup(m.id).is_empty());
+        assert_eq!(t.record_status(m.id, &r), RecordStatus::Looking);
+        // No answer: still unknown, still locked, and a later test looks again.
+        t.lookup_finished(&r, LookupEnd::StillUnknown);
+        assert_eq!(t.record_status(m.id, &r), RecordStatus::StillUnknown);
+        assert!(t.is_record_locked(m.id, "BTCUSDT"));
+        assert_eq!(t.begin_lookup(m.id).len(), 1);
+        // An answer drops it from the locked list.
+        t.lookup_finished(&r, LookupEnd::Found);
+        assert_eq!(t.record_status(m.id, &r), RecordStatus::SessionUnknown);
+        assert!(t.begin_lookup(m.id).is_empty());
+    }
+
+    /// A release before the account's test would skip the lookup that follows the test.
+    #[test]
+    fn a_record_awaiting_the_test_cannot_be_released_by_hand() {
+        let m = meta("a", AccountVenue::Binance, AccountProduct::UsdM);
+        let r = rec(&m, "BTCUSDT", "eAbc123");
+        let mut t = boot_with(vec![r.clone()]);
+        let st = t.record_status(m.id, &r);
+        assert_eq!(st, RecordStatus::AwaitingTest);
+        assert!(!st.may_release() && !st.may_discard());
+        // After the test and a lookup with no answer the release is open.
+        assert_eq!(t.begin_lookup(m.id).len(), 1);
+        assert!(!t.record_status(m.id, &r).may_release());
+        t.lookup_finished(&r, LookupEnd::StillUnknown);
+        assert!(t.record_status(m.id, &r).may_release());
+    }
+
+    #[test]
+    fn records_of_an_account_with_a_bulk_run_show_as_looking_and_cannot_be_released() {
+        let m = meta("a", AccountVenue::Binance, AccountProduct::UsdM);
+        let other = meta("b", AccountVenue::Binance, AccountProduct::UsdM);
+        let r = rec(&m, "BTCUSDT", "eAbc123");
+        let mut t = boot_with(vec![r.clone()]);
+        t.begin_lookup(m.id);
+        t.lookup_finished(&r, LookupEnd::StillUnknown);
+        assert!(t.record_status(m.id, &r).may_release());
+        t.begin_bulk(m.id);
+        let st = t.record_status(m.id, &r);
+        assert_eq!(st, RecordStatus::Looking);
+        assert!(!st.may_release());
+        // Another account is not affected, and an invalid id is still only discardable.
+        let o = rec(&other, "BTCUSDT", "eAbc123");
+        assert_ne!(t.record_status(other.id, &o), RecordStatus::Looking);
+        let bad = rec(&m, "BTCUSDT", "not valid!");
+        assert_eq!(t.record_status(m.id, &bad), RecordStatus::Invalid);
+        t.finish_bulk(m.id);
+        assert!(t.record_status(m.id, &r).may_release());
+    }
+
+    #[test]
+    fn a_record_with_an_invalid_id_is_never_looked_up_and_can_only_be_discarded() {
+        let m = meta("a", AccountVenue::Binance, AccountProduct::UsdM);
+        let r = rec(&m, "BTCUSDT", "not valid!");
+        let mut t = TradingState::new(ProxyState::Direct);
+        t.on_booted(plan_boot(
+            Ok(vec![r.clone()]),
+            || {},
+            |_| Err(RestoreError::BadClientId),
+        ));
+        assert!(t.begin_lookup(m.id).is_empty());
+        let st = t.record_status(m.id, &r);
+        assert_eq!(st, RecordStatus::Invalid);
+        assert!(st.may_discard() && !st.may_release());
+        // After the discard the record stays listed as blocked, not unlocked.
+        t.record_discarded(m.id, "not valid!");
+        // The block stays: the account still refuses new entries on every symbol.
+        assert!(t.is_record_locked(m.id, "ETHUSDT"));
+        assert!(t.begin_lookup(m.id).is_empty());
+        assert_eq!(t.record_status(m.id, &r), RecordStatus::Invalid);
+    }
+
+    #[test]
+    fn a_manual_release_clears_the_unresolved_pair_unless_another_record_names_it() {
+        let m = meta("a", AccountVenue::Binance, AccountProduct::UsdM);
+        let r = rec(&m, "BTCUSDT", "eAbc123");
+        let mut t = boot_with(vec![r.clone()]);
+        t.finish_send(m.id, "BTCUSDT", true);
+        assert_eq!(t.pair_state(m.id, "BTCUSDT"), Some(PairState::Unresolved));
+        // Another saved record still names the symbol: the pair stays.
+        t.record_released(m.id, "BTCUSDT", "eAbc123", true);
+        assert_eq!(t.pair_state(m.id, "BTCUSDT"), Some(PairState::Unresolved));
+        t.record_released(m.id, "BTCUSDT", "eAbc123", false);
+        assert_eq!(t.pair_state(m.id, "BTCUSDT"), None);
+        assert!(!t.is_record_locked(m.id, "BTCUSDT"));
+    }
+
+    #[test]
+    fn a_duplicate_alias_gets_the_venue_and_the_end_of_the_id_and_others_do_not() {
+        let a = meta("Main", AccountVenue::Binance, AccountProduct::UsdM);
+        let b = meta(" main ", AccountVenue::Okx, AccountProduct::UsdM);
+        let c = meta("other", AccountVenue::Okx, AccountProduct::UsdM);
+        let saved = vec![a.clone(), b.clone(), c.clone()];
+        let shown = display_name(&saved, &a);
+        assert!(
+            shown.starts_with("Main [") && shown.contains("Binance"),
+            "{shown}"
+        );
+        let id = a.id.simple().to_string();
+        assert!(shown.contains(&id[id.len() - 4..]));
+        assert_ne!(shown, display_name(&saved, &b));
+        assert_eq!(display_name(&saved, &c), "other");
+        // The alert and the confirmation name the account from the saved list.
+        assert_eq!(name_of(&saved, id_of(&c)).as_deref(), Some("other"));
+        assert_eq!(name_of(&[], id_of(&c)), None);
+    }
+
+    #[test]
+    fn the_lists_are_stale_without_a_connected_stream_and_a_bulk_run_is_tracked() {
+        let mut t = booted();
+        let id = Uuid::new_v4();
+        assert!(t.lists_stale(id));
+        assert!(!t.bulk_running(id));
+        t.begin_bulk(id);
+        assert!(t.bulk_running(id));
+        t.finish_bulk(id);
+        assert!(!t.bulk_running(id));
     }
 }

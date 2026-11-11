@@ -29,11 +29,33 @@ use exchange::trade::{
 };
 use exchange::unit::Price;
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Characters of an exchange message that are shown (it is shown only, never logged).
 const MSG_CHARS: usize = 120;
+
+/// The longest a preparation (Keychain, clock, rules, builder; or the reads before a bulk
+/// confirmation) may take before the form is released again (I1). Nothing is sent by it.
+pub const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Wait for a preparation for at most `limit`. A late answer is dropped with the future, and the
+/// caller gets `timed_out` instead, so a form frozen for the preparation is released.
+pub async fn within<T>(
+    limit: Duration,
+    work: impl Future<Output = Result<T, String>>,
+    timed_out: &str,
+) -> Result<T, String> {
+    match tokio::time::timeout(limit, work).await {
+        Ok(result) => result,
+        Err(_) => Err(timed_out.to_string()),
+    }
+}
+
+pub const PREPARE_TIMED_OUT: &str =
+    "Preparing the order took too long and was stopped. Nothing was sent. Review it again.";
 
 // ── Market → account ────────────────────────────────────────────────────
 
@@ -194,7 +216,7 @@ pub struct PrepareInput {
     pub proxy: Arc<dyn Fn() -> ProxyState + Send + Sync>,
 }
 
-fn clip(text: &str) -> String {
+pub(crate) fn clip(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control())
         .take(MSG_CHARS)
@@ -211,13 +233,18 @@ pub fn describe_read_error(e: &ReadError) -> String {
     }
 }
 
-fn describe_store_error(_: &StoreError) -> String {
+pub(crate) fn describe_store_error(_: &StoreError) -> String {
     // The store's own text can name the Keychain item; only the fact is shown.
     "The API credentials could not be read from the Keychain.".to_string()
 }
 
-/// Keychain → client → clock → rules → builder → intent → preview. Nothing is sent but reads.
+/// [`prepare_steps`] under the overall time limit (I1).
 pub async fn prepare(input: PrepareInput) -> Result<Prepared, String> {
+    within(PREPARE_TIMEOUT, prepare_steps(input), PREPARE_TIMED_OUT).await
+}
+
+/// Keychain → client → clock → rules → builder → intent → preview. Nothing is sent but reads.
+async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
     let PrepareInput {
         meta,
         mode,
@@ -603,7 +630,8 @@ pub fn describe_result(r: &SendResult, tail: Option<&str>) -> String {
         ),
         SendResult::Unresolved => format!(
             "The result is unknown{id}. Nothing was resent. New entries on this symbol stay \
-             blocked until the app restarts; check the exchange."
+             blocked until you release it by hand in the account section or the app restarts; \
+             check the exchange."
         ),
     }
 }

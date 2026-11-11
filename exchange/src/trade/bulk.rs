@@ -72,6 +72,9 @@ pub enum BulkError {
     /// `BulkReport::reread_failed` instead.
     Read(ReadError),
     Trade(TradeError),
+    /// The confirmation was not made for this account and this bulk action (R10). Nothing was
+    /// sent. Not the same as `Trade(Unsupported)`, which is what a spot `flatten` says.
+    ConfirmationMismatch,
 }
 
 impl From<ReadError> for BulkError {
@@ -162,7 +165,7 @@ impl TradeClient {
             &Route::User(
                 confirm
                     .spend_bulk(self.account, BulkAction::CancelAll)
-                    .map_err(|_| BulkError::Trade(TradeError::Unsupported))?,
+                    .map_err(|_| BulkError::ConfirmationMismatch)?,
             ),
             table,
             true,
@@ -278,7 +281,7 @@ impl TradeClient {
             &Route::User(
                 confirm
                     .spend_bulk(self.account, BulkAction::Flatten)
-                    .map_err(|_| BulkError::Trade(TradeError::Unsupported))?,
+                    .map_err(|_| BulkError::ConfirmationMismatch)?,
             ),
             table,
             margin,

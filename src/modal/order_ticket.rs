@@ -180,7 +180,7 @@ pub fn blocked_reason(g: &Gate) -> Option<&'static str> {
         return Some("Pick an account.");
     };
     if g.preparing {
-        return Some("Preparing the order…");
+        return Some("Preparing the order… Press Back to cancel.");
     }
     if venue == AccountVenue::Binance && product == AccountProduct::Spot {
         return Some("Binance spot orders are not available yet (no private stream).");
@@ -325,6 +325,11 @@ pub fn build_spec(
 impl OrderTicket {
     pub fn set_status(&mut self, text: String, kind: BannerKind) {
         self.status = Some((text, kind));
+    }
+
+    /// The account picked in the form.
+    pub fn account(&self) -> Option<Uuid> {
+        self.account
     }
 
     pub fn is_preparing(&self) -> bool {
