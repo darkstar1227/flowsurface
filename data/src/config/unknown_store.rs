@@ -16,6 +16,12 @@
 //!   skipped quietly: loading fails, so the app can refuse to trade until the file is looked at.
 //! - `UnknownStore` is the exchange crate's write-ahead journal (`UnknownJournal`): the record
 //!   is written before a send goes out and removed once its outcome is known.
+//! - A record whose client id is not valid blocks every new entry of its account until restart
+//!   and cannot be released like an unresolved send. [`UnknownStore::discard_invalid`] drops it
+//!   after the user's two-step confirmation (`UnknownRecord::begin_discard`); it never drops a
+//!   record with a valid id.
+//! - The `*_async` methods run the same work on a blocking thread, so the GUI never reads,
+//!   writes or syncs files on the iced thread.
 //! - Releasing an entry by hand is the exchange crate's two-step confirmation
 //!   (`PendingUnknown::begin_manual_release`, then the typed phrase); this store only removes
 //!   the saved line afterwards. Saving, loading and releasing are logged with
@@ -24,7 +30,7 @@
 //! Nothing here reads a clock: the time is the caller's.
 
 use exchange::account::AccountKey;
-use exchange::trade::UnknownRecord;
+use exchange::trade::{DiscardToken, UnknownRecord};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -74,6 +80,8 @@ pub enum StoreError {
     Io(io::Error),
     /// The file is not what this program wrote; nothing was loaded.
     Corrupt(&'static str),
+    /// `discard_invalid` was asked to drop a record whose client id is valid.
+    StillValid,
 }
 
 impl From<io::Error> for StoreError {
@@ -88,6 +96,7 @@ impl StoreError {
         match self {
             StoreError::Io(_) => "file system error",
             StoreError::Corrupt(what) => what,
+            StoreError::StillValid => "record has a valid client id",
         }
     }
 }
@@ -242,6 +251,61 @@ impl UnknownStore {
         Ok(removed)
     }
 
+    /// Drop a record whose client id is not valid, with the token of the user's typed
+    /// confirmation. Refuses (`StillValid`) when the saved line's id is valid, so this cannot
+    /// forget a live unresolved send; those are resolved or released instead. Returns whether
+    /// the line was there. The account stays blocked for new entries until the program
+    /// restarts: the block lives in memory and nothing here lifts it.
+    pub fn discard_invalid(&self, token: DiscardToken) -> Result<bool, StoreError> {
+        let _guard = lock();
+        let mut file = self.read_file()?;
+        let id = Uuid::from_bytes(token.account().to_bytes());
+        let Some(line) = file
+            .entries
+            .iter()
+            .find(|l| l.same_order(id, token.client_id()))
+        else {
+            return Ok(false);
+        };
+        if line.to_record().has_valid_client_id() {
+            return Err(StoreError::StillValid);
+        }
+        file.entries
+            .retain(|l| !l.same_order(id, token.client_id()));
+        self.write_file(&file)?;
+        Ok(true)
+    }
+
+    // ── Off the iced thread ──────────────────────────────────────────────
+
+    /// [`UnknownStore::load`] on a blocking thread. Needs a tokio runtime.
+    pub async fn load_async(&self) -> Result<Vec<UnknownRecord>, StoreError> {
+        let this = self.clone();
+        blocking(move || this.load()).await
+    }
+
+    /// [`UnknownStore::add`] on a blocking thread.
+    pub async fn add_async(&self, record: UnknownRecord) -> Result<(), StoreError> {
+        let this = self.clone();
+        blocking(move || this.add(&record)).await
+    }
+
+    /// [`UnknownStore::remove`] on a blocking thread.
+    pub async fn remove_async(
+        &self,
+        account: AccountKey,
+        client_id: String,
+    ) -> Result<bool, StoreError> {
+        let this = self.clone();
+        blocking(move || this.remove(account, &client_id)).await
+    }
+
+    /// [`UnknownStore::discard_invalid`] on a blocking thread.
+    pub async fn discard_invalid_async(&self, token: DiscardToken) -> Result<bool, StoreError> {
+        let this = self.clone();
+        blocking(move || this.discard_invalid(token)).await
+    }
+
     fn read_file(&self) -> Result<File, StoreError> {
         // Same checks as `load`, so a damaged file is never overwritten by an `add`.
         let records = self.load_unlocked()?;
@@ -254,7 +318,7 @@ impl UnknownStore {
     fn write_file(&self, file: &File) -> Result<(), StoreError> {
         fs::create_dir_all(&self.dir)?;
         let path = self.path();
-        refuse_symlink(&path)?;
+        refuse_unless_regular(&path)?;
         // A random name, created with `create_new` (which never follows a link): nobody can
         // plant a file or a link at a name this process has not chosen yet.
         let tmp = self.dir.join(format!("{FILE_NAME}.{}.tmp", Uuid::new_v4()));
@@ -263,7 +327,10 @@ impl UnknownStore {
             let mut f = open_private(&tmp)?;
             f.write_all(text.as_bytes())?;
             f.sync_all()?;
-            fs::rename(&tmp, &path)
+            fs::rename(&tmp, &path)?;
+            // The rename is only durable once the directory entry is: without this a crash can
+            // bring the old file back, and with it a forgotten write-ahead record.
+            sync_dir(&self.dir)
         })();
         if written.is_err() {
             let _ = fs::remove_file(&tmp);
@@ -273,10 +340,33 @@ impl UnknownStore {
     }
 }
 
+/// Run `f` on a blocking thread. A task that died is an I/O error, never "nothing happened".
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, StoreError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| StoreError::Io(io::Error::other("file task failed")))?
+}
+
+/// Make a rename in `dir` durable.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Windows has no directory handle to sync through `std`; the rename itself is atomic there.
+#[cfg(not(unix))]
+fn sync_dir(_: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Read the file as text, refusing a link, a non-regular file and anything over the cap.
 fn read_capped(path: &Path) -> io::Result<String> {
     let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidInput, m);
-    refuse_symlink(path)?;
+    // Before `open`: opening a FIFO for reading blocks until a writer shows up, which would
+    // hang the send path (and so a close waiting behind it). Only a regular file is opened.
+    refuse_unless_regular(path)?;
     let mut f = open_read(path)?;
     let meta = f.metadata()?;
     if !meta.is_file() {
@@ -317,11 +407,17 @@ fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
     true
 }
 
-fn refuse_symlink(path: &Path) -> io::Result<()> {
+/// Refuse a link and any other file type that is not a regular file (a FIFO, a socket, a
+/// device, a directory). A missing path is fine. Checked before anything is opened.
+fn refuse_unless_regular(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "unresolved orders path is a symbolic link",
+        )),
+        Ok(m) if !m.is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unresolved orders path is not a regular file",
         )),
         Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -577,5 +673,99 @@ mod tests {
             assert!(loaded.iter().any(|r| r.client_id == "eKEEP1"));
         }
         writer.join().unwrap();
+    }
+
+    fn valid_id() -> String {
+        exchange::trade::ClientId::generate(exchange::trade::Role::Entry)
+            .as_str()
+            .to_string()
+    }
+
+    #[test]
+    fn only_a_record_with_an_invalid_id_is_discarded_and_nothing_else_goes() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        let good = record(&valid_id());
+        let bad = record("not-an-id-123");
+        store.add(&good).unwrap();
+        store.add(&bad).unwrap();
+
+        // A live record cannot even start a discard.
+        assert!(good.begin_discard().is_err());
+        // The token of an invalid one removes exactly that line.
+        let challenge = bad.begin_discard().unwrap();
+        let phrase = challenge.phrase().to_string();
+        let token = challenge.confirm(&phrase).unwrap();
+        assert!(store.discard_invalid(token).unwrap());
+        assert_eq!(store.load().unwrap(), vec![good.clone()]);
+
+        // A second time there is nothing to remove.
+        let again = bad.begin_discard().unwrap();
+        let token = again.confirm(&phrase).unwrap();
+        assert!(!store.discard_invalid(token).unwrap());
+
+        assert_eq!(store.load().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn discard_logs_nothing_about_the_id_and_its_error_is_a_fixed_text() {
+        assert_eq!(
+            StoreError::StillValid.reason(),
+            "record has a valid client id"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_path_is_refused_without_blocking() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        let made = std::process::Command::new("mkfifo")
+            .arg(store.path())
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success());
+        // Opening a FIFO for reading would block forever with no writer: run it on a thread
+        // so a regression fails the test instead of hanging it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = store.clone();
+        std::thread::spawn(move || {
+            let loaded = s.load().is_err();
+            let added = s.add(&record("eAAAA1")).is_err();
+            let _ = tx.send((loaded, added));
+        });
+        let (loaded, added) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the store must not block on a FIFO");
+        assert!(loaded && added);
+    }
+
+    #[test]
+    fn the_async_wrappers_do_the_same_work_off_the_calling_thread() {
+        let dir = Scratch::new();
+        let store = UnknownStore::in_dir(dir.0.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let rec = record(&valid_id());
+            assert!(store.load_async().await.unwrap().is_empty());
+            store.add_async(rec.clone()).await.unwrap();
+            assert_eq!(store.load_async().await.unwrap(), vec![rec.clone()]);
+            assert!(
+                store
+                    .remove_async(rec.account, rec.client_id.clone())
+                    .await
+                    .unwrap()
+            );
+            assert!(store.load_async().await.unwrap().is_empty());
+
+            let bad = record("not-an-id-123");
+            store.add_async(bad.clone()).await.unwrap();
+            let challenge = bad.begin_discard().unwrap();
+            let phrase = challenge.phrase().to_string();
+            let token = challenge.confirm(&phrase).unwrap();
+            assert!(store.discard_invalid_async(token).await.unwrap());
+        });
     }
 }

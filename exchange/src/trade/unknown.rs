@@ -104,6 +104,34 @@ impl UnknownRecord {
         }
     }
 
+    /// Whether the client id is one this program could have made. A record that fails this
+    /// cannot be tied to a symbol lock (its account stays blocked for new entries), cannot be
+    /// looked up and cannot be released like an unresolved send: it can only be discarded
+    /// ([`UnknownRecord::begin_discard`]).
+    pub fn has_valid_client_id(&self) -> bool {
+        ClientId::parse(&self.client_id).is_ok()
+    }
+
+    /// Step one of discarding a record whose client id is invalid (review N4): a challenge
+    /// naming it. Refused for a record with a valid id, which must go through a lookup or the
+    /// manual release instead, so this path cannot be used to forget a live unresolved send.
+    pub fn begin_discard(&self) -> Result<DiscardChallenge, DiscardError> {
+        if self.has_valid_client_id() {
+            return Err(DiscardError::StillValid);
+        }
+        let tail: String = self
+            .client_id
+            .chars()
+            .skip(self.client_id.chars().count().saturating_sub(5))
+            .collect();
+        Ok(DiscardChallenge {
+            phrase: format!("discard {} {tail}", self.symbol),
+            account: self.account,
+            symbol: self.symbol.clone(),
+            client_id: self.client_id.clone(),
+        })
+    }
+
     pub(crate) fn parse_kind(name: &str) -> Option<LookupKind> {
         Some(match name {
             "futures_order" => LookupKind::FuturesOrder,
@@ -183,6 +211,70 @@ impl ReleaseChallenge {
         } else {
             Err(Box::new(self))
         }
+    }
+}
+
+/// Why a record cannot be discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardError {
+    /// The record's client id is valid. It stands for a real unresolved send: look it up or
+    /// release it by hand, do not discard it.
+    StillValid,
+}
+
+/// The user's second, separate confirmation that a saved record with an invalid client id may be
+/// dropped from the file (review N4). Same shape as [`ReleaseChallenge`]: the phrase must be
+/// typed by the user, never filled in or confirmed by the program.
+pub struct DiscardChallenge {
+    account: AccountKey,
+    symbol: String,
+    client_id: String,
+    phrase: String,
+}
+
+impl DiscardChallenge {
+    /// The text the user must type: `discard`, the symbol and the end of the client id.
+    pub fn phrase(&self) -> &str {
+        &self.phrase
+    }
+
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    /// `Ok` only when `typed` equals the phrase exactly; otherwise the challenge comes back.
+    pub fn confirm(self, typed: &str) -> Result<DiscardToken, Box<DiscardChallenge>> {
+        if typed == self.phrase {
+            Ok(DiscardToken {
+                account: self.account,
+                symbol: self.symbol,
+                client_id: self.client_id,
+            })
+        } else {
+            Err(Box::new(self))
+        }
+    }
+}
+
+/// Single use, no `Clone`: made only by [`DiscardChallenge::confirm`]. The store removes the
+/// named line with it (and only if that line's id is still invalid).
+pub struct DiscardToken {
+    account: AccountKey,
+    symbol: String,
+    client_id: String,
+}
+
+impl DiscardToken {
+    pub fn account(&self) -> AccountKey {
+        self.account
+    }
+
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.client_id
     }
 }
 
@@ -309,10 +401,13 @@ enum Look {
 /// Lock the (account, symbol) of a saved record without a [`TradeClient`] (review B6). A client
 /// needs credentials, which can be unavailable at startup (a locked Keychain); the lock must not
 /// depend on them. Call it for every record **before** any client is built.
-pub fn lock_from_record(account: AccountKey, record: &UnknownRecord) -> Result<(), RestoreError> {
-    if record.account != account {
-        return Err(RestoreError::WrongAccount);
-    }
+///
+/// The record names its own account and that is the one locked: there is no second account to
+/// pass, so a record can never be checked against, and then left unlocked for, another one.
+/// Every `Err` means the record is kept and shown, never skipped or deleted: the lock (or, for
+/// a bad id, the block of the whole account) is already in place when it returns.
+pub fn lock_from_record(record: &UnknownRecord) -> Result<(), RestoreError> {
+    let account = record.account;
     if ClientId::parse(&record.client_id).is_err() {
         locks::block_entries(account);
         log::error!("a saved unresolved order has a bad id: new entries are blocked");
@@ -354,7 +449,12 @@ impl TradeClient {
     /// entries of the account stay refused until restart, and the record must be kept for the
     /// user to see. Nothing is unlocked by loading, and nothing is resent.
     pub fn lock_from_record(&self, record: &UnknownRecord) -> Result<(), RestoreError> {
-        lock_from_record(self.account, record)
+        // A record of another account is not this client's to lock. (The free function does
+        // lock it, by its own account.)
+        if record.account != self.account {
+            return Err(RestoreError::WrongAccount);
+        }
+        lock_from_record(record)
     }
 
     /// Second step: build the value to hand to [`TradeClient::resolve_unknown`] once fresh
@@ -613,6 +713,25 @@ impl std::fmt::Debug for ReleaseChallenge {
 impl std::fmt::Debug for ManualReleaseToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManualReleaseToken")
+            .field("symbol", &self.symbol)
+            .field("client_id", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for DiscardChallenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscardChallenge")
+            .field("symbol", &self.symbol)
+            .field("client_id", &"<redacted>")
+            .field("phrase", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for DiscardToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscardToken")
             .field("symbol", &self.symbol)
             .field("client_id", &"<redacted>")
             .finish_non_exhaustive()

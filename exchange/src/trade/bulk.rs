@@ -37,6 +37,10 @@ pub struct BulkReport<T> {
     /// exist, were not cancelled and are not in `remaining` (the final read, when made, shows
     /// what is really left). Never empty means the result is not clean.
     pub unknown_algo_types: Vec<OkxAlgoType>,
+    /// At least one send went out without its write-ahead record (the journal is broken). The
+    /// sends are not undone and `is_clear` does not look at this: the UI shows a standing
+    /// warning instead.
+    pub journal_failed: bool,
 }
 
 impl<T> BulkReport<T> {
@@ -48,6 +52,7 @@ impl<T> BulkReport<T> {
             reread_failed: false,
             pending: Vec::new(),
             unknown_algo_types: Vec::new(),
+            journal_failed: false,
         }
     }
 
@@ -134,6 +139,7 @@ impl TradeClient {
                     report.failed += 1;
                 }
                 report.pending.extend(sub.pending);
+                report.journal_failed |= sub.journal_failed;
             }
             Err(_) => report.failed += 1,
         }

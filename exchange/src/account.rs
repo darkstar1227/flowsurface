@@ -10,6 +10,7 @@
 //! [`send`] only ever reports `method + host + path`, never the query or body.
 
 use crate::rate_limit::{self, LimitKey, OkxEndpoint, Priority};
+use crate::signed_http::SignedHttp;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use ring::hmac;
@@ -173,6 +174,13 @@ impl ApiCredentials {
 
     pub fn passphrase(&self) -> Option<&SecretString> {
         self.passphrase.as_ref()
+    }
+
+    /// Whether both use the same API key (the exchange account's public identifier). The
+    /// secret and passphrase are not compared. For a local duplicate check only: nothing
+    /// derived from the key is kept, hashed or printed.
+    pub fn same_key_as(&self, other: &Self) -> bool {
+        self.key.expose_secret() == other.key.expose_secret()
     }
 
     /// Field-by-field comparison, used to confirm a Keychain write by reading it back.
@@ -446,6 +454,9 @@ pub enum AccountError {
     ProxyChanged,
     /// The proxy setting could not be read; signed requests are refused.
     ProxyBroken,
+    /// The HTTP client for signed requests could not be built (an unusable proxy setting or a
+    /// missing TLS backend); nothing was sent and nothing falls back to a direct connection.
+    ClientBuild,
     /// Held back by the local rate limiter; nothing was sent.
     LocalRateLimited,
     Timeout,
@@ -485,6 +496,7 @@ impl AccountError {
             | AccountError::InvalidCredentials
             | AccountError::ProxyChanged
             | AccountError::ProxyBroken
+            | AccountError::ClientBuild
             | AccountError::LocalRateLimited
             | AccountError::Connect => Delivery::NotSent,
             AccountError::RateLimited(_) | AccountError::ClockSkew => Delivery::Rejected,
@@ -525,6 +537,9 @@ impl fmt::Display for AccountError {
             ),
             AccountError::ProxyBroken => f.write_str(
                 "the proxy setting could not be read; refusing to connect (fix it and restart)",
+            ),
+            AccountError::ClientBuild => f.write_str(
+                "failed to build the HTTP client for signed requests (proxy setting unusable?)",
             ),
             AccountError::LocalRateLimited => {
                 f.write_str("held back by the local rate limiter; try again shortly")
@@ -639,7 +654,7 @@ impl ResponseMeta {
 ///
 /// Logs and errors carry only `METHOD host path` and the status: never the query, the
 /// body, or (on success) the response content, which holds order ids, sizes and prices.
-/// The client must not follow redirects (see `connector::client::signed_client`), so
+/// The client must not follow redirects (see [`crate::signed_http::SignedHttp`]), so
 /// credential headers are never forwarded to another host.
 ///
 /// `body` is sent exactly as given: the caller signs the same string it passes here.
@@ -1134,13 +1149,14 @@ async fn check_okx(
 /// Never panics and never returns the credentials or any response body. Each call signs
 /// fresh requests with a new timestamp; nothing is retried.
 pub async fn check_account(
-    client: &reqwest::Client,
+    http: &SignedHttp,
     venue: AccountVenue,
     env: AccountEnv,
     product: AccountProduct,
     creds: &ApiCredentials,
     desired: PositionMode,
 ) -> CheckReport {
+    let client = http.client();
     match venue {
         AccountVenue::Binance => check_binance(client, env, product, creds, desired).await,
         AccountVenue::Okx => check_okx(client, env, creds, desired).await,
@@ -1664,6 +1680,16 @@ pub(crate) mod tests {
             assert!(!shown.contains(s));
         }
         assert!(shown.contains("***"));
+    }
+
+    #[test]
+    fn same_key_as_compares_the_key_only() {
+        let a = ApiCredentials::new("key-1".into(), "secret-a".into(), Some("pass".into()));
+        let b = ApiCredentials::new("key-1".into(), "secret-b".into(), None);
+        let c = ApiCredentials::new("key-2".into(), "secret-a".into(), Some("pass".into()));
+        assert!(a.same_key_as(&b));
+        assert!(!a.same_key_as(&c));
+        assert!(!a.same_as(&b));
     }
 
     #[test]

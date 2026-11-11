@@ -5,6 +5,7 @@
 pub mod binance;
 pub mod driver;
 pub mod events;
+mod key_claims;
 mod listen_key;
 pub mod machine;
 pub mod okx;
@@ -24,4 +25,4 @@ pub use machine::{
     one_cancels_other_paused,
 };
 pub use secret::{ListenKey, StreamKey};
-pub use status::{stream_state, stream_state_for};
+pub use status::{stream_state, stream_state_for, sync_epoch};

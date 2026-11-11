@@ -252,6 +252,83 @@ pub fn load_credentials_with_identity(
     decode_with_identity(meta, &raw)
 }
 
+// ── One exchange account, one app account ───────────────────────────────
+
+/// Why a key may not be bound to an account. Neither case carries the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DuplicateKeyError {
+    /// Another account of the same venue, environment and product already uses this key.
+    /// Only its alias is named.
+    AlreadyBound { alias: String },
+    /// Another account's Keychain item could not be read, so the check could not be made.
+    /// Refused rather than allowed: try again once the Keychain is available.
+    CannotVerify,
+}
+
+impl fmt::Display for DuplicateKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DuplicateKeyError::AlreadyBound { alias } => write!(
+                f,
+                "this API key is already used by the account \"{alias}\" \
+                 (one exchange account must not be bound twice: locks and limits would be split)"
+            ),
+            DuplicateKeyError::CannotVerify => f.write_str(
+                "could not check the other accounts' keys (Keychain unavailable); \
+                 nothing was saved, try again",
+            ),
+        }
+    }
+}
+
+/// Refuse binding a key that another account of the same venue, environment and product
+/// already uses (one exchange account bound twice would split the unresolved-send locks and
+/// the risk limits in two). Reads the other accounts' Keychain items and compares the keys in
+/// memory only: nothing derived from a key is saved or logged, and the credentials read are
+/// dropped (zeroized) at once. The secret is not compared; the key identifies the account.
+///
+/// A Binance key bound to both Spot and USDⓈ-M is a legitimate use and passes (`product`
+/// differs); the UI should say that the two accounts share one exchange account. For OKX the
+/// product is fixed, so the same key in the same environment is always refused.
+pub fn check_key_not_bound(
+    others: &[AccountMeta],
+    candidate: &AccountMeta,
+    creds: &ApiCredentials,
+) -> Result<(), DuplicateKeyError> {
+    check_key_not_bound_with(others, candidate, creds, load_credentials)
+}
+
+/// [`check_key_not_bound`] with the Keychain read injected (for tests).
+pub(crate) fn check_key_not_bound_with(
+    others: &[AccountMeta],
+    candidate: &AccountMeta,
+    creds: &ApiCredentials,
+    load: impl Fn(&AccountMeta) -> Result<ApiCredentials, StoreError>,
+) -> Result<(), DuplicateKeyError> {
+    for other in others.iter().filter(|o| {
+        o.id != candidate.id
+            && o.venue == candidate.venue
+            && o.env == candidate.env
+            && o.product == candidate.product
+    }) {
+        match load(other) {
+            Ok(theirs) if theirs.same_key_as(creds) => {
+                return Err(DuplicateKeyError::AlreadyBound {
+                    alias: other.alias.clone(),
+                });
+            }
+            Ok(_) => {}
+            // That account cannot trade anyway: nothing to collide with.
+            Err(StoreError::NoEntry) => {}
+            Err(StoreError::InvalidFormat | StoreError::Mismatch) => {
+                log::warn!("an account's Keychain item is not valid; skipped by the key check");
+            }
+            Err(StoreError::Keychain(_)) => return Err(DuplicateKeyError::CannotVerify),
+        }
+    }
+    Ok(())
+}
+
 /// A missing item counts as deleted; any other error is returned.
 pub fn delete_credentials(meta: &AccountMeta) -> Result<(), StoreError> {
     match entry(meta)?.delete_credential() {
@@ -458,5 +535,208 @@ mod tests {
         assert_eq!(m.venue, AccountVenue::Binance);
         assert_eq!(m.env, AccountEnv::Live);
         assert_eq!(m.position_mode, PositionMode::OneWay);
+    }
+
+    // ── Duplicate key check ─────────────────────────────────────────────
+
+    fn account(
+        venue: AccountVenue,
+        env: AccountEnv,
+        product: AccountProduct,
+        alias: &str,
+    ) -> AccountMeta {
+        AccountMeta::new(alias.into(), venue, env, product, PositionMode::Hedge)
+    }
+
+    fn with_key(key: &str) -> ApiCredentials {
+        ApiCredentials::new(key.into(), "secret".into(), None)
+    }
+
+    /// The Keychain of the test: the key each account id holds.
+    fn keychain(
+        entries: Vec<(Uuid, Result<&'static str, StoreError>)>,
+    ) -> impl Fn(&AccountMeta) -> Result<ApiCredentials, StoreError> {
+        move |m| match entries.iter().find(|(id, _)| *id == m.id) {
+            Some((_, Ok(key))) => Ok(with_key(key)),
+            Some((_, Err(e))) => Err(e.clone()),
+            None => Err(StoreError::NoEntry),
+        }
+    }
+
+    #[test]
+    fn the_same_key_in_the_same_venue_env_and_product_is_refused_by_alias_only() {
+        let first = account(
+            AccountVenue::Okx,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+            "main",
+        );
+        let new = account(
+            AccountVenue::Okx,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+            "again",
+        );
+        let load = keychain(vec![(first.id, Ok("KEY-ONE-1234"))]);
+        let err =
+            check_key_not_bound_with(&[first], &new, &with_key("KEY-ONE-1234"), load).unwrap_err();
+        assert_eq!(
+            err,
+            DuplicateKeyError::AlreadyBound {
+                alias: "main".into()
+            }
+        );
+        for text in [format!("{err}"), format!("{err:?}")] {
+            assert!(!text.contains("KEY-ONE-1234"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_different_key_the_account_itself_or_another_environment_passes() {
+        let live = account(
+            AccountVenue::Okx,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+            "live",
+        );
+        let test = account(
+            AccountVenue::Okx,
+            AccountEnv::Testnet,
+            AccountProduct::UsdM,
+            "test",
+        );
+        let load = || {
+            keychain(vec![
+                (live.id, Ok("SAME-KEY-9999")),
+                (test.id, Ok("SAME-KEY-9999")),
+            ])
+        };
+        // Another key.
+        assert!(
+            check_key_not_bound_with(
+                std::slice::from_ref(&live),
+                &test,
+                &with_key("OTHER"),
+                load()
+            )
+            .is_ok()
+        );
+        // The same key under a testnet account is a different exchange account.
+        let new_test = account(
+            AccountVenue::Okx,
+            AccountEnv::Testnet,
+            AccountProduct::UsdM,
+            "t2",
+        );
+        assert!(
+            check_key_not_bound_with(
+                std::slice::from_ref(&live),
+                &new_test,
+                &with_key("SAME-KEY-9999"),
+                load()
+            )
+            .is_ok()
+        );
+        // Re-saving an account's own key is not a duplicate of itself.
+        assert!(
+            check_key_not_bound_with(
+                std::slice::from_ref(&live),
+                &live,
+                &with_key("SAME-KEY-9999"),
+                load()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_binance_key_may_serve_spot_and_usdm_but_not_twice_in_one_product() {
+        let usdm = account(
+            AccountVenue::Binance,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+            "fut",
+        );
+        let spot = account(
+            AccountVenue::Binance,
+            AccountEnv::Live,
+            AccountProduct::Spot,
+            "spot",
+        );
+        let load = || keychain(vec![(usdm.id, Ok("BN-KEY-5555"))]);
+        assert!(
+            check_key_not_bound_with(
+                std::slice::from_ref(&usdm),
+                &spot,
+                &with_key("BN-KEY-5555"),
+                load()
+            )
+            .is_ok()
+        );
+        let usdm2 = account(
+            AccountVenue::Binance,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+            "fut2",
+        );
+        assert_eq!(
+            check_key_not_bound_with(
+                std::slice::from_ref(&usdm),
+                &usdm2,
+                &with_key("BN-KEY-5555"),
+                load()
+            ),
+            Err(DuplicateKeyError::AlreadyBound {
+                alias: "fut".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_unreadable_keychain_refuses_and_a_missing_item_is_skipped() {
+        let a = account(
+            AccountVenue::Okx,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+            "a",
+        );
+        let b = account(
+            AccountVenue::Okx,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+            "b",
+        );
+        let new = account(
+            AccountVenue::Okx,
+            AccountEnv::Live,
+            AccountProduct::UsdM,
+            "new",
+        );
+        let broken = keychain(vec![(a.id, Err(StoreError::Keychain("locked".into())))]);
+        assert_eq!(
+            check_key_not_bound_with(std::slice::from_ref(&a), &new, &with_key("K"), broken),
+            Err(DuplicateKeyError::CannotVerify)
+        );
+        // Missing, malformed and mismatching items cannot trade: they do not block.
+        for e in [
+            StoreError::NoEntry,
+            StoreError::InvalidFormat,
+            StoreError::Mismatch,
+        ] {
+            let load = keychain(vec![(a.id, Err(e))]);
+            assert!(
+                check_key_not_bound_with(std::slice::from_ref(&a), &new, &with_key("K"), load)
+                    .is_ok()
+            );
+        }
+        // One unreadable item still refuses even if an earlier one was fine.
+        let load = keychain(vec![
+            (a.id, Ok("OTHER-KEY")),
+            (b.id, Err(StoreError::Keychain("denied".into()))),
+        ]);
+        assert_eq!(
+            check_key_not_bound_with(&[a, b], &new, &with_key("K"), load),
+            Err(DuplicateKeyError::CannotVerify)
+        );
     }
 }

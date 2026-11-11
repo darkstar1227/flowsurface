@@ -435,6 +435,9 @@ pub struct EquityTracker {
     /// The saved risk settings could not be turned into limits: new entries are refused until
     /// valid limits are set (a bad setting never means "no limits").
     settings_invalid: bool,
+    /// The sync epoch of the last snapshot the caller applied (0 = none). New entries need it
+    /// to equal the account's stream epoch (see `stream::sync_epoch`).
+    applied_epoch: u64,
 }
 
 impl EquityTracker {
@@ -455,6 +458,7 @@ impl EquityTracker {
             degraded: false,
             positions: None,
             settings_invalid: false,
+            applied_epoch: 0,
         }
     }
 
@@ -475,8 +479,15 @@ impl EquityTracker {
     /// carries no equity, so the equity reference is not trusted until a new reading
     /// arrives: the tracker counts as stale (new entries under an equity limit are refused
     /// and no automatic close starts) until the caller reads the equity again and feeds it.
-    pub fn snapshot_applied(&mut self) {
+    ///
+    /// `epoch` is [`Snapshot::sync_epoch`](super::stream::Snapshot::sync_epoch) of the snapshot
+    /// that was applied. The stream reports `Connected` as soon as it has *sent* a snapshot,
+    /// possibly before this call: until the tracker has applied the account's latest snapshot
+    /// (and with it the positions of `set_positions`), new entries are refused with
+    /// [`RiskRefusal::SnapshotNotApplied`].
+    pub fn snapshot_applied(&mut self, epoch: u64) {
         self.degraded = true;
+        self.applied_epoch = epoch;
     }
 
     pub fn limits(&self) -> &RiskLimits {
@@ -784,6 +795,11 @@ impl RiskHook for RiskSnapshot<'_> {
         let Exposure::Adds { notional } = view.exposure else {
             return Ok(());
         };
+        // The stream is `Connected` as soon as it sent its snapshot; the positions and equity
+        // this tracker holds are from before it until the caller applied that snapshot.
+        if super::stream::sync_epoch(t.account) != t.applied_epoch {
+            return Err(RiskRefusal::SnapshotNotApplied);
+        }
         if t.settings_invalid {
             return Err(RiskRefusal::SettingsInvalid);
         }
@@ -1514,7 +1530,7 @@ mod tests {
         });
         t.observe(obs(T0, "1000"));
         assert_eq!(t.freshness(T0 + 1), EquityFreshness::Fresh);
-        t.snapshot_applied();
+        t.snapshot_applied(0);
         assert_eq!(t.freshness(T0 + 1), EquityFreshness::Stale);
         t.observe(obs(T0 + MIN, "1000"));
         assert_eq!(t.freshness(T0 + MIN), EquityFreshness::Fresh);

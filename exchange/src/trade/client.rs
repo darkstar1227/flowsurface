@@ -30,6 +30,7 @@ use crate::account::{
     send_limited_meta, sensitive,
 };
 use crate::rate_limit::{LimitKey, OkxEndpoint, Priority, apply_exchange_info_limits};
+use crate::signed_http::SignedHttp;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use secrecy::ExposeSecret;
 use serde_json::Value;
@@ -87,16 +88,20 @@ pub struct Submitted {
     pub outcome: Outcome,
     /// Set when the outcome is `Unknown`: pass it to `TradeClient::resolve_unknown`.
     pub pending: Option<super::unknown::PendingUnknown>,
+    /// A reducing, closing or protective send went out although its write-ahead record could
+    /// not be written (only new entries are refused for that, review B5). If the outcome is
+    /// `Unknown` and the app restarts, nothing remembers it: show a standing warning that the
+    /// journal is broken (review N8).
+    pub journal_failed: bool,
 }
 
 pub struct TradeClient {
-    pub(super) http: reqwest::Client,
+    pub(super) http: SignedHttp,
     pub(super) venue: AccountVenue,
     pub(super) env: AccountEnv,
     pub(super) product: AccountProduct,
     pub(super) account: AccountKey,
     creds: ApiCredentials,
-    proxy_snapshot: ProxyState,
     current_proxy: Arc<dyn Fn() -> ProxyState + Send + Sync>,
     clock_offset_ms: AtomicI64,
     #[cfg(test)]
@@ -110,17 +115,33 @@ pub struct TradeClient {
 }
 
 impl TradeClient {
-    /// `http` must be the signed client (no redirects, https only); `proxy_snapshot` is what
-    /// it was built with and `current_proxy` reads the setting now, compared before every
-    /// request.
+    /// `http` is the signed client together with the proxy it was built with (see
+    /// [`SignedHttp`]); `current_proxy` reads the setting now and is compared with that proxy
+    /// before every request. It must read the live setting, never a copy taken earlier.
+    ///
+    /// A bare `reqwest::Client` is not accepted, so a direct client cannot be paired with a
+    /// `Proxied` snapshot:
+    ///
+    /// ```compile_fail,E0308
+    /// use flowsurface_exchange::account::{AccountEnv, AccountKey, AccountProduct, AccountVenue, ApiCredentials};
+    /// use flowsurface_exchange::trade::TradeClient;
+    /// let _ = TradeClient::new(
+    ///     reqwest::Client::new(),
+    ///     AccountVenue::Okx,
+    ///     AccountEnv::Live,
+    ///     AccountProduct::UsdM,
+    ///     AccountKey::from_bytes([1; 16]),
+    ///     ApiCredentials::new("k".into(), "s".into(), None),
+    ///     std::sync::Arc::new(|| flowsurface_exchange::account::ProxyState::Direct),
+    /// );
+    /// ```
     pub fn new(
-        http: reqwest::Client,
+        http: SignedHttp,
         venue: AccountVenue,
         env: AccountEnv,
         product: AccountProduct,
         account: AccountKey,
         creds: ApiCredentials,
-        proxy_snapshot: ProxyState,
         current_proxy: Arc<dyn Fn() -> ProxyState + Send + Sync>,
     ) -> Self {
         Self {
@@ -130,7 +151,6 @@ impl TradeClient {
             product,
             account,
             creds,
-            proxy_snapshot,
             current_proxy,
             clock_offset_ms: AtomicI64::new(0),
             #[cfg(test)]
@@ -207,7 +227,7 @@ impl TradeClient {
     /// Re-measure server time minus local time. Call at startup, every few minutes and
     /// after the machine wakes from sleep. A failure keeps the old offset.
     pub async fn sync_clock(&self) -> Result<i64, AccountError> {
-        check_proxy_snapshot(&self.proxy_snapshot, &(self.current_proxy)())?;
+        check_proxy_snapshot(self.http.proxy_state(), &(self.current_proxy)())?;
         let local = chrono::Utc::now().timestamp_millis();
         let (host, path) = match self.venue {
             AccountVenue::Binance => {
@@ -226,7 +246,7 @@ impl TradeClient {
             AccountVenue::Okx => LimitKey::Okx(OkxEndpoint::AccountConfig),
         };
         let (result, _) = send_limited_meta(
-            &self.http,
+            self.http.client(),
             &key,
             Priority::Query,
             reqwest::Method::GET,
@@ -271,7 +291,7 @@ impl TradeClient {
         req: &BinanceRequest,
         priority: Priority,
     ) -> (Result<Value, AccountError>, Option<u16>) {
-        if let Err(e) = check_proxy_snapshot(&self.proxy_snapshot, &(self.current_proxy)()) {
+        if let Err(e) = check_proxy_snapshot(self.http.proxy_state(), &(self.current_proxy)()) {
             return (Err(e), None);
         }
         let (_, host, _) = binance_hosts(self.env, self.product);
@@ -320,7 +340,16 @@ impl TradeClient {
             weight: binance_weight(req.path(), req.symbol().is_some(), self.product),
             account: Some(self.account),
         };
-        send_limited_meta(&self.http, &key, priority, method, url, headers, body).await
+        send_limited_meta(
+            self.http.client(),
+            &key,
+            priority,
+            method,
+            url,
+            headers,
+            body,
+        )
+        .await
     }
 
     async fn call_okx(
@@ -328,7 +357,7 @@ impl TradeClient {
         req: &OkxRequest,
         priority: Priority,
     ) -> (Result<Value, AccountError>, Option<u16>) {
-        if let Err(e) = check_proxy_snapshot(&self.proxy_snapshot, &(self.current_proxy)()) {
+        if let Err(e) = check_proxy_snapshot(self.http.proxy_state(), &(self.current_proxy)()) {
             return (Err(e), None);
         }
         let Some(passphrase) = self.creds.passphrase() else {
@@ -364,7 +393,16 @@ impl TradeClient {
             Err(e) => return (Err(e), None),
         };
         let key = LimitKey::Okx(okx_endpoint(req));
-        send_limited_meta(&self.http, &key, priority, method, url, headers, body).await
+        send_limited_meta(
+            self.http.client(),
+            &key,
+            priority,
+            method,
+            url,
+            headers,
+            body,
+        )
+        .await
     }
 
     // ── Private stream support (stage b) ────────────────────────────────
@@ -383,7 +421,7 @@ impl TradeClient {
         &self,
         method: reqwest::Method,
     ) -> Result<Value, AccountError> {
-        check_proxy_snapshot(&self.proxy_snapshot, &(self.current_proxy)())?;
+        check_proxy_snapshot(self.http.proxy_state(), &(self.current_proxy)())?;
         if (self.venue, self.product) != (AccountVenue::Binance, AccountProduct::UsdM) {
             return Err(AccountError::InvalidEndpoint);
         }
@@ -397,7 +435,7 @@ impl TradeClient {
             account: Some(self.account),
         };
         send_limited_meta(
-            &self.http,
+            self.http.client(),
             &key,
             Priority::Protective,
             method,
@@ -413,8 +451,10 @@ impl TradeClient {
 
     /// Run the single gate and send. `token` is the user's confirmation, spent here.
     ///
-    /// `journal` records a send that may end `Unknown` before it goes out (see [`journal`]); if
-    /// that fails, nothing is sent.
+    /// `journal` records a send that may end `Unknown` before it goes out (see [`journal`]).
+    /// Only a **new entry** is refused when that write fails (`JournalUnavailable`, nothing
+    /// sent). A reducing, closing or protective send goes out anyway, and
+    /// [`Submitted::journal_failed`] tells the caller the record is missing.
     ///
     /// [`journal`]: super::journal
     pub async fn submit<G: SendGate>(
@@ -494,6 +534,7 @@ impl TradeClient {
         // reducing, closing and protective sends always go out (conditions 60 and 72), so a
         // full disk or a corrupt file can never stop a position from being cut. For those the
         // write is best effort, and an in-memory lock still covers an Unknown outcome.
+        let mut journal_failed = false;
         let journaled = match &lookup {
             Some(l) => {
                 let record =
@@ -509,6 +550,7 @@ impl TradeClient {
                     return Err(NotSent::Journal);
                 } else {
                     log::error!("could not write ahead a non-entry send: sending anyway");
+                    journal_failed = true;
                     false
                 }
             }
@@ -559,7 +601,11 @@ impl TradeClient {
             }),
             _ => None,
         };
-        Ok(Submitted { outcome, pending })
+        Ok(Submitted {
+            outcome,
+            pending,
+            journal_failed,
+        })
     }
 
     /// True while a send for this (account, symbol) has an unresolved outcome or an entry in
@@ -864,7 +910,7 @@ impl TradeClient {
     /// a [`RulesTable`]: tables cannot be built from caller-supplied JSON. Also reads the
     /// order rate limits (`rateLimits`) into the limiter for Binance.
     pub async fn fetch_rules(&self, product: TradeProduct) -> Result<RulesTable, ReadError> {
-        check_proxy_snapshot(&self.proxy_snapshot, &(self.current_proxy)())?;
+        check_proxy_snapshot(self.http.proxy_state(), &(self.current_proxy)())?;
         let now = chrono::Utc::now().timestamp_millis();
         let expected = match (self.venue, self.product) {
             (AccountVenue::Binance, AccountProduct::Spot) => TradeProduct::BinanceSpot,
@@ -889,7 +935,7 @@ impl TradeClient {
                 };
                 let key = LimitKey::binance(&self.limit_host(host), weight);
                 let (result, _) = send_limited_meta(
-                    &self.http,
+                    self.http.client(),
                     &key,
                     Priority::Query,
                     reqwest::Method::GET,
@@ -910,7 +956,7 @@ impl TradeClient {
                 };
                 let path = format!("/api/v5/public/instruments?instType={inst}");
                 let (result, _) = send_limited_meta(
-                    &self.http,
+                    self.http.client(),
                     &LimitKey::Okx(OkxEndpoint::Instruments),
                     Priority::Query,
                     reqwest::Method::GET,
