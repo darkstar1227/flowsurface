@@ -1101,8 +1101,13 @@ mod tests {
                     .to_string_lossy()
                     .replace('\\', "/");
                 let text = std::fs::read_to_string(&path).unwrap();
-                // Only the code, not the tests of the file (they quote the words).
-                let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+                // Only the code, not the tests module of the file (it quotes the words). Single
+                // items that are `#[cfg(test)]` come before it and stay in the scan.
+                let code = text
+                    .split("#[cfg(test)]\nmod tests")
+                    .next()
+                    .and_then(|c| c.split("#[cfg(test)]\npub(crate) mod tests").next())
+                    .unwrap_or_default();
                 if code.contains(".submit(") {
                     submit_files.push(name.clone());
                 }
@@ -1123,5 +1128,32 @@ mod tests {
         assert_eq!(submit_files, vec!["order_flow.rs".to_string()]);
         assert_eq!(auto_files, AUTO_FILES.map(String::from).to_vec());
         assert_eq!(mint_files, vec!["main.rs".to_string()]);
+    }
+
+    /// "Retry protection" only opens the review: the order is sent by the confirmation handler
+    /// after the user confirms (new client id, new token), never from the retry itself, and it
+    /// makes no automatic order (so no grant).
+    #[test]
+    fn the_retry_only_opens_the_review_and_sends_nothing_itself() {
+        let main = include_str!("main.rs");
+        let start = main
+            .find("fn start_protection_retry(")
+            .expect("the retry function exists");
+        let rest = &main[start..];
+        // The body ends at the next method of the impl.
+        let end = rest.find("\n    /// ").expect("a doc comment follows");
+        let body = &rest[..end];
+        assert!(body.contains("self.start_review("), "{body}");
+        for banned in [
+            "order_flow::send(",
+            "confirm_order",
+            ".submit(",
+            "submit_auto(",
+            "AutoIntent::new(",
+            "auto_flow::mint(",
+            "AutoGrant",
+        ] {
+            assert!(!body.contains(banned), "the retry must not use {banned}");
+        }
     }
 }

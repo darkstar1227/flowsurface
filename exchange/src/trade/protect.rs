@@ -68,7 +68,9 @@ impl Protection {
             Protection::TargetOnly => "Take-profit only, no stop-loss",
             Protection::Unprotected => "No stop-loss",
             Protection::Undetermined => "Cannot tell: order and position lists may be out of date",
-            Protection::EntryPending => "Entry protection pending, not in force yet",
+            Protection::EntryPending => {
+                "Protection not active yet (entry protection pending, not in force yet)"
+            }
         }
     }
 }
@@ -344,6 +346,26 @@ fn trigger(
     Ok(rounded)
 }
 
+/// The trigger of a stop for a position of `dir` at the price `base`: `base` less the offset
+/// (more, for a short). Not rounded to the tick: the order builder rounds it and checks that it
+/// is on the right side of the market. Used to offer a stop again for a position that is
+/// already open, where the base is the current price. Pure: nothing is sent.
+pub fn stop_trigger_at(dir: Dir, base: &Decimal, offset: Offset) -> Result<Decimal, PlanError> {
+    if !base.is_positive() {
+        return Err(PlanError::BadInput);
+    }
+    let d = delta(base, offset)?;
+    let raw = match dir {
+        Dir::Long => base.checked_sub(&d)?,
+        Dir::Short => base.checked_add(&d)?,
+    };
+    if raw.is_positive() {
+        Ok(raw)
+    } else {
+        Err(PlanError::WrongSide)
+    }
+}
+
 /// The trigger prices and target quantities for a fill. Pure: nothing is sent.
 pub fn plan(
     dir: Dir,
@@ -410,6 +432,36 @@ pub fn plan(
 mod tests {
     use super::*;
     use crate::trade::client::OpenKind;
+
+    #[test]
+    fn a_stop_trigger_for_an_open_position_is_on_the_losing_side_of_the_base() {
+        let base = d("50000");
+        assert_eq!(
+            stop_trigger_at(Dir::Long, &base, Offset::Percent(d("2"))),
+            Ok(d("49000"))
+        );
+        assert_eq!(
+            stop_trigger_at(Dir::Short, &base, Offset::Percent(d("2"))),
+            Ok(d("51000"))
+        );
+        assert_eq!(
+            stop_trigger_at(Dir::Long, &base, Offset::Distance(d("250"))),
+            Ok(d("49750"))
+        );
+        // A distance that reaches zero or below, a zero offset and a bad base are refused.
+        assert_eq!(
+            stop_trigger_at(Dir::Long, &base, Offset::Distance(d("50000"))),
+            Err(PlanError::WrongSide)
+        );
+        assert_eq!(
+            stop_trigger_at(Dir::Long, &base, Offset::Percent(d("0"))),
+            Err(PlanError::BadOffset)
+        );
+        assert_eq!(
+            stop_trigger_at(Dir::Long, &d("0"), Offset::Percent(d("1"))),
+            Err(PlanError::BadInput)
+        );
+    }
 
     fn d(s: &str) -> Decimal {
         Decimal::parse(s).expect("decimal")

@@ -7,6 +7,7 @@
 
 use crate::{
     account_flow::ChallengeSlot,
+    auto_flow::FailureView,
     modal::order_ticket::{Gate, blocked_reason},
     style,
     trading::{RecordStatus, TradingState, account_key, display_name},
@@ -26,6 +27,11 @@ use std::fmt;
 /// What a click in the panel asks `main` to do. Not a `Message`: it can carry a token.
 pub enum Action {
     Bulk(BulkAction),
+    /// Offer a stop again for the entry with this client id (its position's protection failed).
+    /// The key names the entry by value; `main` looks it up, never trusts a stale position.
+    Retry(String),
+    /// The user confirmed "I've handled it" for the entry with this client id.
+    Handled(String),
     AckTrip,
     BeginRelease(Box<UnknownRecord>),
     Release(ManualReleaseToken, Box<UnknownRecord>),
@@ -37,6 +43,12 @@ pub enum Message {
     CancelAll,
     CloseAll,
     AckTrip,
+    /// Offer a stop again for the entry of this key (client id of the entry, by value).
+    Retry(String),
+    /// Ask to remove the entry of this key from the protection list; confirmed on a second step.
+    Handled(String),
+    ConfirmHandled,
+    CancelHandled,
     /// The client id of the record, looked up by value in the records the panel holds (a list
     /// that was replaced between the view and the click never points at another record).
     Release(String),
@@ -53,6 +65,10 @@ impl fmt::Debug for Message {
             Message::CancelAll => "CancelAll",
             Message::CloseAll => "CloseAll",
             Message::AckTrip => "AckTrip",
+            Message::Retry(_) => "Retry(..)",
+            Message::Handled(_) => "Handled(..)",
+            Message::ConfirmHandled => "ConfirmHandled",
+            Message::CancelHandled => "CancelHandled",
             Message::Release(_) => "Release(..)",
             Message::Discard(_) => "Discard(..)",
             Message::Typed(_) => "Typed(<redacted>)",
@@ -85,6 +101,8 @@ pub struct AccountPanel {
     /// Bumped for each bulk preparation, so an older answer is told apart.
     bulk_nonce: u64,
     bulk_preparing: bool,
+    /// The entry whose "I've handled it" waits for its second click (key by value).
+    handling: Option<String>,
 }
 
 /// Why cancel-all / close-all cannot start now, or `None`. `gate` has no order kind, so a
@@ -158,6 +176,7 @@ impl AccountPanel {
     /// Leaving the panel: nothing half typed stays behind.
     pub fn reset_form(&mut self) {
         self.form = None;
+        self.handling = None;
     }
 
     /// The challenge of a release arrived (or failed). The input starts empty.
@@ -196,6 +215,29 @@ impl AccountPanel {
             Message::CancelAll => return Some(Action::Bulk(BulkAction::CancelAll)),
             Message::CloseAll => return Some(Action::Bulk(BulkAction::Flatten)),
             Message::AckTrip => return Some(Action::AckTrip),
+            Message::Retry(key) => {
+                self.handling = None;
+                if deleting {
+                    self.status = Some((DELETING.to_string(), BannerKind::Error));
+                    return None;
+                }
+                self.status = None;
+                return Some(Action::Retry(key));
+            }
+            Message::Handled(key) => {
+                // One more click: the entry is not removed by a single press.
+                self.status = None;
+                self.handling = Some(key);
+            }
+            Message::CancelHandled => self.handling = None,
+            Message::ConfirmHandled => {
+                let key = self.handling.take()?;
+                if deleting {
+                    self.status = Some((DELETING.to_string(), BannerKind::Error));
+                    return None;
+                }
+                return Some(Action::Handled(key));
+            }
             Message::Release(client_id) => {
                 let meta = account?;
                 let record = self.record_of(meta, &client_id)?.clone();
@@ -399,14 +441,28 @@ impl AccountPanel {
             col = col.push(text(format!("  {symbol}: {line}")).size(small));
         }
 
-        // What the app could not do by itself after a fill (never retried): the position may be
-        // unprotected, so each line is a warning.
-        for note in trading.auto_notes(meta.id) {
-            col = col.push(banner(note, BannerKind::Error));
-        }
-
         // Cancel all / close all.
         let press = |m: Message| bulk_blocked.is_none().then_some(m);
+
+        // Condition 65: what the app could not do by itself after a fill is shown until the
+        // user has handled it (never retried by the app). Each entry offers a stop again (a
+        // new confirmation), closing all positions (the same confirmation as "Close all"), and
+        // removing the warning after a second click.
+        let alias = display_name(saved, meta);
+        for f in trading.auto_failures(meta.id) {
+            col = col.push(failure_view(
+                f,
+                &alias,
+                self.handling.as_deref(),
+                bulk_blocked.is_none(),
+                flatten_offered(meta.venue, meta.product),
+            ));
+        }
+        // Notes that are not failures of an entry.
+        for note in trading.auto_info_notes(meta.id) {
+            col = col.push(banner(note, BannerKind::Warning));
+        }
+
         let mut bulk =
             row![button(text("Cancel all").size(small)).on_press_maybe(press(Message::CancelAll))]
                 .spacing(8);
@@ -463,6 +519,72 @@ impl AccountPanel {
         }
         col.into()
     }
+}
+
+/// One entry of the protection list: the red banner of its failures with its buttons, or a plain
+/// line for an entry that only still counts as protection at work. `idle`: nothing else is
+/// running, so a confirmation can be opened.
+fn failure_view<'a>(
+    f: FailureView,
+    alias: &str,
+    handling: Option<&str>,
+    idle: bool,
+    flatten: bool,
+) -> Element<'a, Message> {
+    let small = style::text_size::SMALL;
+    let mut col = column![].spacing(4);
+    if f.reasons.is_empty() {
+        col = col.push(
+            text(format!(
+                "{}: automatic protection still counts as at work and blocks a new entry on \
+                 this symbol. If you know it is over, remove it.",
+                f.symbol
+            ))
+            .size(small),
+        );
+    } else {
+        let mut lines = format!("Protection failed on {alias}: {}", f.symbol);
+        for r in &f.reasons {
+            lines.push_str("\n- ");
+            lines.push_str(r.text());
+        }
+        col = col.push(banner(lines, BannerKind::Error));
+    }
+    if handling == Some(f.key.as_str()) {
+        col = col.push(
+            text(
+                "Remove this warning? Do it only after you checked the position and the open \
+                 orders on the exchange. The app stops watching this entry and a new entry on the \
+                 symbol is allowed. An order with an unknown result is not cleared by this.",
+            )
+            .size(small),
+        );
+        col = col.push(
+            row![
+                button(text("Yes, I've handled it").size(small)).on_press(Message::ConfirmHandled),
+                button(text("Back").size(small)).on_press(Message::CancelHandled),
+            ]
+            .spacing(8),
+        );
+        return col.into();
+    }
+    let mut buttons = row![].spacing(8);
+    if f.may_retry {
+        buttons = buttons.push(
+            button(text("Retry protection").size(small))
+                .on_press_maybe(idle.then(|| Message::Retry(f.key.clone()))),
+        );
+    }
+    if flatten && !f.reasons.is_empty() {
+        buttons = buttons.push(
+            button(text("Flatten (close all positions)").size(small))
+                .on_press_maybe(idle.then_some(Message::CloseAll)),
+        );
+    }
+    buttons = buttons.push(
+        button(text("I've handled it").size(small)).on_press(Message::Handled(f.key.clone())),
+    );
+    col.push(buttons).into()
 }
 
 const DELETING: &str = "The account is being deleted.";
