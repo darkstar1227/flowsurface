@@ -64,5 +64,6 @@ pub enum Menu {
     ThemeEditor,
     Network,
     ExchangeAccounts,
+    OrderTicket,
     IndicatorEditor,
 }

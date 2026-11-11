@@ -28,7 +28,7 @@ use exchange::trade::{
 };
 use iced::futures::{Stream, StreamExt, stream};
 use iced::{Element, Subscription, Task};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -195,6 +195,10 @@ struct AccountRuntime {
     needs_retest: bool,
     risk_unavailable: bool,
     equity_inflight: bool,
+    /// A snapshot of the current stream was applied and the state has not left `Connected`
+    /// since: only then is a flat position list known to be current (an empty book may be
+    /// refreshed, never before the first snapshot of a new stream).
+    book_trusted: bool,
 }
 
 fn equity_basis(venue: AccountVenue, product: AccountProduct) -> EquityBasis {
@@ -237,6 +241,7 @@ impl AccountRuntime {
             needs_retest: false,
             risk_unavailable: false,
             equity_inflight: false,
+            book_trusted: false,
         }
     }
 
@@ -313,6 +318,7 @@ impl AccountRuntime {
         ) -> Result<(), exchange::trade::RiskPoisoned>,
     ) {
         self.orders = orders.to_vec();
+        self.book_trusted = true;
         self.set_positions_from_snapshot(positions);
         let notionals = position_notionals(&self.positions);
         let r = apply(&self.risk, notionals);
@@ -402,8 +408,23 @@ pub struct TradingState {
     /// `None` until the startup load has been applied: no stream starts before.
     boot: Option<BootReport>,
     accounts: BTreeMap<Uuid, AccountRuntime>,
-    /// A send reported that its journal could not be written (c2b-2 sets it).
+    /// A send reported that its journal could not be written.
     journal_failed: bool,
+    /// Sends of this run that are still going or ended without an answer.
+    /// Only `Unresolved` is kept here: it must outlive any later send on the same pair.
+    pairs: BTreeMap<(Uuid, String), PairState>,
+    /// Sends that are going now, kept apart so finishing one never erases an unresolved result.
+    inflight: BTreeSet<(Uuid, String)>,
+}
+
+/// What blocks the buttons of one (account, symbol) (condition 61).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairState {
+    /// A send (and the lookup that follows an unknown result) is running.
+    InFlight,
+    /// The result stayed unknown after the lookups: the symbol is locked for entries until
+    /// the app restarts (manual release and discard come with c2b-3).
+    Unresolved,
 }
 
 fn now_ms() -> i64 {
@@ -417,6 +438,8 @@ impl TradingState {
             boot: None,
             accounts: BTreeMap::new(),
             journal_failed: false,
+            pairs: BTreeMap::new(),
+            inflight: BTreeSet::new(),
         }
     }
 
@@ -432,6 +455,83 @@ impl TradingState {
 
     pub fn on_booted(&mut self, report: BootReport) {
         self.boot = Some(report);
+    }
+
+    /// The account's stream was built for another proxy setting than the one now.
+    fn proxy_changed_for(&self, rt: &AccountRuntime) -> bool {
+        let Phase::Running(h) = &rt.phase else {
+            return false;
+        };
+        let now = self.proxy_reader()();
+        check_proxy_snapshot(h.ctx.signed.proxy_state(), &now).is_err()
+    }
+
+    /// The saved unresolved sends were loaded and locked (N4). Until then no order may be
+    /// prepared or sent: an entry could go out for a symbol that a saved record locks.
+    pub fn orders_allowed(&self) -> bool {
+        self.boot.is_some()
+    }
+
+    /// The account's one risk tracker, for the send gate (never another one).
+    pub fn risk_for(&self, id: Uuid) -> Option<SharedRisk> {
+        self.accounts.get(&id).map(|rt| rt.risk.clone())
+    }
+
+    pub fn stream_state(&self, id: Uuid) -> Option<StreamState> {
+        self.accounts.get(&id)?.state
+    }
+
+    pub fn needs_retest(&self, id: Uuid) -> bool {
+        self.accounts.get(&id).is_some_and(|rt| rt.needs_retest)
+    }
+
+    /// The open orders of the last snapshot of the account's stream (may be stale: see
+    /// `stream_state`).
+    pub fn open_orders(&self, id: Uuid) -> &[OpenOrder] {
+        self.accounts
+            .get(&id)
+            .map_or(&[], |rt| rt.orders.as_slice())
+    }
+
+    /// A saved unresolved send locks the (account, symbol) (or the whole account) until restart.
+    pub fn is_record_locked(&self, id: Uuid, symbol: &str) -> bool {
+        let account = account_key(id);
+        self.boot.as_ref().is_some_and(|b| {
+            b.journal_unreadable
+                || b.records
+                    .iter()
+                    .any(|r| r.account == account && (r.error.is_some() || r.symbol == symbol))
+        })
+    }
+
+    /// A send went out although its journal record could not be written (condition: standing
+    /// warning that unknown results will not be remembered).
+    pub fn set_journal_failed(&mut self) {
+        self.journal_failed = true;
+    }
+
+    pub fn pair_state(&self, id: Uuid, symbol: &str) -> Option<PairState> {
+        let key = (id, symbol.to_string());
+        if self.inflight.contains(&key) {
+            Some(PairState::InFlight)
+        } else {
+            self.pairs.get(&key).copied()
+        }
+    }
+
+    /// A send on the (account, symbol) starts. An earlier unresolved result stays.
+    pub fn begin_send(&mut self, id: Uuid, symbol: &str) {
+        self.inflight.insert((id, symbol.to_string()));
+    }
+
+    /// The send ended. Only an unknown result is kept (until restart); a later send that ends
+    /// well never clears an earlier unknown one.
+    pub fn finish_send(&mut self, id: Uuid, symbol: &str, unresolved: bool) {
+        let key = (id, symbol.to_string());
+        self.inflight.remove(&key);
+        if unresolved {
+            self.pairs.insert(key, PairState::Unresolved);
+        }
     }
 
     /// The closer of the account's running stream, for deleting the account.
@@ -555,6 +655,7 @@ impl TradingState {
         };
         let meta = rt.meta.clone();
         rt.feed = StreamEquityFeed::new(&key);
+        rt.book_trusted = false;
         rt.state = Some(StreamState::Reconnecting);
         rt.needs_retest = false;
         rt.phase = Phase::Running(StreamHandle {
@@ -589,7 +690,10 @@ impl TradingState {
                 }
                 Task::none()
             }
-            Message::EquityTick => self.poll_equity(),
+            Message::EquityTick => {
+                self.refresh_flat_books(now_ms);
+                self.poll_equity()
+            }
             Message::EquityPolled(id, observation) => {
                 if let Some(rt) = self.accounts.get_mut(&id) {
                     rt.equity_inflight = false;
@@ -623,7 +727,12 @@ impl TradingState {
             return;
         }
         match output {
-            StreamOutput::State(state) => rt.state = Some(state),
+            StreamOutput::State(state) => {
+                if state != StreamState::Connected {
+                    rt.book_trusted = false;
+                }
+                rt.state = Some(state);
+            }
             StreamOutput::InvalidateSession(_) => {
                 rt.needs_retest = true;
                 fx.invalidate.push(id);
@@ -669,6 +778,24 @@ impl TradingState {
                 (age / 3).clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
             })
             .min()
+    }
+
+    /// A flat book goes stale with time although nothing changed, and a stale book makes every
+    /// entry under a per-symbol cap `PositionUnknown`. While the stream is connected, has
+    /// applied its snapshot and stayed connected, the position events keep the list current,
+    /// so an empty list is still true and is stamped again. A book with a position, or one
+    /// from before the first snapshot of a stream, is never refreshed here.
+    fn refresh_flat_books(&mut self, now_ms: i64) {
+        for rt in self.accounts.values_mut() {
+            if rt.state == Some(StreamState::Connected)
+                && rt.book_trusted
+                && !rt.needs_retest
+                && rt.positions.is_empty()
+            {
+                let r = rt.risk.set_positions(now_ms, Vec::new());
+                rt.note_poisoned(r);
+            }
+        }
     }
 
     fn poll_equity(&mut self) -> Task<Message> {
@@ -856,12 +983,38 @@ pub fn standing_alerts(state: &TradingState, session: &TradeSession) -> Vec<Aler
         ));
     }
 
+    for ((id, symbol), pair) in &state.pairs {
+        if *pair == PairState::Unresolved {
+            let who = state
+                .accounts
+                .get(id)
+                .map_or("an account", |rt| rt.meta.alias.as_str());
+            out.push(alert(
+                Severity::Error,
+                format!(
+                    "{who}: the result of an order on {symbol} is unknown. New entries on this \
+                     symbol stay blocked until the app restarts; check the exchange."
+                ),
+            ));
+        }
+    }
+
     for rt in state.accounts.values() {
         let who = rt.meta.alias.as_str();
         if rt.needs_retest || (session.get(rt.meta.id).is_none() && rt.state.is_some()) {
             out.push(alert(
                 Severity::Warning,
                 format!("{who}: not tested in this session. Trading is off until you test it."),
+            ));
+        }
+        // L2: after a proxy change the stream only shows "reconnecting"; say why.
+        if state.proxy_changed_for(rt) {
+            out.push(alert(
+                Severity::Warning,
+                format!(
+                    "{who}: the proxy setting changed since this account was tested. Its stream \
+                     and all orders are refused until you test the account again."
+                ),
             ));
         }
         match rt.state {
@@ -1478,6 +1631,159 @@ mod tests {
         for secret in [SECRET_CID, "listenKey", "apiKey", "secret", "passphrase"] {
             assert!(!text.contains(secret), "leaked {secret}");
         }
+    }
+
+    #[test]
+    fn order_updates_and_equity_reads_print_no_client_id() {
+        let (_, _, key) = running();
+        let update = PrivateEvent::Order(exchange::trade::stream::OrderUpdate {
+            symbol: "BTCUSDT".into(),
+            client_id: Some(SECRET_CID.into()),
+            order_id: Some("987654".into()),
+            category: exchange::trade::stream::OrderCategory::Plain,
+            side: None,
+            status: exchange::trade::stream::OrderStatus::New,
+            price: None,
+            qty: None,
+            filled_qty: None,
+            reduce_only: None,
+            position_side: None,
+            time_ms: None,
+        });
+        let obs = EquityObservation::rest(
+            0,
+            Decimal::from_int(1000),
+            EquityBasis::BinanceTotalMarginBalance,
+        );
+        let msgs = [
+            Message::Stream(key, StreamOutput::Event(Box::new(update))),
+            Message::EquityPolled(Uuid::nil(), Some(obs)),
+        ];
+        let text = format!("{msgs:?}");
+        assert!(!text.contains(SECRET_CID), "{text}");
+    }
+
+    // ── N1, the book of a flat account, the proxy alert ─────────────────
+
+    #[test]
+    fn testing_again_after_a_failed_delete_keeps_the_tracker_and_its_lock() {
+        let (mut t, m, _) = running();
+        t.apply_risk_settings(
+            m.id,
+            &AccountRiskSettings {
+                daily_loss_limit: Some("100".into()),
+                confirm_observations: 1,
+                ..AccountRiskSettings::default()
+            },
+        );
+        let basis = EquityBasis::BinanceTotalMarginBalance;
+        let base = now_ms();
+        {
+            let rt = t.accounts.get_mut(&m.id).unwrap();
+            for (at, eq) in [(base, 1000), (base + 1, 700)] {
+                let _ = rt
+                    .risk
+                    .observe(EquityObservation::rest(at, Decimal::from_int(eq), basis));
+            }
+            assert!(rt.risk.is_tripped().unwrap().is_some());
+        }
+        // The delete failed after the stream was closed: the account is voided, not removed.
+        let _ = t.on_tested(&m, false, signed());
+        assert!(t.accounts.contains_key(&m.id));
+        let _ = t.on_tested(&m, true, signed());
+        let rt = &t.accounts[&m.id];
+        assert!(
+            rt.risk.is_tripped().unwrap().is_some(),
+            "a new test must not clear the lock"
+        );
+        assert_eq!(rt.generation, 2, "one stream was made again");
+    }
+
+    fn connect(t: &mut TradingState, key: StreamKey) {
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::State(StreamState::Connected)),
+            0,
+        );
+    }
+
+    #[test]
+    fn a_flat_book_is_stamped_only_when_connected_trusted_and_flat() {
+        let (mut t, m, key) = running();
+        t.apply_risk_settings(
+            m.id,
+            &AccountRiskSettings {
+                max_symbol_notional: Some("1000".into()),
+                ..AccountRiskSettings::default()
+            },
+        );
+        let view = RiskView {
+            account: account_key(m.id),
+            symbol: "BTCUSDT",
+            exposure: Exposure::Adds {
+                notional: Some(Decimal::from_int(10)),
+            },
+        };
+        let risk = t.risk_for(m.id).unwrap();
+        // Before the first snapshot nothing is trusted: a refresh does not make a book.
+        connect(&mut t, key);
+        t.refresh_flat_books(now_ms());
+        assert_ne!(risk.check(&view), Ok(()), "no snapshot yet");
+        // After a flat snapshot the book is stamped; later refreshes keep it fresh.
+        let now = now_ms();
+        t.accounts
+            .get_mut(&m.id)
+            .unwrap()
+            .apply_snapshot(&[], &[], |r, n| r.set_positions(now, n));
+        t.refresh_flat_books(now);
+        assert_eq!(risk.check(&view), Ok(()));
+        // A held position is never refreshed: it stays unknown.
+        t.accounts
+            .get_mut(&m.id)
+            .unwrap()
+            .apply_snapshot(&[], &[held("BTCUSDT", 1)], |r, n| r.set_positions(now, n));
+        t.refresh_flat_books(now);
+        assert_eq!(risk.check(&view), Err(RiskRefusal::PositionUnknown));
+        // Not connected: no refresh either (flat again, but the stream is down).
+        t.accounts
+            .get_mut(&m.id)
+            .unwrap()
+            .apply_snapshot(&[], &[], |r, n| r.set_positions(0, n));
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::State(StreamState::Reconnecting)),
+            0,
+        );
+        t.refresh_flat_books(now);
+        assert!(!t.accounts[&m.id].book_trusted);
+    }
+
+    #[test]
+    fn a_proxy_change_after_the_test_is_a_standing_warning() {
+        let (t, m, _) = running();
+        let session = session_with(&m);
+        assert!(!texts(&standing_alerts(&t, &session)).contains("proxy setting changed"));
+        t.set_proxy(ProxyState::Broken);
+        let all = texts(&standing_alerts(&t, &session));
+        assert!(all.contains("proxy setting changed"), "{all}");
+        assert!(all.contains("test the account again"), "{all}");
+    }
+
+    #[test]
+    fn a_later_send_never_erases_an_unresolved_result() {
+        let (mut t, m, _) = running();
+        t.begin_send(m.id, "BTCUSDT");
+        assert_eq!(t.pair_state(m.id, "BTCUSDT"), Some(PairState::InFlight));
+        t.finish_send(m.id, "BTCUSDT", true);
+        assert_eq!(t.pair_state(m.id, "BTCUSDT"), Some(PairState::Unresolved));
+        // A stop or a cancel on the same pair starts and ends well.
+        t.begin_send(m.id, "BTCUSDT");
+        assert_eq!(t.pair_state(m.id, "BTCUSDT"), Some(PairState::InFlight));
+        t.finish_send(m.id, "BTCUSDT", false);
+        assert_eq!(t.pair_state(m.id, "BTCUSDT"), Some(PairState::Unresolved));
+        assert!(texts(&standing_alerts(&t, &session_with(&m))).contains("is unknown"));
+        // Another symbol is untouched, and a send that ends well leaves nothing behind.
+        t.begin_send(m.id, "ETHUSDT");
+        t.finish_send(m.id, "ETHUSDT", false);
+        assert_eq!(t.pair_state(m.id, "ETHUSDT"), None);
     }
 
     // ── Proxy, equity ───────────────────────────────────────────────────

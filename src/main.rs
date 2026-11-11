@@ -6,6 +6,7 @@ mod layout;
 mod logger;
 mod modal;
 mod notify;
+mod order_flow;
 mod screen;
 mod style;
 mod theme;
@@ -34,6 +35,7 @@ use notify::Notifications;
 use screen::dashboard::{self, Dashboard};
 use theme::ThemeState;
 use widget::{
+    BannerKind,
     toast::{self, Toast},
     tooltip,
 };
@@ -93,6 +95,12 @@ struct Flowsurface {
     indicator_editor: IndicatorEditor,
     network_editor: NetworkEditor,
     exchange_accounts: modal::exchange_accounts::ExchangeAccounts,
+    /// The manual order form (memory only; nothing of it is saved).
+    order_ticket: modal::order_ticket::OrderTicket,
+    /// The confirmation window of one prepared order, while it is open.
+    order_confirm: Option<modal::order_confirm::PendingConfirm>,
+    /// The request being sent, kept so an expired preview can be made again.
+    order_requests: HashMap<(uuid::Uuid, String), order_flow::PrepareRequest>,
     network_config: data::Network,
     /// The saved state could not be read, so the proxy setting is unknown (see `SavedState`).
     proxy_unreadable: bool,
@@ -175,6 +183,9 @@ enum Message {
     IndicatorEditor(indicator_editor::Message),
     NetworkEditor(modal::network_editor::Message),
     ExchangeAccounts(modal::exchange_accounts::Message),
+    OrderTicket(modal::order_ticket::Message),
+    OrderConfirm(modal::order_confirm::Message),
+    OrderSent(order_flow::SendSummary),
     Trading(trading::Message),
     Layouts(modal::layout_manager::Message),
     SharedChartResources(manifest::Message),
@@ -210,6 +221,266 @@ impl Flowsurface {
     fn signed_client_for_current_proxy(&self) -> Result<SignedHttp, String> {
         self.proxy_snapshot_ok().map_err(|e| e.to_string())?;
         self.data_sources.signed.clone()
+    }
+
+    /// Drops the pending preview and the confirmation (the ticket was left, or Escape).
+    fn discard_order(&mut self) {
+        self.order_confirm = None;
+        self.order_requests.clear();
+        // Makes any preview still on its way stale.
+        self.order_ticket.finish_prepare();
+    }
+
+    /// Checks the gate again and starts the background preview of a request.
+    fn start_review(&mut self, request: order_flow::PrepareRequest) -> Task<Message> {
+        use modal::order_ticket as ticket;
+        let accounts = self.exchange_accounts.persisted().accounts;
+        let Some(meta) = accounts.iter().find(|m| m.id == request.account).cloned() else {
+            self.order_ticket.set_status(
+                "The account no longer exists.".to_string(),
+                BannerKind::Error,
+            );
+            return Task::none();
+        };
+        // `Ticker::new` asserts on odd text: never let typed text reach it unchecked.
+        if !ticket::valid_symbol(&request.symbol) {
+            self.order_ticket.set_status(
+                "The symbol may hold up to 28 letters, digits, '-' or '_'.".to_string(),
+                BannerKind::Error,
+            );
+            return Task::none();
+        }
+        let signed = self.signed_client_for_current_proxy();
+        let gate = ticket::gate_for(
+            Some(&meta),
+            ticket::kind_of(&request.spec),
+            &request.symbol,
+            &self.trading,
+            &self.trade_session,
+            signed.is_ok(),
+            false,
+        );
+        if let Some(why) = ticket::blocked_reason(&gate) {
+            self.order_ticket
+                .set_status(why.to_string(), BannerKind::Error);
+            return Task::none();
+        }
+        let Ok(signed) = signed else {
+            self.order_ticket.set_status(
+                "No usable connection to the exchange.".to_string(),
+                BannerKind::Error,
+            );
+            return Task::none();
+        };
+        let ref_price = order_flow::trade_market(order_flow::market_of(meta.venue, meta.product))
+            .and_then(|_| {
+                let ticker = exchange::Ticker::new(
+                    &request.symbol,
+                    order_flow::market_of(meta.venue, meta.product),
+                );
+                self.sidebar.tickers_table.mark_price(&ticker)
+            })
+            .and_then(order_flow::price_to_decimal);
+        let mode = self.trade_session.get(meta.id).and_then(|e| e.actual_mode);
+        let nonce = self.order_ticket.start_prepare();
+        let input = order_flow::PrepareInput {
+            meta,
+            mode,
+            request,
+            ref_price,
+            signed,
+            proxy: self.trading.proxy_reader(),
+        };
+        Task::perform(order_flow::prepare(input), move |result| {
+            Message::OrderTicket(modal::order_ticket::Message::Prepared(
+                nonce,
+                result.map(Box::new),
+            ))
+        })
+    }
+
+    fn update_order_ticket(&mut self, msg: modal::order_ticket::Message) -> Task<Message> {
+        use modal::order_ticket::{Action, Message as T};
+        if let T::Prepared(nonce, result) = msg {
+            // An answer for a review that was replaced or discarded is dropped.
+            if !self.order_ticket.is_current(nonce) {
+                return Task::none();
+            }
+            self.order_ticket.finish_prepare();
+            match result {
+                Ok(prepared) => {
+                    // Never replace a confirmation that is open: the user may be about to
+                    // press its Confirm (M2). The new preview is dropped.
+                    if self.order_confirm.is_some() {
+                        self.order_ticket.set_status(
+                            "Another order is waiting for confirmation. Review again after it."
+                                .to_string(),
+                            BannerKind::Warning,
+                        );
+                        return Task::none();
+                    }
+                    // The account of the preview itself, not the one the ticket shows now.
+                    let accounts = self.exchange_accounts.persisted().accounts;
+                    match modal::order_confirm::account_of(&accounts, &prepared.request) {
+                        Some(meta) => {
+                            self.order_confirm = Some(modal::order_confirm::PendingConfirm::new(
+                                self.main_window.id,
+                                meta,
+                                *prepared,
+                                std::time::Instant::now(),
+                            ));
+                        }
+                        None => self.order_ticket.set_status(
+                            "The account no longer exists.".to_string(),
+                            BannerKind::Error,
+                        ),
+                    }
+                }
+                Err(e) => self.order_ticket.set_status(e, BannerKind::Error),
+            }
+            return Task::none();
+        }
+        match self.order_ticket.update(msg) {
+            Some(Action::Review(request)) => self.start_review(request),
+            Some(Action::Exit) => {
+                self.discard_order();
+                self.sidebar.set_menu(None);
+                Task::none()
+            }
+            None => Task::none(),
+        }
+    }
+
+    fn update_order_confirm(&mut self, msg: modal::order_confirm::Message) -> Task<Message> {
+        use modal::order_confirm::Message as C;
+        match msg {
+            C::DelayElapsed => Task::none(),
+            C::Cancel => {
+                self.order_confirm = None;
+                Task::none()
+            }
+            C::Confirm => self.confirm_order(),
+        }
+    }
+
+    /// The one click that sends: checks the gate once more, takes the intent out of the
+    /// confirmation (once) and starts the send in the background.
+    fn confirm_order(&mut self) -> Task<Message> {
+        use modal::order_ticket as ticket;
+        let Some(conf) = self.order_confirm.as_ref() else {
+            return Task::none();
+        };
+        let request = conf.request.clone();
+        let accounts = self.exchange_accounts.persisted().accounts;
+        let meta = accounts.iter().find(|m| m.id == request.account).cloned();
+        let signed = self.signed_client_for_current_proxy();
+        let gate = ticket::gate_for(
+            meta.as_ref(),
+            ticket::kind_of(&request.spec),
+            &request.symbol,
+            &self.trading,
+            &self.trade_session,
+            signed.is_ok(),
+            false,
+        );
+        let risk = self.trading.risk_for(request.account);
+        let risk_missing = risk.is_none();
+        let (Some(meta), Ok(signed), Some(risk), None) =
+            (meta, signed, risk, ticket::blocked_reason(&gate))
+        else {
+            self.order_confirm = None;
+            let why = ticket::blocked_reason(&gate)
+                .unwrap_or(if risk_missing {
+                    "The account has no running trading state. Test it again in Exchange accounts."
+                } else {
+                    "The order can no longer be sent."
+                })
+                .to_string();
+            self.order_ticket.set_status(why, BannerKind::Error);
+            return Task::none();
+        };
+        let Some(conf) = self.order_confirm.as_mut() else {
+            return Task::none();
+        };
+        let Some((token, intent)) = conf.confirm(std::time::Instant::now()) else {
+            return Task::none();
+        };
+        self.order_confirm = None;
+        self.trading.begin_send(request.account, &request.symbol);
+        self.order_ticket
+            .set_status("Sending…".to_string(), BannerKind::Normal);
+        let input = order_flow::SendInput {
+            session: self.trade_session.get(meta.id).cloned(),
+            symbol: request.symbol.clone(),
+            meta,
+            signed,
+            proxy: self.trading.proxy_reader(),
+            risk,
+            token,
+            intent,
+        };
+        self.order_requests
+            .insert((request.account, request.symbol.clone()), request);
+        Task::perform(order_flow::send(input), Message::OrderSent)
+    }
+
+    fn on_order_sent(&mut self, summary: order_flow::SendSummary) -> Task<Message> {
+        // Only an unknown result keeps the symbol blocked; it is never erased by a later send.
+        self.trading.finish_send(
+            summary.account,
+            &summary.symbol,
+            summary.pair_after().is_some(),
+        );
+        if summary.journal_failed {
+            self.trading.set_journal_failed();
+        }
+        // The request of this very send (account and symbol), never another one's.
+        let request = self
+            .order_requests
+            .remove(&(summary.account, summary.symbol.clone()));
+        if summary.result == order_flow::SendResult::RulesExpired
+            && let Some(request) = request
+        {
+            // Not a failure: the data aged between the preview and the click. A new preview
+            // is made only when nothing else is open or being prepared; it would replace or
+            // outdate that other order (M2). Otherwise the user is told to review again.
+            if order_flow::may_review_again(
+                self.order_confirm.is_some(),
+                self.order_ticket.is_preparing(),
+            ) {
+                let task = self.start_review(request);
+                if self.order_ticket.is_preparing() {
+                    self.order_ticket.set_status(
+                        "The trading data expired. Review the order again.".to_string(),
+                        BannerKind::Warning,
+                    );
+                }
+                return task;
+            }
+            self.order_ticket.set_status(
+                format!(
+                    "The trading data of the {} order expired. Review it again.",
+                    summary.symbol
+                ),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
+        let line = order_flow::describe_result(&summary.result, summary.client_tail.as_deref());
+        // With the ticket closed nobody sees its banner: say it in a toast as well.
+        if self.sidebar.active_menu() != Some(sidebar::Menu::OrderTicket) {
+            use order_flow::SendResult as R;
+            let text = format!("{}: {line}", summary.symbol);
+            self.notifications.push(match summary.result {
+                R::Accepted { .. } | R::Found => Toast::info(text),
+                R::NotPlacedPresumed | R::RulesExpired | R::ConfirmationMismatch => {
+                    Toast::warn(text)
+                }
+                _ => Toast::error(text),
+            });
+        }
+        self.order_ticket.show_result(&summary, line);
+        Task::none()
     }
 
     fn new() -> (Self, Task<Message>) {
@@ -266,6 +537,9 @@ impl Flowsurface {
             exchange_accounts: modal::exchange_accounts::ExchangeAccounts::new(
                 &saved_state.exchange_accounts,
             ),
+            order_ticket: modal::order_ticket::OrderTicket::default(),
+            order_confirm: None,
+            order_requests: HashMap::new(),
             antialiasing: saved_state.antialiasing,
             applied_antialiasing: saved_state.antialiasing,
             restoring_windows: HashSet::new(),
@@ -322,14 +596,18 @@ impl Flowsurface {
 
         (
             state,
-            open_main_window
-                .chain(load_layout)
-                .chain(restore_detached)
-                .chain(launch_sidebar.map(Message::Sidebar))
-                // Locks the saved unresolved sends before any private stream can start.
-                .chain(Task::perform(trading::boot(), |report| {
+            Task::batch([
+                open_main_window
+                    .chain(load_layout)
+                    .chain(restore_detached)
+                    .chain(launch_sidebar.map(Message::Sidebar)),
+                // Locks the saved unresolved sends before any private stream can start. It runs
+                // beside the rest so a slow sidebar fetch cannot hold it back; no order can be
+                // prepared or sent until it is applied.
+                Task::perform(trading::boot(), |report| {
                     Message::Trading(trading::Message::Booted(report))
-                })),
+                }),
+            ]),
         )
     }
 
@@ -424,7 +702,14 @@ impl Flowsurface {
                     return Task::none();
                 }
 
+                // Escape closes the confirmation first, and never confirms.
+                if self.order_confirm.is_some() {
+                    self.order_confirm = None;
+                    return Task::none();
+                }
+
                 if self.sidebar.active_menu().is_some() {
+                    self.discard_order();
                     self.exchange_accounts.clear_form();
                     self.sidebar.set_menu(None);
                 } else {
@@ -889,13 +1174,23 @@ impl Flowsurface {
                             );
                         }
                     }
-                    Some(modal::exchange_accounts::Action::DeleteFailed(id)) => {
-                        self.trade_session.invalidate(id);
-                        self.trading.remove(id);
+                    Some(modal::exchange_accounts::Action::DeleteFailed(meta)) => {
+                        // The account stays listed: its runtime, with the one risk tracker, is
+                        // kept (N1). Only the stream is closed and the account needs a new test.
+                        self.trade_session.invalidate(meta.id);
+                        extra.push(
+                            self.trading
+                                .on_tested(&meta, false, signed.clone())
+                                .map(Message::Trading),
+                        );
                     }
                     Some(modal::exchange_accounts::Action::RiskSaved(id, settings)) => {
                         self.trading.apply_risk_settings(id, &settings);
                         persist = true;
+                    }
+                    Some(modal::exchange_accounts::Action::Deleting(id)) => {
+                        // From here the gate refuses every order of the account (L4).
+                        self.trade_session.invalidate(id);
                     }
                     Some(modal::exchange_accounts::Action::Removed(id)) => {
                         self.trade_session.invalidate(id);
@@ -925,6 +1220,9 @@ impl Flowsurface {
                 extra.push(task);
                 return Task::batch(extra);
             }
+            Message::OrderTicket(msg) => return self.update_order_ticket(msg),
+            Message::OrderConfirm(msg) => return self.update_order_confirm(msg),
+            Message::OrderSent(summary) => return self.on_order_sent(summary),
             Message::Trading(msg) => {
                 let (task, effects) = self
                     .trading
@@ -945,6 +1243,12 @@ impl Flowsurface {
                     // Closing the modal (or switching away) drops any typed credentials.
                     // Background ticks yield no action and must not wipe the form.
                     self.exchange_accounts.clear_form();
+                }
+                if let Some(screen::sidebar::Action::MenuChanged(menu)) = &action
+                    && *menu != Some(sidebar::Menu::OrderTicket)
+                {
+                    // Leaving the ticket drops its pending preview and confirmation.
+                    self.discard_order();
                 }
 
                 match action {
@@ -1114,6 +1418,7 @@ impl Flowsurface {
         };
 
         let content = self.with_standing_alerts(content);
+        let content = self.with_order_confirm(id, content);
 
         toast::Manager::new(
             content,
@@ -1135,6 +1440,36 @@ impl Flowsurface {
             Some(banners) => column![banners, content].into(),
             None => content,
         }
+    }
+
+    /// The confirmation of a prepared order, over everything in the window it was opened in.
+    /// The backdrop takes every click, so nothing behind it can be pressed.
+    fn with_order_confirm<'a>(
+        &'a self,
+        id: window::Id,
+        content: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let Some(confirm) = self.order_confirm.as_ref().filter(|c| c.window == id) else {
+            return content;
+        };
+        let dialog = confirm
+            .view(std::time::Instant::now())
+            .map(Message::OrderConfirm);
+        iced::widget::stack![
+            content,
+            iced::widget::opaque(iced::widget::mouse_area(
+                container(iced::widget::opaque(dialog))
+                    .width(iced::Length::Fill)
+                    .height(iced::Length::Fill)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center)
+                    .style(|_| container::Style {
+                        background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5).into()),
+                        ..container::Style::default()
+                    }),
+            ))
+        ]
+        .into()
     }
 
     fn view_detached(&self, id: window::Id, layout_id: uuid::Uuid) -> Element<'_, Message> {
@@ -1168,6 +1503,7 @@ impl Flowsurface {
         };
 
         let content = self.with_standing_alerts(content);
+        let content = self.with_order_confirm(id, content);
 
         toast::Manager::new(
             content,
@@ -1261,7 +1597,20 @@ impl Flowsurface {
             Subscription::none()
         };
 
+        // Redraws a LIVE confirmation so its button turns on after the delay.
+        let confirm_delay = if self
+            .order_confirm
+            .as_ref()
+            .is_some_and(|c| c.waiting(std::time::Instant::now()))
+        {
+            iced::time::every(std::time::Duration::from_millis(100))
+                .map(|_| Message::OrderConfirm(modal::order_confirm::Message::DelayElapsed))
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch(vec![
+            confirm_delay,
             tab_drag,
             exchange_streams,
             trading,
@@ -1300,6 +1649,13 @@ impl Flowsurface {
     fn handle_hotkey(&mut self, hotkey: Hotkey) -> Task<Message> {
         use modal::layout_manager::Message as Layouts;
 
+        // While a confirmation is open only Escape (which cancels it) does anything.
+        if self.order_confirm.is_some() {
+            return match hotkey {
+                Hotkey::Escape => Task::done(Message::GoBack),
+                _ => Task::none(),
+            };
+        }
         // While the indicator editor is open, layout and search shortcuts would act on the
         // dashboard hidden behind it; only Escape and save apply there.
         if self.sidebar.active_menu() == Some(sidebar::Menu::IndicatorEditor) {
@@ -1694,6 +2050,12 @@ impl Flowsurface {
                         ))),
                     );
 
+                    let toggle_order_ticket = button(text("Order ticket")).on_press(
+                        Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(Some(
+                            sidebar::Menu::OrderTicket,
+                        ))),
+                    );
+
                     let timezone_picklist = pick_list(
                         [data::UserTimezone::Utc, data::UserTimezone::Local],
                         Some(self.timezone),
@@ -1949,7 +2311,7 @@ impl Flowsurface {
                         column![text("Rendering").size(crate::style::text_size::SECTION), antialiasing_checkbox,].spacing(12),
                         column![
                             text("Experimental").size(crate::style::text_size::SECTION),
-                            column![toggle_theme_editor, toggle_network_editor, toggle_exchange_accounts].spacing(8),
+                            column![toggle_theme_editor, toggle_network_editor, toggle_exchange_accounts, toggle_order_ticket].spacing(8),
                         ]
                         .spacing(12),
                         footer,
@@ -2171,6 +2533,25 @@ impl Flowsurface {
                     self.exchange_accounts
                         .view(&self.trading)
                         .map(Message::ExchangeAccounts),
+                    Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(None)),
+                    padding,
+                    Alignment::End,
+                    align_x,
+                )
+            }
+            sidebar::Menu::OrderTicket => {
+                let (align_x, padding) = match sidebar_pos {
+                    sidebar::Position::Left => (Alignment::Start, padding::left(44).bottom(4)),
+                    sidebar::Position::Right => (Alignment::End, padding::right(44).bottom(4)),
+                };
+
+                let accounts = self.exchange_accounts.persisted().accounts;
+                let signed_ok = self.proxy_snapshot_ok().is_ok();
+                dashboard_modal(
+                    base,
+                    self.order_ticket
+                        .view(&accounts, &self.trading, &self.trade_session, signed_ok)
+                        .map(Message::OrderTicket),
                     Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(None)),
                     padding,
                     Alignment::End,

@@ -364,6 +364,15 @@ impl TickersTable {
         Subscription::batch([stats_fetch, debounce_tick])
     }
 
+    /// The last mark price of a ticker, when the table has one. The order ticket uses it for the
+    /// 5% limit-price check, the notional of a market order and the trigger side of protective
+    /// orders. It has no timestamp and keeps its old value when a fetch fails: before Live
+    /// opens, `prepare` must read a timestamped mark price instead.
+    pub fn mark_price(&self, ticker: &exchange::Ticker) -> Option<exchange::unit::Price> {
+        let idx = *self.row_index.get(ticker)?;
+        Some(self.ticker_rows.get(idx)?.stats.mark_price)
+    }
+
     pub fn is_metadata_loading(&self) -> bool {
         self.metadata.any_in_flight()
     }

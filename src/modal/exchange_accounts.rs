@@ -35,14 +35,17 @@ pub enum Action {
     /// A connection test finished. `Some` records its verdict in the send gate's session;
     /// `None` (the test could not run) voids any earlier verdict.
     Tested(Box<AccountMeta>, Option<Box<CheckReport>>),
+    /// A delete was confirmed and is running: the session verdict is void from now on, so no
+    /// order can be sent for the account while its credentials are being removed (L4).
+    Deleting(Uuid),
     /// An account was deleted: its session verdict is void and the list must be persisted.
     Removed(Uuid),
     /// Every account's test could not start (no usable signed client): all verdicts are void.
     Voided(Vec<AccountMeta>),
     /// The account's stream was closed for a delete that then failed at the Keychain: the
     /// stream and the session verdict are gone, the account stays listed and must be tested
-    /// again.
-    DeleteFailed(Uuid),
+    /// again. The caller keeps the account's risk state (N1): it is handled like a failed test.
+    DeleteFailed(Box<AccountMeta>),
     /// New risk settings were saved for the account (already validated by `limits()`): the
     /// tracker takes them and the list must be persisted.
     RiskSaved(Uuid, Box<AccountRiskSettings>),
@@ -400,6 +403,15 @@ impl ExchangeAccounts {
             }
             Message::Tested(id, outcome) => {
                 if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) {
+                    // A test that finishes while the account is being deleted must not start a
+                    // new stream for it (N2): the delete already closed the old one.
+                    if row.deleting {
+                        // Not stuck in `Testing` if the delete then fails and the row stays.
+                        if matches!(row.status, Status::Testing) {
+                            row.status = Status::NotTested;
+                        }
+                        return (Task::none(), None);
+                    }
                     let meta = Box::new(row.meta.clone());
                     return match outcome {
                         Ok(report) => {
@@ -425,7 +437,7 @@ impl ExchangeAccounts {
                     row.delete_error = None;
                     return (
                         delete_task(row.meta.clone(), closer_for(id), trading::SHUTDOWN_TIMEOUT),
-                        None,
+                        Some(Action::Deleting(id)),
                     );
                 }
             }
@@ -441,7 +453,8 @@ impl ExchangeAccounts {
                             self.rows[pos].delete_error = Some(e);
                             // The stream was closed before the Keychain was touched: it is
                             // gone, so the account needs a new test.
-                            return (Task::none(), Some(Action::DeleteFailed(id)));
+                            let meta = Box::new(self.rows[pos].meta.clone());
+                            return (Task::none(), Some(Action::DeleteFailed(meta)));
                         }
                     }
                 }
@@ -497,7 +510,8 @@ impl ExchangeAccounts {
         let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) else {
             return (Task::none(), None);
         };
-        if matches!(row.status, Status::Testing) {
+        // An account being deleted is not tested (N2): its stream was already closed.
+        if matches!(row.status, Status::Testing) || row.deleting {
             return (Task::none(), None);
         }
         let client = match signed {
@@ -549,7 +563,7 @@ impl ExchangeAccounts {
         if let Err(e) = signed {
             let mut voided = Vec::new();
             for row in &mut self.rows {
-                if !matches!(row.status, Status::Testing) {
+                if !matches!(row.status, Status::Testing) && !row.deleting {
                     row.status = Status::Failed(e.clone());
                     voided.push(row.meta.clone());
                 }
@@ -616,8 +630,8 @@ impl ExchangeAccounts {
         .align_y(iced::Alignment::Center);
 
         let testing = matches!(r.status, Status::Testing);
-        let test_btn =
-            button(text("Test")).on_press_maybe((!testing).then_some(Message::Test(meta.id)));
+        let test_btn = button(text("Test"))
+            .on_press_maybe((!testing && !r.deleting).then_some(Message::Test(meta.id)));
 
         let delete_ctrl: Element<'a, Message> = if self.confirm_delete == Some(meta.id) {
             row![
@@ -1090,6 +1104,25 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_delete_voids_the_session_verdict_at_once() {
+        let (mut modal, meta) = modal_with_account();
+        let (_, action) = modal.update(
+            Message::ConfirmDelete(meta.id),
+            &Err("x".into()),
+            &no_closer,
+        );
+        assert!(matches!(action, Some(Action::Deleting(id)) if id == meta.id));
+        assert!(modal.rows[0].deleting);
+        // A second confirm while it runs reports nothing new.
+        let (_, action) = modal.update(
+            Message::ConfirmDelete(meta.id),
+            &Err("x".into()),
+            &no_closer,
+        );
+        assert!(action.is_none());
+    }
+
+    #[test]
     fn deleting_an_account_reports_its_id_so_the_session_can_drop_it() {
         let (mut modal, meta) = modal_with_account();
         let (_, action) = modal.update(
@@ -1126,11 +1159,51 @@ mod tests {
             &Err("x".into()),
             &no_closer,
         );
-        assert!(matches!(action, Some(Action::DeleteFailed(id)) if id == meta.id));
+        assert!(matches!(action, Some(Action::DeleteFailed(m)) if m.id == meta.id));
         // The account stays listed, with the error, and can be deleted again.
         assert_eq!(modal.rows.len(), 1);
         assert!(!modal.rows[0].deleting);
         assert!(modal.rows[0].delete_error.is_some());
+    }
+
+    #[test]
+    fn an_account_being_deleted_is_not_tested_and_a_late_result_is_ignored() {
+        let (mut modal, meta) = modal_with_account();
+        modal.rows[0].deleting = true;
+        let signed =
+            SignedHttp::build(exchange::account::ProxyState::Direct).map_err(|e| e.to_string());
+        // Test, and Test all with no usable client, both skip it.
+        let (_, action) = modal.update(Message::Test(meta.id), &signed, &no_closer);
+        assert!(action.is_none());
+        assert!(matches!(modal.rows[0].status, Status::NotTested));
+        let (_, action) = modal.update(Message::TestAll, &signed, &no_closer);
+        assert!(action.is_none());
+        assert!(matches!(modal.rows[0].status, Status::NotTested));
+        let (_, action) = modal.update(Message::TestAll, &Err("proxy".into()), &no_closer);
+        assert!(matches!(action, Some(Action::Voided(m)) if m.is_empty()));
+        // A test that was already running finishes: no stream may start for the account.
+        modal.rows[0].status = Status::Testing;
+        let report = CheckReport {
+            verdict: Verdict::Usable,
+            warnings: vec![],
+            actual_mode: None,
+            can_trade: Some(true),
+        };
+        let (_, action) = modal.update(
+            Message::Tested(meta.id, Ok(Box::new(report))),
+            &signed,
+            &no_closer,
+        );
+        assert!(action.is_none());
+        // The result was dropped and the delete then fails: the row can be tested again.
+        assert!(matches!(modal.rows[0].status, Status::NotTested));
+        let _ = modal.update(
+            Message::Deleted(meta.id, Err("keychain".into())),
+            &signed,
+            &no_closer,
+        );
+        let _ = modal.update(Message::Test(meta.id), &signed, &no_closer);
+        assert!(matches!(modal.rows[0].status, Status::Testing));
     }
 
     #[test]

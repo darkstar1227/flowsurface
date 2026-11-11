@@ -27,6 +27,11 @@ use uuid::Uuid;
 // TODO(trade-risk): delete once the conditions above are met.
 const LIVE_SENDING_ENABLED: bool = false;
 
+/// Whether LIVE orders may be sent at all (for the ticket to say so; the gate still decides).
+pub const fn live_sending_enabled() -> bool {
+    LIVE_SENDING_ENABLED
+}
+
 /// What the last connection test of an account in this session found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
