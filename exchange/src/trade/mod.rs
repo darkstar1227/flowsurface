@@ -18,6 +18,7 @@ pub mod decimal;
 pub mod gate;
 pub mod journal;
 mod locks;
+pub mod manual;
 pub mod okx;
 pub mod outcome;
 pub mod preview;
@@ -42,6 +43,7 @@ pub use gate::{
     OrderIntent, RiskHook, RiskRefusal, RiskView, SendGate, SubmitError,
 };
 pub use journal::{JournalError, UnknownJournal};
+pub use manual::{ManualContext, ManualSpec, build_intent};
 pub use outcome::{ItemRejection, Outcome, RejectKind};
 pub use preview::{OrderPreview, PreviewField};
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};

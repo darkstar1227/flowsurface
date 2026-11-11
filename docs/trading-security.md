@@ -480,10 +480,24 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 c2b-1 只接私有 stream、風控狀態與常駐警示；**沒有任何下單路徑**（不呼叫 `submit`／`cancel_all`／`flatten`／`auto_close`，測試 `the_only_trade_calls_here_are_reads` 掃 `trading.rs` 原始碼（`.flatten(` 只允許無參數的 `Stream::flatten`）；`main.rs` 與 `exchange_accounts.rs` 以 grep 確認）。`LIVE_SENDING_ENABLED` 仍為 false。
 
 - **開機順序**：先非同步讀 Unknown store，再依結果套用；讀取失敗 → `block_all_entries` 並顯示「日誌無法讀取」警示，不鎖任何紀錄；讀取成功 → 每筆紀錄 `lock_from_record`，個別失敗（壞 id）保留在警示中，不吞掉。開機報告套用前 `runs()` 為空，所以沒有任何 stream 會先於鎖定啟動。報告不含 client id。c2b-1 **不**跑 `resolve_unknown`（需要憑證，Unknown 面板在 c2b-3）；紀錄維持鎖定、唯讀顯示。
-- **stream 生命週期**：只有本次 session Test 通過的帳戶才有 stream（Binance 現貨不建 stream，狀態 `Unavailable`，文字寫明未在 testnet 驗證）。重新 Test：先 `closer.shutdown()` 關舊 listenKey，再以 generation+1 建新 stream（S1-b：`AuthFailed` 之後重測可重新允許平倉）。舊 generation 遲到的輸出一律忽略（`key != 目前 key`）。`AuthFailed` 保留，不自動重建；`InvalidateSession` 使 session 判定失效並標記需重測。
-- **風控 tracker**：每帳戶一個 `SharedRisk`，整個 app 生命週期不換；stream 重啟、設定變更都只經 `set_limits`／`snapshot_applied`／`observe`，不替換 tracker（`a_risk_tracker_survives_a_new_stream`）。
+- **stream 生命週期**：只有本次 session Test 通過的帳戶才有 stream（Binance 現貨不建 stream，狀態 `Unavailable`，文字寫明未在 testnet 驗證）。重新 Test：以 generation+1 建新 stream，舊 stream 被丟棄（停止其所有 task），**不保證**舊 listenKey 已關閉——它不會被延長，約 60 分鐘後自行失效；只有刪除帳戶或停用才走 `closer.shutdown()` 主動關閉（S1-b：`AuthFailed` 之後重測可重新允許平倉）。舊 generation 遲到的輸出一律忽略（`key != 目前 key`）。`AuthFailed` 保留，不自動重建；`InvalidateSession` 使 session 判定失效並標記需重測。
+- **風控 tracker**：每帳戶一個 `SharedRisk`，整個 app 生命週期不換（刪除失敗後的重測同樣沿用，這點在 c2b-2 的 N1 之後才成立：先前該路徑會 `remove` 而丟掉 tracker 與鎖）；stream 重啟、設定變更都只經 `set_limits`／`snapshot_applied`／`observe`，不替換 tracker（`a_risk_tracker_survives_a_new_stream`）。
 - **刪帳戶順序**：先在期限內（15 秒）`closer.shutdown()`，再刪 Keychain；逾時仍刪（`delete_after_close` 測試）。刪除失敗 → session 判定作廢，stream 已關閉。
 - **proxy**：stream 與淨值讀取每次連線都讀即時的 `proxy_cell`；與建 client 時的快照不符就拒絕連線／簽名（fail closed）。proxy 設定不可讀 → 初始為 `Broken`。
 - **未計價部位 fail closed**：`Position` 沒有價格、此版本沒有價格來源，所以只要持有任何部位，名目價值就以哨兵 `?` 提供給 tracker → 有單一 symbol 上限時進場回 `PositionUnknown`。價格來源由後續階段補上。
 - **淨值輪詢**：只輪詢 `Connected` 的帳戶，間隔為 `max_equity_age/3`（夾在 5–60 秒）；憑證只在 `spawn_blocking` 內短暫載入，失敗 → 無觀測（淨值會變陳舊並顯示警示）。
 - **常駐警示**：主視窗與 popout 都顯示；內容含日誌／紀錄狀態、未測試、`AuthFailed`（全部下單含撤單與平倉暫停）、重連／重同步、風控鎖、風控狀態不可用、淨值陳舊、「未設任何風控上限」。
+
+## c2b-2 補充：手動下單（票據、確認視窗、送出）
+
+- **範圍**：側欄 modal（Settings → Order ticket），不新增 pane 類型、不動 layout 存檔格式，也不把任何訂單狀態寫進 `saved-state.json`。支援限價／市價進場、停損／停利（可選整倉）、Binance 期貨追蹤停損、撤銷單一掛單。**不含**全撤、全平、Unknown 釋放／丟棄（c2b-3）。
+- **送單路徑只有一條**：`src/order_flow.rs::send` 是 GUI 裡唯一呼叫 `.submit(` 的地方，且只經 `SignedHttp`（不走 `server_http`）。手動單不使用 `submit_auto`／`AutoIntent::new`。`order_flow` 的測試掃描整個 `src/`：`.submit(` 只出現在該檔、不出現 `block_on`、`submit_auto`、`AutoIntent::new`；`for_preview(` 只出現在 `order_confirm.rs`，且參數是確認視窗存下的 preview，不是新呼叫 `.preview()` 的結果。
+- **兩段式**：`prepare`（讀 Keychain → 建 client → 校時 → 抓規則 → builder → preview，只做讀取）與 `send`（確認後才重新讀 Keychain、含身分、重新判斷 proxy、建新 client）。兩步都不保留 client 或憑證。preview 的 intent 放在只能取出一次的 slot。
+- **確認**：顯示 builder 實際送出的欄位；LIVE 有紅色 LIVE 標記與 700 ms 延遲，testnet 無延遲、無 LIVE 標記；單次有效、無預設焦點、無文字輸入、無鍵盤路徑（Escape 只取消）。限價偏離市價超過 5% 顯示紅色警告，沒有報價就明說沒有，不略過。OKX 顯示張數與換算後的基礎幣數量。確認視窗另顯示帳戶別名、venue、產品、環境（取自預覽所屬的帳戶，不是票據目前選的）與預估名目價值（無參考價時寫 unknown）或「Reduces / closes only」。準備預覽期間票據表單凍結，已開的確認視窗不會被新的預覽或自動重新預覽覆蓋（M1、M2）。
+- **`LIVE_SENDING_ENABLED` 仍為 false**：LIVE 帳戶在票據上顯示 "Live trading is not open yet"，不送出；閘門本身仍會拒絕。
+- **N4**：`trading::boot()` 與其他啟動工作並行（`Task::batch`），但在 boot 報告套用前，準備與送出都被拒絕（票據的 `blocked_reason` 與確認時各檢查一次）。
+- **結果**：Unknown 時只做查詢（`resolve_unknown`），絕不重送；找到只說「交易所有這張單」，不說成交；查無只說「推定未下單」；仍未知則該 (帳戶, symbol) 維持鎖定直到重啟。`RulesExpired` 會自動重新 preview，需再按一次確認，不當成失敗。交易所 `msg` 以 `chars().take` 截斷、只顯示不記錄；摘要只帶 client id 最後四碼。
+- **部位估值**：持有部位仍 fail closed（`PositionUnknown`），原因：報價沒有時間戳、OKX 需要 ctVal，無法保證估值新鮮。空倉帳戶則在 stream 為 Connected、已收過快照時，每次淨值輪詢重新蓋一次空帳本時間戳，避免帳本陳舊而擋下進場。
+- **參考價**：來自行情表的 `mark_price`（Binance 與 OKX 實際上是最新成交價）。它不只用於 5% 偏離，也用於市價單的名目價值（影響 minNotional 檢查與本機單筆／symbol 上限），以及保護單觸發價方向檢查（沒有參考價就拒絕）。它沒有時間戳，連線失敗時會保留舊值；Live 開放前必須改成 `prepare` 內以 REST 讀取帶時間戳的標記價，過期就拒絕。
+- **L4**：確認刪除帳戶的當下就讓該帳戶的 session 驗證失效，刪除進行中不能再送單。L7：沒有 runtime 時顯示「請重新 Test」的文案。
+- **L2**：測試後 proxy 設定改變，常駐警示顯示「請重新測試」。N2：刪除中的帳戶不可測試，遲到的測試結果丟棄。

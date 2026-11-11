@@ -3010,6 +3010,37 @@ async fn after_a_failed_login_every_kind_of_order_is_refused_and_nothing_is_sent
     assert_eq!(fake.count("POST"), 0);
 }
 
+/// A new test after a failed login makes a new stream that takes over the status entry: the
+/// close that was refused goes through the real send path, and the old stream cannot put the
+/// failure back (M5 c2b-2, item 7; the GUI cannot build a real client, so it is checked here).
+#[tokio::test]
+async fn a_new_stream_after_a_failed_login_lets_the_close_through_the_real_gate() {
+    use super::stream::{StreamState, status};
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let account = c.account();
+    status::retire(account, 0);
+    let old = status::register(account);
+    status::publish(account, old, StreamState::AuthFailed);
+    let refused = submit_futures(&c, Action::Close(Dir::Long)).await;
+    assert!(
+        matches!(
+            refused,
+            Err(SubmitError::StreamNotReady(StreamState::AuthFailed))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(fake.count("POST"), 0);
+    // The account is tested again: its new stream takes the entry over.
+    let new = status::register(account);
+    status::publish(account, new, StreamState::Connected);
+    // The old stream's late failure does not touch it.
+    status::publish(account, old, StreamState::AuthFailed);
+    assert!(submit_futures(&c, Action::Close(Dir::Long)).await.is_ok());
+    assert_eq!(fake.count("POST /fapi/v1/order"), 1);
+    status::retire(account, new);
+}
+
 #[tokio::test]
 async fn an_entry_waits_for_the_snapshot_the_tracker_has_not_applied_yet() {
     let snapshot_at = |epoch: u64| crate::trade::stream::Snapshot {

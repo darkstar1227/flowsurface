@@ -142,7 +142,8 @@ impl Sidebar {
             let is_active = self.is_menu_active(sidebar::Menu::Settings)
                 || self.is_menu_active(sidebar::Menu::ThemeEditor)
                 || self.is_menu_active(sidebar::Menu::Network)
-                || self.is_menu_active(sidebar::Menu::ExchangeAccounts);
+                || self.is_menu_active(sidebar::Menu::ExchangeAccounts)
+                || self.is_menu_active(sidebar::Menu::OrderTicket);
 
             button_with_tooltip(
                 icon_text(Icon::Cog, 14)
