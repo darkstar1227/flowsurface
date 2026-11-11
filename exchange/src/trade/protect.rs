@@ -51,6 +51,10 @@ pub enum Protection {
     Unprotected,
     /// The lists may not match the exchange: nothing can be said.
     Undetermined,
+    /// The entry has protection attached that is not in force yet (OKX attaches it to the
+    /// entry; on Binance the app sends it after the fill). Set by the GUI, never by
+    /// [`protected_status`]; it must never read as "protected".
+    EntryPending,
 }
 
 impl Protection {
@@ -64,6 +68,7 @@ impl Protection {
             Protection::TargetOnly => "Take-profit only, no stop-loss",
             Protection::Unprotected => "No stop-loss",
             Protection::Undetermined => "Cannot tell: order and position lists may be out of date",
+            Protection::EntryPending => "Entry protection pending, not in force yet",
         }
     }
 }
@@ -200,10 +205,35 @@ pub struct TargetSpec {
     pub share_pct: u8,
 }
 
+/// Which price a trigger watches. Neutral twin of the venue types, so `exchange` need not know
+/// the saved-settings type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriggerBasis {
+    #[default]
+    Last,
+    Mark,
+}
+
+/// A trailing stop: callback rate in percent, and where the trail starts (`None` = at once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrailingSpec {
+    pub callback_pct: Decimal,
+    pub activation: Option<Offset>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProtectSpec {
     pub stop: Option<Offset>,
     pub targets: Vec<TargetSpec>,
+    pub trailing: Option<TrailingSpec>,
+    pub trigger_price: TriggerBasis,
+}
+
+impl ProtectSpec {
+    /// Nothing to attach. A spec with only a trailing stop is not empty.
+    pub fn is_empty(&self) -> bool {
+        self.stop.is_none() && self.targets.is_empty() && self.trailing.is_none()
+    }
 }
 
 /// Price tick and quantity step of the symbol.
@@ -325,7 +355,7 @@ pub fn plan(
         return Err(PlanError::BadShares);
     }
     let total = filled_qty.trunc_to_step(&rounding.step)?;
-    if total.is_zero() && (spec.stop.is_some() || !spec.targets.is_empty()) {
+    if total.is_zero() && !spec.is_empty() {
         return Err(PlanError::QtyTooSmall);
     }
     let stop = spec
@@ -595,6 +625,7 @@ mod tests {
                 .iter()
                 .map(|&(offset, share_pct)| TargetSpec { offset, share_pct })
                 .collect(),
+            ..ProtectSpec::default()
         }
     }
 

@@ -12,18 +12,22 @@ use data::config::exchange_accounts::{
     AccountMeta, StoreError, check_key_not_bound, delete_credentials, load_credentials,
     save_credentials,
 };
+use data::config::protect::{
+    ProtectDefaults, ProtectOffset, TakeProfitLeg, TrailingDefault, TriggerPriceType,
+};
 use data::config::risk::{AccountRiskSettings, RiskSettingsError};
 use exchange::account::{
     AccountEnv, AccountProduct, AccountVenue, ApiCredentials, CheckReport, PositionMode, Verdict,
     check_account, is_usable,
 };
 use exchange::signed_http::SignedHttp;
+use exchange::trade::MAX_TARGETS;
 use exchange::trade::stream::StreamCloser;
 use std::time::Duration;
 
 use iced::{
     Element, Task, Theme,
-    widget::{button, column, container, pick_list, row, text, text_input},
+    widget::{button, checkbox, column, container, pick_list, row, text, text_input},
 };
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -49,6 +53,9 @@ pub enum Action {
     /// New risk settings were saved for the account (already validated by `limits()`): the
     /// tracker takes them and the list must be persisted.
     RiskSaved(Uuid, Box<AccountRiskSettings>),
+    /// New protective order defaults were saved for the account (already checked by
+    /// `ProtectDefaults::spec`): the running copy takes them and the list must be persisted.
+    ProtectSaved(Uuid, Box<ProtectDefaults>),
 }
 
 /// Looks up the closer of an account's running private stream.
@@ -101,6 +108,10 @@ pub enum Message {
     RiskInput(Uuid, RiskField, String),
     RiskSave(Uuid),
     RiskCancel(Uuid),
+    ProtectEdit(Uuid),
+    ProtectInput(Uuid, ProtectField),
+    ProtectSave(Uuid),
+    ProtectCancel(Uuid),
     Delete(Uuid),
     ConfirmDelete(Uuid),
     Deleted(Uuid, Result<(), String>),
@@ -158,6 +169,8 @@ struct Row {
     deleting: bool,
     /// The risk editor, open while the user edits this account's limits.
     risk_form: Option<RiskForm>,
+    /// The protective defaults editor, open while the user edits them.
+    protect_form: Option<ProtectForm>,
 }
 
 /// One text field of the risk editor per saved setting (amounts are decimal strings).
@@ -243,6 +256,256 @@ impl RiskForm {
     }
 }
 
+/// How an offset field is read: not set, a percent of the fill price, or a price distance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OffsetKind {
+    #[default]
+    None,
+    Percent,
+    Distance,
+}
+
+impl OffsetKind {
+    const OPTIONAL: [OffsetKind; 3] = [OffsetKind::None, OffsetKind::Percent, OffsetKind::Distance];
+    const SET: [OffsetKind; 2] = [OffsetKind::Percent, OffsetKind::Distance];
+
+    fn of(o: &ProtectOffset) -> (Self, String) {
+        match o {
+            ProtectOffset::Percent(v) => (OffsetKind::Percent, v.clone()),
+            ProtectOffset::Distance(v) => (OffsetKind::Distance, v.clone()),
+        }
+    }
+
+    /// `None` when not set. The value is kept as typed (trimmed); the check is `spec`.
+    fn offset(self, value: &str) -> Option<ProtectOffset> {
+        let v = value.trim().to_string();
+        match self {
+            OffsetKind::None => None,
+            OffsetKind::Percent => Some(ProtectOffset::Percent(v)),
+            OffsetKind::Distance => Some(ProtectOffset::Distance(v)),
+        }
+    }
+}
+
+impl std::fmt::Display for OffsetKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OffsetKind::None => "None",
+            OffsetKind::Percent => "Percent",
+            OffsetKind::Distance => "Price distance",
+        })
+    }
+}
+
+/// One edit of the protective defaults editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtectField {
+    StopKind(OffsetKind),
+    StopValue(String),
+    AddTarget,
+    RemoveTarget(usize),
+    TargetKind(usize, OffsetKind),
+    TargetValue(usize, String),
+    TargetShare(usize, String),
+    Trailing(bool),
+    Callback(String),
+    ActivationKind(OffsetKind),
+    ActivationValue(String),
+    MarkPrice(bool),
+    AutoAttach(bool),
+    AutoAttachLive(bool),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetForm {
+    kind: OffsetKind,
+    value: String,
+    share: String,
+}
+
+/// The editor of one account's protective order defaults. Numbers stay text until saved; the
+/// only check is `ProtectDefaults::spec`, the one the order ticket uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProtectForm {
+    stop_kind: OffsetKind,
+    stop_value: String,
+    targets: Vec<TargetForm>,
+    trailing: bool,
+    callback: String,
+    activation_kind: OffsetKind,
+    activation_value: String,
+    mark_price: bool,
+    auto_attach: bool,
+    auto_attach_live: bool,
+    error: Option<String>,
+}
+
+impl ProtectForm {
+    fn from_defaults(d: &ProtectDefaults) -> Self {
+        let (stop_kind, stop_value) = d.stop_loss.as_ref().map(OffsetKind::of).unwrap_or_default();
+        let (trailing, callback, activation_kind, activation_value) = match &d.trailing {
+            Some(t) => {
+                let (k, v) = t
+                    .activation
+                    .as_ref()
+                    .map(OffsetKind::of)
+                    .unwrap_or_default();
+                (true, t.callback_pct.clone(), k, v)
+            }
+            None => (false, String::new(), OffsetKind::None, String::new()),
+        };
+        Self {
+            stop_kind,
+            stop_value,
+            targets: d
+                .take_profits
+                .iter()
+                .map(|t| {
+                    let (kind, value) = OffsetKind::of(&t.offset);
+                    TargetForm {
+                        kind,
+                        value,
+                        share: t.share_pct.to_string(),
+                    }
+                })
+                .collect(),
+            trailing,
+            callback,
+            activation_kind,
+            activation_value,
+            mark_price: d.trigger_price == TriggerPriceType::Mark,
+            auto_attach: d.auto_attach,
+            auto_attach_live: d.auto_attach_live,
+            error: None,
+        }
+    }
+
+    /// `live`: the account is a Live one. The second switch is ignored on any other account.
+    fn apply(&mut self, field: ProtectField, live: bool) {
+        self.error = None;
+        match field {
+            ProtectField::StopKind(k) => self.stop_kind = k,
+            ProtectField::StopValue(v) => self.stop_value = v,
+            ProtectField::AddTarget => {
+                if self.targets.len() < MAX_TARGETS {
+                    self.targets.push(TargetForm {
+                        kind: OffsetKind::Percent,
+                        value: String::new(),
+                        share: String::new(),
+                    });
+                }
+            }
+            ProtectField::RemoveTarget(i) => {
+                if i < self.targets.len() {
+                    self.targets.remove(i);
+                }
+            }
+            ProtectField::TargetKind(i, k) => {
+                if let Some(t) = self.targets.get_mut(i) {
+                    t.kind = k;
+                }
+            }
+            ProtectField::TargetValue(i, v) => {
+                if let Some(t) = self.targets.get_mut(i) {
+                    t.value = v;
+                }
+            }
+            ProtectField::TargetShare(i, v) => {
+                if let Some(t) = self.targets.get_mut(i) {
+                    t.share = v;
+                }
+            }
+            ProtectField::Trailing(on) => self.trailing = on,
+            ProtectField::Callback(v) => self.callback = v,
+            ProtectField::ActivationKind(k) => self.activation_kind = k,
+            ProtectField::ActivationValue(v) => self.activation_value = v,
+            ProtectField::MarkPrice(on) => self.mark_price = on,
+            ProtectField::AutoAttach(on) => self.auto_attach = on,
+            ProtectField::AutoAttachLive(on) => {
+                if live {
+                    self.auto_attach_live = on;
+                }
+            }
+        }
+    }
+
+    /// The defaults the form describes, on top of the account's saved ones (which keep the
+    /// second switch of a non-Live account). Checked by `ProtectDefaults::spec` against the
+    /// account's expected position mode (the real mode is known only after a test; the order
+    /// is refused again at preparation if it differs). Anything not valid is an error.
+    fn parse(&self, meta: &AccountMeta) -> Result<ProtectDefaults, String> {
+        let mut take_profits = Vec::with_capacity(self.targets.len());
+        for t in &self.targets {
+            let Some(offset) = t.kind.offset(&t.value) else {
+                return Err("Every take-profit level needs percent or price distance.".into());
+            };
+            let share_pct =
+                t.share.trim().parse::<u8>().map_err(|_| {
+                    "A take-profit share must be a whole number, 1 to 100.".to_string()
+                })?;
+            take_profits.push(TakeProfitLeg { offset, share_pct });
+        }
+        let trailing = self.trailing.then(|| TrailingDefault {
+            callback_pct: self.callback.trim().to_string(),
+            activation: self.activation_kind.offset(&self.activation_value),
+        });
+        let defaults = ProtectDefaults {
+            stop_loss: self.stop_kind.offset(&self.stop_value),
+            take_profits,
+            trailing,
+            trigger_price: if self.mark_price {
+                TriggerPriceType::Mark
+            } else {
+                TriggerPriceType::Last
+            },
+            auto_attach: self.auto_attach,
+            auto_attach_live: if meta.env == AccountEnv::Live {
+                self.auto_attach_live
+            } else {
+                meta.protect.auto_attach_live
+            },
+        };
+        let mode = match meta.product {
+            AccountProduct::Spot => PositionMode::OneWay,
+            AccountProduct::UsdM => meta.position_mode,
+        };
+        defaults
+            .spec(meta.venue, mode)
+            .map_err(|e| format!("Cannot save: {e}."))?;
+        Ok(defaults)
+    }
+}
+
+/// One line saying what an account's saved defaults do.
+fn protect_summary(meta: &AccountMeta) -> String {
+    let p = &meta.protect;
+    let offset = |o: &ProtectOffset| match o {
+        ProtectOffset::Percent(v) => format!("{v}%"),
+        ProtectOffset::Distance(v) => format!("{v} price"),
+    };
+    let mut parts = Vec::new();
+    if let Some(s) = &p.stop_loss {
+        parts.push(format!("stop {}", offset(s)));
+    }
+    if !p.take_profits.is_empty() {
+        parts.push(format!("{} take-profit level(s)", p.take_profits.len()));
+    }
+    if let Some(t) = &p.trailing {
+        parts.push(format!("trailing {}%", t.callback_pct));
+    }
+    if parts.is_empty() {
+        return "Protective defaults: none".into();
+    }
+    let auto = if p.attaches_automatically(meta.env) {
+        "automatic attach on"
+    } else if p.auto_attach {
+        "automatic attach waits for the LIVE switch"
+    } else {
+        "automatic attach off"
+    };
+    format!("Protective defaults: {} · {auto}", parts.join(", "))
+}
+
 fn describe_risk_error(e: RiskSettingsError) -> String {
     match e {
         RiskSettingsError::BadAmount(name) => {
@@ -277,6 +540,7 @@ impl ExchangeAccounts {
                     delete_error: None,
                     deleting: false,
                     risk_form: None,
+                    protect_form: None,
                 })
                 .collect(),
             form: Form::default(),
@@ -360,6 +624,7 @@ impl ExchangeAccounts {
                             delete_error: None,
                             deleting: false,
                             risk_form: None,
+                            protect_form: None,
                         });
                         self.error = None;
                         return (Task::none(), Some(Action::Persist));
@@ -391,7 +656,11 @@ impl ExchangeAccounts {
                 }
             }
             Message::RiskSave(id) => {
-                if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id)
+                // An account that is being deleted takes no new settings.
+                if let Some(row) = self
+                    .rows
+                    .iter_mut()
+                    .find(|r| r.meta.id == id && !r.deleting)
                     && let Some(form) = row.risk_form.as_mut()
                 {
                     match form.parse(&row.meta.risk) {
@@ -401,6 +670,45 @@ impl ExchangeAccounts {
                             return (
                                 Task::none(),
                                 Some(Action::RiskSaved(id, Box::new(settings))),
+                            );
+                        }
+                        Err(e) => form.error = Some(e),
+                    }
+                }
+            }
+            Message::ProtectEdit(id) => {
+                if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) {
+                    row.protect_form = Some(ProtectForm::from_defaults(&row.meta.protect));
+                }
+            }
+            Message::ProtectInput(id, field) => {
+                if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) {
+                    let live = row.meta.env == AccountEnv::Live;
+                    if let Some(form) = row.protect_form.as_mut() {
+                        form.apply(field, live);
+                    }
+                }
+            }
+            Message::ProtectCancel(id) => {
+                if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) {
+                    row.protect_form = None;
+                }
+            }
+            Message::ProtectSave(id) => {
+                // An account that is being deleted takes no new settings.
+                if let Some(row) = self
+                    .rows
+                    .iter_mut()
+                    .find(|r| r.meta.id == id && !r.deleting)
+                    && let Some(form) = row.protect_form.as_mut()
+                {
+                    match form.parse(&row.meta) {
+                        Ok(defaults) => {
+                            row.meta.protect = defaults.clone();
+                            row.protect_form = None;
+                            return (
+                                Task::none(),
+                                Some(Action::ProtectSaved(id, Box::new(defaults))),
                             );
                         }
                         Err(e) => form.error = Some(e),
@@ -688,6 +996,7 @@ impl ExchangeAccounts {
             col = col.push(text(line).size(style::text_size::SMALL));
         }
         col = col.push(self.view_risk(r));
+        col = col.push(self.view_protect(r));
         if let Some(e) = &r.delete_error {
             col = col.push(banner(e.as_str(), BannerKind::Error));
         }
@@ -779,6 +1088,129 @@ impl ExchangeAccounts {
             row![
                 button(text("Save limits")).on_press(Message::RiskSave(id)),
                 button(text("Cancel")).on_press(Message::RiskCancel(id)),
+            ]
+            .spacing(8),
+        )
+        .into()
+    }
+
+    /// The protective order defaults of one account: a summary, and the editor while it is
+    /// open. Saving changes what the order ticket applies; nothing is sent from here.
+    fn view_protect<'a>(&'a self, r: &'a Row) -> Element<'a, Message> {
+        let id = r.meta.id;
+        let mut col =
+            column![text(protect_summary(&r.meta)).size(style::text_size::SMALL)].spacing(4);
+        let Some(form) = &r.protect_form else {
+            return col
+                .push(button(text("Edit protective defaults")).on_press(Message::ProtectEdit(id)))
+                .into();
+        };
+        let small = style::text_size::SMALL;
+        let field = move |f: ProtectField| Message::ProtectInput(id, f);
+        let labelled = |label: &'static str, input: Element<'a, Message>| {
+            row![text(label).size(small).width(150), input]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+        };
+
+        col = col.push(labelled(
+            "Stop-loss",
+            row![
+                pick_list(OffsetKind::OPTIONAL, Some(form.stop_kind), move |k| field(
+                    ProtectField::StopKind(k)
+                )),
+                text_input("", &form.stop_value)
+                    .on_input(move |s| field(ProtectField::StopValue(s))),
+            ]
+            .spacing(8)
+            .into(),
+        ));
+        for (i, t) in form.targets.iter().enumerate() {
+            col = col.push(labelled(
+                "Take-profit",
+                row![
+                    pick_list(OffsetKind::SET, Some(t.kind), move |k| field(
+                        ProtectField::TargetKind(i, k)
+                    )),
+                    text_input("", &t.value)
+                        .on_input(move |s| field(ProtectField::TargetValue(i, s))),
+                    text_input("share %", &t.share)
+                        .on_input(move |s| field(ProtectField::TargetShare(i, s)))
+                        .width(80),
+                    button(text("Remove").size(small))
+                        .on_press(field(ProtectField::RemoveTarget(i))),
+                ]
+                .spacing(8)
+                .into(),
+            ));
+        }
+        if form.targets.len() < MAX_TARGETS {
+            col = col.push(
+                button(text("Add take-profit level").size(small))
+                    .on_press(field(ProtectField::AddTarget)),
+            );
+        }
+        col = col.push(
+            checkbox(form.trailing)
+                .label("Trailing stop")
+                .on_toggle(move |on| field(ProtectField::Trailing(on))),
+        );
+        if form.trailing {
+            col = col
+                .push(labelled(
+                    "Callback rate %",
+                    text_input("", &form.callback)
+                        .on_input(move |s| field(ProtectField::Callback(s)))
+                        .into(),
+                ))
+                .push(labelled(
+                    "Trail starts at",
+                    row![
+                        pick_list(OffsetKind::OPTIONAL, Some(form.activation_kind), move |k| {
+                            field(ProtectField::ActivationKind(k))
+                        }),
+                        text_input("", &form.activation_value)
+                            .on_input(move |s| field(ProtectField::ActivationValue(s))),
+                    ]
+                    .spacing(8)
+                    .into(),
+                ));
+        }
+        col = col
+            .push(
+                checkbox(form.mark_price)
+                    .label("Trigger on mark price (otherwise last price)")
+                    .on_toggle(move |on| field(ProtectField::MarkPrice(on))),
+            )
+            .push(
+                checkbox(form.auto_attach)
+                    .label("Attach automatically with entries")
+                    .on_toggle(move |on| field(ProtectField::AutoAttach(on))),
+            );
+        if r.meta.env == AccountEnv::Live {
+            col = col
+                .push(
+                    checkbox(form.auto_attach_live)
+                        .label("Also attach automatically on this LIVE account")
+                        .on_toggle(move |on| field(ProtectField::AutoAttachLive(on))),
+                )
+                .push(text("Live trading is not open yet.").size(small));
+        }
+        let note = if r.meta.venue == AccountVenue::Okx {
+            "OKX takes one take-profit level and no trailing stop with an entry."
+        } else if r.meta.position_mode == PositionMode::Hedge {
+            "A hedge account takes one take-profit level and no trailing stop."
+        } else {
+            "Offsets are measured from the fill price. Shares add up to 100. Up to 3 levels."
+        };
+        col = col.push(text(note).size(small));
+        if let Some(e) = &form.error {
+            col = col.push(banner(e.as_str(), BannerKind::Error));
+        }
+        col.push(
+            row![
+                button(text("Save defaults")).on_press(Message::ProtectSave(id)),
+                button(text("Cancel")).on_press(Message::ProtectCancel(id)),
             ]
             .spacing(8),
         )
@@ -1282,6 +1714,27 @@ mod tests {
     }
 
     #[test]
+    fn an_account_being_deleted_takes_no_risk_or_protect_save() {
+        let (mut modal, meta) = modal_with_account();
+        let unused = Err("x".to_string());
+        let _ = modal.update(Message::RiskEdit(meta.id), &unused, &no_closer);
+        let _ = modal.update(Message::ProtectEdit(meta.id), &unused, &no_closer);
+        modal.rows[0].deleting = true;
+        let before = modal.rows[0].meta.clone();
+        for msg in [Message::RiskSave(meta.id), Message::ProtectSave(meta.id)] {
+            let (_, action) = modal.update(msg, &unused, &no_closer);
+            assert!(action.is_none());
+        }
+        assert_eq!(modal.rows[0].meta, before);
+        assert!(modal.rows[0].risk_form.is_some());
+        assert!(modal.rows[0].protect_form.is_some());
+        // Not deleting: the same save goes through.
+        modal.rows[0].deleting = false;
+        let (_, action) = modal.update(Message::RiskSave(meta.id), &unused, &no_closer);
+        assert!(matches!(action, Some(Action::RiskSaved(..))));
+    }
+
+    #[test]
     fn invalid_risk_input_shows_an_error_and_saves_nothing() {
         let bad: [(RiskField, &str); 7] = [
             (RiskField::MaxOrder, "-5"),
@@ -1371,5 +1824,279 @@ mod tests {
             || Err("keychain".to_string()),
         ));
         assert_eq!(result, Err("keychain".to_string()));
+    }
+
+    fn account(env: AccountEnv, venue: AccountVenue, mode: PositionMode) -> AccountMeta {
+        AccountMeta::new("p".into(), venue, env, AccountProduct::UsdM, mode)
+    }
+
+    fn modal_of(meta: &AccountMeta) -> ExchangeAccounts {
+        ExchangeAccounts::new(&data::ExchangeAccounts {
+            accounts: vec![meta.clone()],
+        })
+    }
+
+    fn protect(modal: &mut ExchangeAccounts, id: Uuid, f: ProtectField) {
+        let _ = modal.update(Message::ProtectInput(id, f), &Err("x".into()), &no_closer);
+    }
+
+    fn pct(v: &str) -> ProtectOffset {
+        ProtectOffset::Percent(v.into())
+    }
+
+    fn rich() -> ProtectDefaults {
+        ProtectDefaults {
+            stop_loss: Some(ProtectOffset::Distance("150.5".into())),
+            take_profits: vec![
+                TakeProfitLeg {
+                    offset: pct("1"),
+                    share_pct: 50,
+                },
+                TakeProfitLeg {
+                    offset: ProtectOffset::Distance("300".into()),
+                    share_pct: 30,
+                },
+                TakeProfitLeg {
+                    offset: pct("5"),
+                    share_pct: 20,
+                },
+            ],
+            trailing: Some(TrailingDefault {
+                callback_pct: "1.5".into(),
+                activation: Some(pct("2")),
+            }),
+            trigger_price: TriggerPriceType::Mark,
+            auto_attach: true,
+            auto_attach_live: false,
+        }
+    }
+
+    #[test]
+    fn the_protect_form_round_trips_what_it_shows() {
+        let meta = account(
+            AccountEnv::Testnet,
+            AccountVenue::Binance,
+            PositionMode::OneWay,
+        );
+        for d in [rich(), ProtectDefaults::default()] {
+            let form = ProtectForm::from_defaults(&d);
+            assert_eq!(form.parse(&meta), Ok(d));
+        }
+        // A trailing stop that starts at once keeps no start condition.
+        let d = ProtectDefaults {
+            trailing: Some(TrailingDefault {
+                callback_pct: "2".into(),
+                activation: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(ProtectForm::from_defaults(&d).parse(&meta), Ok(d));
+    }
+
+    #[test]
+    fn a_saved_protect_form_is_kept_and_handed_on_and_the_switch_follows_the_env() {
+        for (env, live_switch) in [(AccountEnv::Testnet, false), (AccountEnv::Live, false)] {
+            let meta = account(env, AccountVenue::Binance, PositionMode::OneWay);
+            let mut modal = modal_of(&meta);
+            let id = meta.id;
+            let _ = modal.update(Message::ProtectEdit(id), &Err("x".into()), &no_closer);
+            protect(&mut modal, id, ProtectField::StopKind(OffsetKind::Percent));
+            protect(&mut modal, id, ProtectField::StopValue(" 1.5 ".into()));
+            protect(&mut modal, id, ProtectField::AutoAttach(true));
+            let (_, action) = modal.update(Message::ProtectSave(id), &Err("x".into()), &no_closer);
+            let Some(Action::ProtectSaved(got, d)) = action else {
+                panic!("expected a saved action");
+            };
+            assert_eq!(got, id);
+            assert_eq!(d.stop_loss, Some(pct("1.5")));
+            assert!(modal.rows[0].protect_form.is_none());
+            assert_eq!(modal.persisted().accounts[0].protect, *d);
+            // The saved copy is what the ticket reads: automatic only if the env allows.
+            assert_eq!(
+                modal.persisted().accounts[0]
+                    .protect
+                    .attaches_automatically(env),
+                env != AccountEnv::Live || live_switch
+            );
+        }
+        // With the second switch on, a Live account attaches too.
+        let meta = account(
+            AccountEnv::Live,
+            AccountVenue::Binance,
+            PositionMode::OneWay,
+        );
+        let mut modal = modal_of(&meta);
+        let _ = modal.update(Message::ProtectEdit(meta.id), &Err("x".into()), &no_closer);
+        protect(
+            &mut modal,
+            meta.id,
+            ProtectField::StopKind(OffsetKind::Percent),
+        );
+        protect(&mut modal, meta.id, ProtectField::StopValue("2".into()));
+        protect(&mut modal, meta.id, ProtectField::AutoAttach(true));
+        protect(&mut modal, meta.id, ProtectField::AutoAttachLive(true));
+        let _ = modal.update(Message::ProtectSave(meta.id), &Err("x".into()), &no_closer);
+        assert!(
+            modal.persisted().accounts[0]
+                .protect
+                .attaches_automatically(AccountEnv::Live)
+        );
+    }
+
+    #[test]
+    fn the_live_switch_is_ignored_on_an_account_that_is_not_live() {
+        let meta = account(
+            AccountEnv::Testnet,
+            AccountVenue::Binance,
+            PositionMode::OneWay,
+        );
+        let mut modal = modal_of(&meta);
+        let _ = modal.update(Message::ProtectEdit(meta.id), &Err("x".into()), &no_closer);
+        protect(&mut modal, meta.id, ProtectField::AutoAttachLive(true));
+        assert!(
+            !modal.rows[0]
+                .protect_form
+                .as_ref()
+                .unwrap()
+                .auto_attach_live
+        );
+    }
+
+    #[test]
+    fn invalid_protect_input_is_not_written_and_says_why() {
+        let meta = account(
+            AccountEnv::Testnet,
+            AccountVenue::Binance,
+            PositionMode::OneWay,
+        );
+        let leg = |kind, value: &str, share: &str| TargetForm {
+            kind,
+            value: value.into(),
+            share: share.into(),
+        };
+        let cases: Vec<ProtectForm> = vec![
+            // A negative stop, a stop of 100 %, an empty amount with a kind chosen.
+            ProtectForm {
+                stop_kind: OffsetKind::Percent,
+                stop_value: "-1".into(),
+                ..Default::default()
+            },
+            ProtectForm {
+                stop_kind: OffsetKind::Percent,
+                stop_value: "100".into(),
+                ..Default::default()
+            },
+            ProtectForm {
+                stop_kind: OffsetKind::Distance,
+                ..Default::default()
+            },
+            // Four levels; shares that do not add up; a share that is not a whole number.
+            ProtectForm {
+                targets: (0..4)
+                    .map(|_| leg(OffsetKind::Percent, "1", "25"))
+                    .collect(),
+                ..Default::default()
+            },
+            ProtectForm {
+                targets: vec![
+                    leg(OffsetKind::Percent, "1", "60"),
+                    leg(OffsetKind::Percent, "2", "30"),
+                ],
+                ..Default::default()
+            },
+            ProtectForm {
+                targets: vec![leg(OffsetKind::Percent, "1", "-100")],
+                ..Default::default()
+            },
+            ProtectForm {
+                targets: vec![leg(OffsetKind::Percent, "1", "100.5")],
+                ..Default::default()
+            },
+            // A trailing stop without a callback rate.
+            ProtectForm {
+                trailing: true,
+                ..Default::default()
+            },
+        ];
+        for form in cases {
+            let mut modal = modal_of(&meta);
+            modal.rows[0].protect_form = Some(form);
+            let before = modal.persisted();
+            let (_, action) =
+                modal.update(Message::ProtectSave(meta.id), &Err("x".into()), &no_closer);
+            assert!(action.is_none());
+            assert_eq!(modal.persisted(), before);
+            let shown = modal.rows[0]
+                .protect_form
+                .as_ref()
+                .expect("editor stays open");
+            assert!(shown.error.is_some());
+        }
+    }
+
+    #[test]
+    fn several_levels_are_refused_on_hedge_and_okx_and_the_form_caps_the_levels() {
+        let multi = ProtectForm::from_defaults(&ProtectDefaults {
+            take_profits: vec![
+                TakeProfitLeg {
+                    offset: pct("1"),
+                    share_pct: 50,
+                },
+                TakeProfitLeg {
+                    offset: pct("2"),
+                    share_pct: 50,
+                },
+            ],
+            ..Default::default()
+        });
+        let one_way = account(
+            AccountEnv::Testnet,
+            AccountVenue::Binance,
+            PositionMode::OneWay,
+        );
+        assert!(multi.parse(&one_way).is_ok());
+        for meta in [
+            account(
+                AccountEnv::Testnet,
+                AccountVenue::Binance,
+                PositionMode::Hedge,
+            ),
+            account(AccountEnv::Testnet, AccountVenue::Okx, PositionMode::OneWay),
+        ] {
+            assert!(multi.parse(&meta).is_err());
+        }
+        let mut form = ProtectForm::default();
+        for _ in 0..5 {
+            form.apply(ProtectField::AddTarget, false);
+        }
+        assert_eq!(form.targets.len(), MAX_TARGETS);
+        // A new level starts empty: no number is made up.
+        assert!(form.targets[0].value.is_empty() && form.targets[0].share.is_empty());
+    }
+
+    #[test]
+    fn cancelling_the_protect_editor_changes_nothing() {
+        let meta = account(
+            AccountEnv::Testnet,
+            AccountVenue::Binance,
+            PositionMode::OneWay,
+        );
+        let mut modal = modal_of(&meta);
+        let _ = modal.update(Message::ProtectEdit(meta.id), &Err("x".into()), &no_closer);
+        protect(
+            &mut modal,
+            meta.id,
+            ProtectField::StopKind(OffsetKind::Percent),
+        );
+        let _ = modal.update(
+            Message::ProtectCancel(meta.id),
+            &Err("x".into()),
+            &no_closer,
+        );
+        assert!(modal.rows[0].protect_form.is_none());
+        assert_eq!(
+            modal.persisted().accounts[0].protect,
+            ProtectDefaults::default()
+        );
     }
 }

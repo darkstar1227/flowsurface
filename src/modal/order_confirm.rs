@@ -7,6 +7,7 @@
 
 use crate::{
     order_flow::{Deviation, IntentSlot, Notes, PrepareRequest, Prepared},
+    protect_attach::{AttachNote, AttachPlan, confirmation_lines},
     style,
 };
 use data::config::exchange_accounts::AccountMeta;
@@ -139,6 +140,15 @@ impl PendingConfirm {
         self.guard.waiting(now)
     }
 
+    /// The protection this confirmation lists, to be remembered when it is confirmed. Read
+    /// from what was shown, never worked out again from the account's current settings.
+    pub fn attach_plan(&self) -> Option<&AttachPlan> {
+        match self.notes.attach.as_ref()? {
+            AttachNote::Attach(plan) => Some(plan),
+            AttachNote::Nothing | AttachNote::SwitchOff { .. } => None,
+        }
+    }
+
     /// The token and the intent, once. The token is for the preview that was shown.
     pub fn confirm(&mut self, now: Instant) -> Option<(ConfirmToken, OrderIntent)> {
         if !self.guard.try_confirm(now) {
@@ -208,6 +218,19 @@ impl PendingConfirm {
                 );
             }
             Deviation::Within | Deviation::NotApplicable => {}
+        }
+
+        // The protection that goes with an entry: one confirmation covers all of it.
+        if let Some(note) = &self.notes.attach {
+            let mut block = column![].spacing(2);
+            for l in confirmation_lines(note, &self.preview.fields) {
+                block = block.push(if l.warn {
+                    warn(l.text)
+                } else {
+                    text(l.text).size(style::text_size::SMALL).into()
+                });
+            }
+            content = content.push(block);
         }
 
         let confirm_label = if self.guard.waiting(now) {
@@ -307,7 +330,9 @@ mod tests {
 
     /// The tokens are made from what the confirmation stored, in the confirmation files only
     /// (condition 70): an order token from the stored preview, a bulk token from the stored
-    /// account and action. The unbound ways of making a request are not used anywhere.
+    /// account and action. The unbound ways of making a request are not used anywhere. d2 adds
+    /// no file to the list: the protection block of the confirmation only lists text, and the
+    /// token still comes from the stored preview alone.
     #[test]
     fn the_tokens_come_from_the_stored_values_in_the_confirmation_files_only() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -395,6 +420,7 @@ mod tests {
                 id: "1".into(),
                 kind: exchange::trade::OpenKind::Plain,
             },
+            protect: None,
         };
         let found = account_of(&accounts, &request).unwrap();
         assert_eq!(found.id, a.id);

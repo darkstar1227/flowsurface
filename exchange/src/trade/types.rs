@@ -52,6 +52,10 @@ pub enum TradeError {
     /// buy or a swap open. On a sell or a close the attached order would be on the wrong
     /// side and could add exposure (condition 64).
     AttachOnlyOnOpen,
+    /// The protective prices cannot be worked out from the entry price and the settings (a
+    /// distance too wide, a share too small for the step): the entry is refused, not sent
+    /// without the protection.
+    ProtectionNotPossible,
     /// The client ids of one OCO/OTOCO list (list, working, above, below) must differ.
     ClientIdsNotDistinct,
     /// A client id does not match the venue's pattern (condition 59).
@@ -94,6 +98,9 @@ impl fmt::Display for TradeError {
             TradeError::OkxNoTrigger => "an OKX algo order needs a TP or an SL",
             TradeError::AttachOnlyOnOpen => {
                 "attached TP/SL is only allowed on a spot buy or a swap open"
+            }
+            TradeError::ProtectionNotPossible => {
+                "the protective prices cannot be worked out from the entry price"
             }
             TradeError::ClientIdsNotDistinct => "client ids of one order list must differ",
             TradeError::ClientIdInvalid => "client id does not match the venue's pattern",

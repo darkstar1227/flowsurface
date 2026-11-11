@@ -9,10 +9,15 @@
 //! `.submit(` is called in this file only, from [`send`], and only with a token made by the
 //! confirmation (`order_confirm`). Manual orders never use `submit_auto` or `AutoIntent`.
 
+use crate::protect_attach::{
+    self, AttachKind, AttachNote, AttachPlan, Holdings, Resolved, check_against_price, plan_lines,
+    preview_has_attachment,
+};
 use crate::trading::{PairState, account_key};
 use data::config::exchange_accounts::{
     AccountMeta, StoreError, load_credentials, load_credentials_with_identity,
 };
+use data::config::protect::ProtectDefaults;
 use data::config::trade_gate::{GateRejection, SessionEntry, SessionGate};
 use data::config::unknown_store::UnknownStore;
 use exchange::account::{
@@ -23,9 +28,9 @@ use exchange::signed_http::SignedHttp;
 use exchange::trade::MarginMode;
 use exchange::trade::stream::StreamState;
 use exchange::trade::{
-    ConfirmToken, DEFAULT_DEVIATION_BPS, Decimal, ManualContext, ManualSpec, OpenKind, OrderIntent,
-    OrderPreview, Outcome, ReadError, Resolution, RiskRefusal, SharedRisk, SubmitError,
-    TradeClient, TradeProduct, build_intent, deviation_exceeds,
+    ConfirmToken, DEFAULT_DEVIATION_BPS, Decimal, Dir, ManualContext, ManualSpec, OpenKind,
+    OrderIntent, OrderPreview, Outcome, ReadError, Resolution, RiskRefusal, SharedRisk,
+    SubmitError, TradeClient, TradeProduct, build_intent, deviation_exceeds,
 };
 use exchange::unit::Price;
 use std::fmt;
@@ -141,6 +146,11 @@ pub struct PrepareRequest {
     pub account: Uuid,
     pub symbol: String,
     pub spec: ManualSpec,
+    /// The ticket's override of the account's protection defaults for this entry (`None` =
+    /// the account's defaults). It lives in the request so that a preview made again after
+    /// the rules expired keeps it. Checked by the same `ProtectDefaults::spec`; it cannot
+    /// switch attaching on (`protect_attach::resolve`).
+    pub protect: Option<ProtectDefaults>,
 }
 
 /// The intent waits here for the confirmation. It is not `Clone`: the slot hands it out once.
@@ -195,6 +205,21 @@ pub struct Notes {
     pub reference: Option<String>,
     /// OKX contracts and what they are in the base currency (condition 63).
     pub base_amount: Option<String>,
+    /// What the confirmation says about protection; `None` when the request is not an entry.
+    pub attach: Option<AttachNote>,
+}
+
+/// The direction, quantity and limit price of an entry request.
+///
+/// A spot `Short` is a sale of what is held, never an entry (defence in depth: the builder
+/// refuses it today).
+fn entry_of(spec: &ManualSpec, product: AccountProduct) -> Option<(Dir, Decimal, Option<Decimal>)> {
+    let entry = match spec {
+        ManualSpec::Limit { dir, qty, price } => (*dir, *qty, Some(*price)),
+        ManualSpec::Market { dir, qty } => (*dir, *qty, None),
+        _ => return None,
+    };
+    (!(product == AccountProduct::Spot && entry.0 == Dir::Short)).then_some(entry)
 }
 
 /// A preview, with the intent it came from (only in the slot).
@@ -210,6 +235,8 @@ pub struct PrepareInput {
     pub meta: AccountMeta,
     /// The position mode the exchange reported at the test (not the saved one).
     pub mode: Option<PositionMode>,
+    /// What the account holds on the request's symbol, and whether that can be trusted.
+    pub held: Holdings,
     pub request: PrepareRequest,
     pub ref_price: Option<Decimal>,
     pub signed: SignedHttp,
@@ -248,6 +275,7 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
     let PrepareInput {
         meta,
         mode,
+        held,
         request,
         ref_price,
         signed,
@@ -255,6 +283,21 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
     } = input;
     let market = trade_market(market_of(meta.venue, meta.product))
         .ok_or_else(|| "This account's market cannot be traded.".to_string())?;
+    // Which protection applies to this entry: refused here, before anything is read or
+    // confirmed, when the settings or the override are not valid for the account.
+    let entry = entry_of(&request.spec, meta.product);
+    let resolved = match entry {
+        Some((dir, _, _)) => {
+            let resolved = protect_attach::resolve(&meta, mode, request.protect.as_ref())?;
+            // Protection goes with new entries only: an order against a held position, or one
+            // placed while the positions cannot be told, is refused when it would be attached.
+            if matches!(resolved, Resolved::Attach(_)) {
+                protect_attach::check_new_entry(meta.product, mode, dir, &held)?;
+            }
+            Some(resolved)
+        }
+        None => None,
+    };
     let creds = {
         let meta = meta.clone();
         tokio::task::spawn_blocking(move || load_credentials(&meta))
@@ -281,6 +324,37 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
     let fresh = client
         .fresh(&table, &request.symbol)
         .map_err(|e| format!("Trading rules: {e}."))?;
+    // The protective prices at the price the entry would fill at; refused when they cannot be
+    // applied (a stop distance not below the price, a share too small for the step).
+    let okx = meta.venue == AccountVenue::Okx;
+    let mut attach = match (&resolved, entry) {
+        (Some(Resolved::Attach(spec)), Some((dir, qty, limit))) => {
+            let base = limit.or(ref_price).ok_or_else(|| {
+                "No market price is available to place the protection from.".to_string()
+            })?;
+            let planned = check_against_price(fresh.rules(), dir, &base, &qty, spec)?;
+            Some((
+                spec.clone(),
+                AttachPlan {
+                    kind: if okx {
+                        AttachKind::OkxOnEntry
+                    } else {
+                        AttachKind::AfterFill
+                    },
+                    dir,
+                    limit: limit.is_some(),
+                    spec: spec.clone(),
+                    lines: plan_lines(
+                        spec,
+                        &planned,
+                        &base,
+                        protect_attach::quote_of(&request.symbol),
+                    ),
+                },
+            ))
+        }
+        _ => None,
+    };
     let intent = build_intent(
         account,
         &fresh,
@@ -289,10 +363,16 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
             mode,
             ref_price,
             okx_margin: MarginMode::Cross,
+            // OKX carries it on the entry; a Binance futures entry is sent unchanged.
+            protect: attach.as_ref().filter(|_| okx).map(|(spec, _)| spec),
         },
     )
     .map_err(|e| format!("The order cannot be built: {e}."))?;
     let preview = intent.preview();
+    // What is listed as attached must be in what will be sent.
+    if okx && attach.is_some() && !preview_has_attachment(&preview.fields) {
+        return Err("The protection was not part of the order. Nothing was sent.".to_string());
+    }
     let limit_price = match &request.spec {
         ManualSpec::Limit { .. } => preview
             .field("price")
@@ -309,10 +389,19 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
             base.to_plain_string()
         ))
     });
+    let attach_note = resolved.map(|r| match r {
+        Resolved::Nothing => AttachNote::Nothing,
+        Resolved::SwitchOff { live } => AttachNote::SwitchOff { live },
+        Resolved::Attach(_) => match attach.take() {
+            Some((_, plan)) => AttachNote::Attach(plan),
+            None => AttachNote::Nothing,
+        },
+    });
     let notes = Notes {
         deviation: deviation_of(limit_price.as_ref(), ref_price.as_ref()),
         reference: ref_price.as_ref().map(Decimal::to_plain_string),
         base_amount,
+        attach: attach_note,
     };
     Ok(Prepared {
         request,
@@ -664,6 +753,22 @@ mod tests {
     }
     use exchange::trade::TradeError;
 
+    #[test]
+    fn a_spot_sale_is_never_an_entry_so_it_gets_no_protection_note() {
+        let q = Decimal::parse("1").unwrap();
+        let short = ManualSpec::Market {
+            dir: Dir::Short,
+            qty: q,
+        };
+        let long = ManualSpec::Market {
+            dir: Dir::Long,
+            qty: q,
+        };
+        assert!(entry_of(&short, AccountProduct::Spot).is_none());
+        assert!(entry_of(&long, AccountProduct::Spot).is_some());
+        assert!(entry_of(&short, AccountProduct::UsdM).is_some());
+    }
+
     const ALL_EXCHANGES: [Exchange; 14] = [
         Exchange::BinanceLinear,
         Exchange::BinanceInverse,
@@ -952,7 +1057,9 @@ mod tests {
     }
 
     /// The only caller of `submit` in the GUI is `send`, only here, and the manual path never
-    /// uses the automatic ones (condition 71, 72).
+    /// uses the automatic ones (condition 71, 72). d2 adds no allowed file: the protection
+    /// that goes with an entry is either a field of the entry order itself (OKX, built by
+    /// `build_intent`) or only remembered (`protect_attach.rs`); nothing sends it.
     #[test]
     fn submit_is_called_from_this_file_only_and_never_the_automatic_paths() {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

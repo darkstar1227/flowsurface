@@ -11,8 +11,11 @@
 //! this session, and it is kept in [`TradingState`] (not derived from the session) so that a
 //! terminal state such as `AuthFailed` is not lost when the session is voided.
 
+use crate::order_flow::SendResult;
+use crate::protect_attach::{PendingAttach, PendingAttachTable};
 use crate::widget::{BannerKind, banner};
 use data::config::exchange_accounts::{AccountMeta, load_credentials};
+use data::config::protect::ProtectDefaults;
 use data::config::risk::AccountRiskSettings;
 use data::config::trade_gate::TradeSession;
 use data::config::unknown_store::UnknownStore;
@@ -566,6 +569,9 @@ pub struct TradingState {
     /// Accounts with a cancel-all or close-all running: no other order of the account is
     /// prepared or sent meanwhile.
     bulk_running: BTreeSet<Uuid>,
+    /// The protection each confirmed entry listed (d2). Remembered only; nothing consumes it
+    /// yet.
+    attach: PendingAttachTable,
 }
 
 /// What blocks the buttons of one (account, symbol) (condition 61).
@@ -592,6 +598,7 @@ impl TradingState {
             pairs: BTreeMap::new(),
             inflight: BTreeSet::new(),
             bulk_running: BTreeSet::new(),
+            attach: PendingAttachTable::default(),
         }
     }
 
@@ -671,11 +678,19 @@ impl TradingState {
         let Some(rt) = self.accounts.get(&id) else {
             return Vec::new();
         };
-        exchange::trade::protected_status(
+        let mut all = exchange::trade::protected_status(
             &rt.exchange_positions(),
             &rt.orders,
             self.lists_stale(id),
-        )
+        );
+        // Protection that was listed for an entry and is not in force yet: said so, and never
+        // "protected", whatever the lists show.
+        for p in &mut all {
+            if self.attach.has_pending(id, &p.symbol) {
+                p.protection = exchange::trade::Protection::EntryPending;
+            }
+        }
+        all
     }
 
     /// The reason of the account's risk lock, when one is on.
@@ -871,6 +886,46 @@ impl TradingState {
     /// whoever deleted it; dropping it here removes its subscription.
     pub fn remove(&mut self, id: Uuid) {
         self.accounts.remove(&id);
+        self.attach.remove_account(id);
+    }
+
+    /// An entry was confirmed: remember the protection its confirmation listed, by the
+    /// entry's client id.
+    pub fn register_attach(&mut self, entry_id: String, pending: PendingAttach) {
+        if !self.attach.register(entry_id, pending) {
+            log::warn!("Protection was not listed: a send for the same symbol is in flight.");
+        }
+    }
+
+    /// The send of the (account, symbol) ended: keep or drop what was remembered for it.
+    pub fn settle_attach(&mut self, id: Uuid, symbol: &str, result: &SendResult) {
+        self.attach.settle(id, symbol, result);
+    }
+
+    /// The entry with this client id is known not to stand on the exchange (a lookup found
+    /// nothing, or the user released or discarded its record): its listed protection goes.
+    pub fn entry_gone(&mut self, client_id: &str) {
+        self.attach.remove_entry(client_id);
+    }
+
+    /// Symbols with protection listed for an entry that has no position yet (a resting limit
+    /// entry): the panel says so, since no position row can.
+    pub fn pending_without_position(&self, id: Uuid) -> Vec<String> {
+        let held: Vec<String> = self
+            .positions(id)
+            .iter()
+            .map(|p| p.symbol.clone())
+            .collect();
+        self.attach
+            .pending_symbols(id)
+            .into_iter()
+            .filter(|s| !held.contains(s))
+            .collect()
+    }
+
+    /// A resting limit entry with protection still owed (closing the app is warned about).
+    pub fn has_resting_limit_attach(&self) -> bool {
+        self.attach.has_resting_limit()
     }
 
     /// New risk settings were saved for the account: the same tracker takes the new limits
@@ -886,6 +941,13 @@ impl TradingState {
                 rt.note_poisoned(r);
             }
             Err(e) => log::warn!("risk settings not applied: {e:?}"),
+        }
+    }
+
+    /// New protective defaults were saved for the account: the running copy takes them.
+    pub fn apply_protect_defaults(&mut self, id: Uuid, defaults: &ProtectDefaults) {
+        if let Some(rt) = self.accounts.get_mut(&id) {
+            rt.meta.protect = defaults.clone();
         }
     }
 
@@ -2664,5 +2726,58 @@ mod tests {
         let t = booted();
         let id = Uuid::new_v4();
         assert!(t.protection(id).is_empty());
+    }
+    fn pending_for(id: Uuid, symbol: &str, limit: bool) -> PendingAttach {
+        use crate::protect_attach::{AttachKind, AttachPlan};
+        PendingAttach {
+            account: id,
+            symbol: symbol.into(),
+            plan: AttachPlan {
+                kind: AttachKind::AfterFill,
+                dir: Dir::Long,
+                limit,
+                spec: exchange::trade::ProtectSpec::default(),
+                lines: Vec::new(),
+            },
+        }
+    }
+
+    /// A listed but not yet sent protection is "pending", never "protected", even when a stop
+    /// is on the list; once the entry is refused the pending state is gone (d2).
+    #[test]
+    fn a_pending_entry_protection_is_never_shown_as_protected() {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        let status = |t: &TradingState| {
+            t.protection(m.id)
+                .iter()
+                .map(|p| p.protection)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(status(&t), vec![exchange::trade::Protection::Stop]);
+        t.register_attach("eAAAA".into(), pending_for(m.id, "BTCUSDT", true));
+        assert_eq!(status(&t), vec![exchange::trade::Protection::EntryPending]);
+        assert!(t.has_resting_limit_attach());
+        assert!(
+            exchange::trade::Protection::EntryPending
+                .label()
+                .contains("pending")
+        );
+        // Also while the lists may be out of date.
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::Event(algo_update(OrderCategory::Algo))),
+            0,
+        );
+        assert_eq!(status(&t), vec![exchange::trade::Protection::EntryPending]);
+        // The send was refused: nothing is pending any more.
+        t.settle_attach(m.id, "BTCUSDT", &SendResult::Refused("gate".into()));
+        assert!(!t.has_resting_limit_attach());
+        assert_ne!(status(&t), vec![exchange::trade::Protection::EntryPending]);
+        // Another symbol's pending entry does not touch this position.
+        t.register_attach("eBBBB".into(), pending_for(m.id, "ETHUSDT", false));
+        assert_ne!(status(&t), vec![exchange::trade::Protection::EntryPending]);
+        // Deleting the account drops what was remembered for it.
+        t.remove(m.id);
+        assert!(!t.has_resting_limit_attach());
     }
 }

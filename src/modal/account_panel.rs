@@ -383,6 +383,17 @@ impl AccountPanel {
             }
         }
 
+        // An entry with protection listed but no position yet (a resting limit order).
+        for symbol in trading.pending_without_position(meta.id) {
+            col = col.push(
+                text(format!(
+                    "  {symbol}: {}",
+                    exchange::trade::Protection::EntryPending.label()
+                ))
+                .size(small),
+            );
+        }
+
         // Cancel all / close all.
         let press = |m: Message| bulk_blocked.is_none().then_some(m);
         let mut bulk =
