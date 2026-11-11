@@ -13,8 +13,8 @@ mod secret;
 pub mod status;
 
 pub use driver::{
-    CredentialLoader, CredentialsUnavailable, PrivateStream, Snapshot, StreamContext, StreamOutput,
-    run,
+    CredentialLoader, CredentialsUnavailable, PrivateStream, Snapshot, StreamCloser, StreamContext,
+    StreamOutput, run,
 };
 pub use events::{
     AccountReason, BalanceUpdate, EquityUpdate, Fill, OrderCategory, OrderStatus, OrderUpdate,

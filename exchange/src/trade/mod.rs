@@ -20,6 +20,7 @@ pub mod journal;
 mod locks;
 pub mod okx;
 pub mod outcome;
+pub mod preview;
 pub mod queries;
 pub mod request;
 pub mod risk;
@@ -37,16 +38,18 @@ pub use client::{
 pub use client_id::{ClientId, IdField, Role};
 pub use decimal::{Decimal, DecimalError};
 pub use gate::{
-    ApprovedOrder, AutoIntent, AutoPath, ConfirmToken, GateClass, GateRequest, OrderIntent,
-    RiskHook, RiskRefusal, RiskView, SendGate, SubmitError,
+    ApprovedOrder, AutoIntent, AutoPath, BulkAction, ConfirmToken, GateClass, GateRequest,
+    OrderIntent, RiskHook, RiskRefusal, RiskView, SendGate, SubmitError,
 };
 pub use journal::{JournalError, UnknownJournal};
 pub use outcome::{ItemRejection, Outcome, RejectKind};
+pub use preview::{OrderPreview, PreviewField};
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
 pub use risk::{
     AutoCloseDecision, AutoCloseGrant, DrawdownAnchor, EquityBasis, EquityFreshness,
     EquityObservation, EquitySource, EquityTracker, IgnoreReason, Observed, RiskLimits, RiskNotice,
-    RiskNoticeKind, RiskSnapshot, StreamEquityFeed, TripReason, local_day,
+    RiskNoticeKind, RiskPoisoned, RiskSnapshot, SharedRisk, StreamEquityFeed, TripReason,
+    local_day,
 };
 pub use rules::{FreshRules, RulesTable, SymbolRules, TradeProduct, ValidSymbol};
 pub use types::{

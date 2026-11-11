@@ -6,8 +6,8 @@ use super::binance_spot as bs;
 use super::client::{OpenKind, TradeClient};
 use super::client_id::{ClientId, Role};
 use super::gate::{
-    AutoIntent, AutoPath, ConfirmToken, GateRequest, OrderIntent, RiskHook, RiskRefusal, RiskView,
-    SendGate, SubmitError,
+    AutoIntent, AutoPath, BulkAction, ConfirmToken, GateRequest, OrderIntent, RiskHook,
+    RiskRefusal, RiskView, SendGate, SubmitError,
 };
 use super::okx::{self, OkxAlgoType, OkxProtective, OkxTarget, TriggerPxType};
 use super::outcome::{Outcome, RejectKind};
@@ -36,6 +36,8 @@ type Handler = dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync;
 struct Fake {
     port: u16,
     log: Arc<Mutex<Vec<String>>>,
+    /// `(method, target with query, body)` of every request, as received.
+    raw: Arc<Mutex<Vec<(String, String, String)>>>,
 }
 
 impl Fake {
@@ -46,6 +48,10 @@ impl Fake {
             .iter()
             .filter(|l| l.contains(needle))
             .count()
+    }
+
+    fn raw(&self) -> Vec<(String, String, String)> {
+        self.raw.lock().unwrap().clone()
     }
 
     fn all(&self) -> Vec<String> {
@@ -67,11 +73,14 @@ fn serve_q(handler: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + '
     let log = Arc::new(Mutex::new(Vec::new()));
     let handler: Arc<Handler> = Arc::new(handler);
     let log2 = Arc::clone(&log);
+    let raw = Arc::new(Mutex::new(Vec::new()));
+    let raw2 = Arc::clone(&raw);
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut conn) = conn else { break };
             let handler = Arc::clone(&handler);
             let log = Arc::clone(&log2);
+            let raw = Arc::clone(&raw2);
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -103,6 +112,13 @@ fn serve_q(handler: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + '
                 let path = target.split('?').next().unwrap_or("").to_string();
                 let query = target.split_once('?').map_or("", |(_, q)| q).to_string();
                 log.lock().unwrap().push(format!("{method} {path}"));
+                let sent_body = head
+                    .split_once("\r\n\r\n")
+                    .map_or("", |(_, b)| b)
+                    .to_string();
+                raw.lock()
+                    .unwrap()
+                    .push((method.clone(), target.clone(), sent_body));
                 let (status, body) = handler(&method, &path, &query);
                 let reply = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
@@ -112,7 +128,7 @@ fn serve_q(handler: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + '
             });
         }
     });
-    Fake { port, log }
+    Fake { port, log, raw }
 }
 
 static HOSTS: AtomicUsize = AtomicUsize::new(0);
@@ -292,7 +308,7 @@ async fn binance_row(
                 &OpenGate,
                 &NoRisk,
                 &NoJournal,
-                ConfirmToken::user_confirmed(),
+                ConfirmToken::for_preview(&intent.preview()),
                 intent,
             )
             .await
@@ -416,7 +432,7 @@ async fn matrix_binance_futures_send_paths() {
                 &OpenGate,
                 &NoRisk,
                 &NoJournal,
-                ConfirmToken::user_confirmed(),
+                ConfirmToken::for_preview(&cancel.preview()),
                 cancel,
             )
             .await
@@ -594,7 +610,7 @@ async fn okx_submit(c: &TradeClient, t: &RulesTable, sym: &str, req: OkxRequest)
         &OpenGate,
         &NoRisk,
         &NoJournal,
-        ConfirmToken::user_confirmed(),
+        ConfirmToken::for_preview(&intent.preview()),
         intent,
     )
     .await
@@ -850,7 +866,7 @@ async fn okx_unknown(fake: &Fake) -> (TradeClient, PendingUnknown) {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -884,7 +900,7 @@ async fn unknown_is_never_resent_and_locks_the_symbol() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&again.preview()),
             again,
         )
         .await
@@ -903,7 +919,7 @@ async fn unknown_is_never_resent_and_locks_the_symbol() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&close.preview()),
             close,
         )
         .await
@@ -964,7 +980,7 @@ async fn unknown_found_by_lookup() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -1002,7 +1018,7 @@ async fn clock_skew_is_rejected_without_resend() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -1086,7 +1102,7 @@ async fn cancel_all_reports_leftovers() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
             &t,
         )
         .await
@@ -1127,7 +1143,7 @@ async fn cancel_all_succeeds_only_when_the_requery_is_empty() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
             &t,
         )
         .await
@@ -1240,7 +1256,7 @@ async fn single_order_cap_and_gate_refusals_stop_the_send() {
             &OpenGate,
             &cap,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&mk().preview()),
             mk()
         )
         .await
@@ -1252,7 +1268,7 @@ async fn single_order_cap_and_gate_refusals_stop_the_send() {
             &Deny,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&mk().preview()),
             mk()
         )
         .await
@@ -1266,7 +1282,7 @@ async fn single_order_cap_and_gate_refusals_stop_the_send() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&mk().preview()),
             mk()
         )
         .await
@@ -1282,7 +1298,7 @@ async fn single_order_cap_and_gate_refusals_stop_the_send() {
             &OpenGate,
             &cap,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&mk().preview()),
             mk()
         )
         .await
@@ -1323,7 +1339,7 @@ async fn a_changed_proxy_stops_every_request() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -1408,7 +1424,7 @@ async fn silent_exchange_leaves_the_unknown_unresolved_and_locked() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -1442,7 +1458,7 @@ async fn two_unknowns_on_one_symbol_need_two_resolutions() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&close.preview()),
             close,
         )
         .await
@@ -1531,7 +1547,7 @@ async fn flatten_closes_every_position_and_requeries() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::Flatten),
             &t,
             MarginMode::Cross,
         )
@@ -1553,7 +1569,7 @@ async fn flatten_closes_every_position_and_requeries() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(sc.account(), BulkAction::Flatten),
             &spot(),
             MarginMode::Cross,
         )
@@ -1583,7 +1599,7 @@ async fn cancel_all_keeps_going_after_one_symbol_fails_and_still_requeries() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
             &futures(),
         )
         .await
@@ -1629,7 +1645,7 @@ async fn fetch_rules_builds_the_table_and_loads_the_spot_order_limits() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -1652,7 +1668,7 @@ async fn fetch_rules_builds_the_table_and_loads_the_spot_order_limits() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -1745,7 +1761,7 @@ async fn spot_resolve_with(reply: (u16, String)) -> Resolution {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -1831,7 +1847,7 @@ async fn only_verified_codes_mean_no_such_order() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -2024,7 +2040,7 @@ async fn the_gate_sees_what_the_client_will_sign_for() {
         &rec,
         &NoRisk,
         &NoJournal,
-        ConfirmToken::user_confirmed(),
+        ConfirmToken::for_preview(&mk("eAAAA").preview()),
         mk("eAAAA"),
     )
     .await
@@ -2045,7 +2061,7 @@ async fn the_gate_sees_what_the_client_will_sign_for() {
             &TestnetOnly,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&mk("eBBBB").preview()),
             mk("eBBBB"),
         )
         .await
@@ -2078,7 +2094,7 @@ async fn an_intent_for_another_account_or_product_is_not_sent() {
             &rec,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -2107,7 +2123,7 @@ async fn an_intent_for_another_account_or_product_is_not_sent() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -2160,7 +2176,7 @@ async fn an_unknown_cancel_has_nothing_to_resolve_by_lookup() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -2191,7 +2207,7 @@ async fn the_lock_outlives_the_client_and_is_taken_before_sending() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -2225,7 +2241,7 @@ async fn the_lock_outlives_the_client_and_is_taken_before_sending() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&mk("eAAAA").preview()),
             mk("eAAAA")
         ),
         async {
@@ -2235,7 +2251,7 @@ async fn the_lock_outlives_the_client_and_is_taken_before_sending() {
                 &OpenGate,
                 &NoRisk,
                 &NoJournal,
-                ConfirmToken::user_confirmed(),
+                ConfirmToken::for_preview(&mk("eBBBB").preview()),
                 mk("eBBBB"),
             )
             .await
@@ -2304,7 +2320,7 @@ async fn cancel_all_still_reports_when_the_final_read_fails() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
             &t,
         )
         .await
@@ -2343,7 +2359,7 @@ async fn a_418_set_on_another_thread_does_not_stop_this_send() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -2440,7 +2456,7 @@ async fn risk_close_cancels_everything_flattens_and_reports_after_requery() {
             &OpenGate,
             &snap,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&entry.preview()),
             entry
         )
         .await
@@ -2633,7 +2649,7 @@ async fn cancel_all_cancels_what_it_read_when_one_algo_type_cannot_be_read() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
             &t,
         )
         .await
@@ -2676,7 +2692,7 @@ async fn a_report_with_an_unread_type_is_not_clean_even_when_the_final_read_is_e
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
             &okx_swap_table(),
         )
         .await
@@ -2698,7 +2714,7 @@ async fn pressing_cancel_all_twice_still_cancels_the_second_time() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
             &t,
         )
         .await
@@ -2711,7 +2727,7 @@ async fn pressing_cancel_all_twice_still_cancels_the_second_time() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
             &t,
         )
         .await
@@ -2930,7 +2946,7 @@ async fn submit_futures(
         &OpenGate,
         &NoRisk,
         &NoJournal,
-        ConfirmToken::user_confirmed(),
+        ConfirmToken::for_preview(&intent.preview()),
         intent,
     )
     .await
@@ -2996,6 +3012,12 @@ async fn after_a_failed_login_every_kind_of_order_is_refused_and_nothing_is_sent
 
 #[tokio::test]
 async fn an_entry_waits_for_the_snapshot_the_tracker_has_not_applied_yet() {
+    let snapshot_at = |epoch: u64| crate::trade::stream::Snapshot {
+        orders: vec![],
+        positions: vec![],
+        balances: vec![],
+        epoch,
+    };
     use super::stream::{StreamState, status, sync_epoch};
     let fake = serve(gen_binance);
     let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
@@ -3018,7 +3040,7 @@ async fn an_entry_waits_for_the_snapshot_the_tracker_has_not_applied_yet() {
             &OpenGate,
             &c.risk_snapshot(tracker),
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -3043,7 +3065,7 @@ async fn an_entry_waits_for_the_snapshot_the_tracker_has_not_applied_yet() {
             .is_ok()
     );
     // Applying the snapshot lets the entry through.
-    tracker.snapshot_applied(epoch);
+    tracker.snapshot_applied(&snapshot_at(epoch), NOW, []);
     assert!(
         send(&tracker, Action::Open(Dir::Long), "eAAAC")
             .await
@@ -3063,13 +3085,13 @@ async fn an_entry_waits_for_the_snapshot_the_tracker_has_not_applied_yet() {
         "{err:?}"
     );
     // Applying the old epoch again does not help; the new one does.
-    tracker.snapshot_applied(epoch);
+    tracker.snapshot_applied(&snapshot_at(epoch), NOW, []);
     assert!(
         send(&tracker, Action::Open(Dir::Long), "eAAAE")
             .await
             .is_err()
     );
-    tracker.snapshot_applied(again);
+    tracker.snapshot_applied(&snapshot_at(again), NOW, []);
     assert!(
         send(&tracker, Action::Open(Dir::Long), "eAAAF")
             .await
@@ -3248,7 +3270,7 @@ async fn a_failed_journal_write_sends_nothing_and_leaves_no_lock() {
             &OpenGate,
             &NoRisk,
             &journal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&okx_entry_intent(&c, "eAAAA").preview()),
             okx_entry_intent(&c, "eAAAA"),
         )
         .await
@@ -3267,7 +3289,7 @@ async fn a_failed_journal_write_sends_nothing_and_leaves_no_lock() {
             &OpenGate,
             &NoRisk,
             &journal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&okx_entry_intent(&c, "eBBBB").preview()),
             okx_entry_intent(&c, "eBBBB"),
         )
         .await
@@ -3290,7 +3312,7 @@ async fn a_known_outcome_clears_the_record_it_wrote_ahead() {
             &OpenGate,
             &NoRisk,
             &journal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&okx_entry_intent(&c, "eAAAA").preview()),
             okx_entry_intent(&c, "eAAAA"),
         )
         .await
@@ -3310,7 +3332,7 @@ async fn an_unknown_outcome_keeps_the_record() {
             &OpenGate,
             &NoRisk,
             &journal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&okx_entry_intent(&c, "eAAAA").preview()),
             okx_entry_intent(&c, "eAAAA"),
         )
         .await
@@ -3340,7 +3362,7 @@ async fn a_send_dropped_after_the_post_arrived_leaves_its_record() {
             &OpenGate,
             &NoRisk,
             &journal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&okx_entry_intent(&c, "eAAAA").preview()),
             okx_entry_intent(&c, "eAAAA"),
         );
         tokio::pin!(send);
@@ -3386,7 +3408,7 @@ async fn two_clients_of_one_account_share_the_registry_and_a_retired_stream_refu
                 &OpenGate,
                 &NoRisk,
                 &NoJournal,
-                ConfirmToken::user_confirmed(),
+                ConfirmToken::for_preview(&okx_entry_intent(client, cid).preview()),
                 okx_entry_intent(client, cid),
             )
             .await
@@ -3401,7 +3423,7 @@ async fn two_clients_of_one_account_share_the_registry_and_a_retired_stream_refu
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&okx_entry_intent(&a, "eCCCC").preview()),
             okx_entry_intent(&a, "eCCCC"),
         )
         .await
@@ -3537,7 +3559,7 @@ async fn okx_submit_with(
         &OpenGate,
         &NoRisk,
         journal,
-        ConfirmToken::user_confirmed(),
+        ConfirmToken::for_preview(&intent.preview()),
         intent,
     )
     .await
@@ -3565,7 +3587,7 @@ async fn a_failing_journal_does_not_stop_a_binance_reduce_only_close() {
             &OpenGate,
             &NoRisk,
             &failing_journal(),
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await;
@@ -3657,7 +3679,7 @@ async fn a_failing_journal_does_not_stop_flatten_or_auto_close() {
             &OpenGate,
             &NoRisk,
             &journal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_bulk(c.account(), BulkAction::Flatten),
             &okx_swap_table(),
             MarginMode::Cross,
         )
@@ -3705,7 +3727,7 @@ async fn a_failing_journal_still_refuses_a_new_entry_without_a_post() {
             &OpenGate,
             &NoRisk,
             &failing_journal(),
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&intent.preview()),
             intent,
         )
         .await
@@ -3739,7 +3761,7 @@ async fn a_record_locks_before_any_client_exists() {
             &OpenGate,
             &NoRisk,
             &NoJournal,
-            ConfirmToken::user_confirmed(),
+            ConfirmToken::for_preview(&okx_entry_intent(&c2, "eCCCC").preview()),
             okx_entry_intent(&c2, "eCCCC"),
         )
         .await
@@ -3847,4 +3869,366 @@ async fn block_all_entries_refuses_every_account_but_not_closes() {
     ));
     assert!(submit_futures(&c, Action::Close(Dir::Long)).await.is_ok());
     assert_eq!(fake.count("POST /fapi/v1/order"), 1);
+}
+
+// ── Send futures, the preview and the bound confirmation ─────────────────
+
+fn assert_send<T: Send>(_: &T) {}
+
+/// Nothing is run: these only have to compile. The futures are `Send` so they fit in a spawned
+/// task, which needs the risk hook and the journal to be `Sync` (`&dyn` of them crosses threads).
+#[test]
+fn every_send_path_future_is_send() {
+    use super::risk::AutoCloseGrant;
+    use super::risk::SharedRisk;
+    let _: fn(
+        &TradeClient,
+        &dyn RiskHook,
+        &dyn super::journal::UnknownJournal,
+        ConfirmToken,
+        OrderIntent,
+    ) = |c, r, j, t, i| assert_send(&c.submit(&OpenGate, r, j, t, i));
+    let _: fn(&TradeClient, &dyn RiskHook, &dyn super::journal::UnknownJournal, AutoIntent) =
+        |c, r, j, a| assert_send(&c.submit_auto(&OpenGate, r, j, a));
+    let _: fn(&TradeClient, PendingUnknown, &dyn super::journal::UnknownJournal) =
+        |c, p, j| assert_send(&c.resolve_unknown(p, j));
+    let _: fn(
+        &TradeClient,
+        &dyn RiskHook,
+        &dyn super::journal::UnknownJournal,
+        ConfirmToken,
+        &RulesTable,
+    ) = |c, r, j, t, tb| assert_send(&c.cancel_all(&OpenGate, r, j, t, tb));
+    let _: fn(
+        &TradeClient,
+        &dyn RiskHook,
+        &dyn super::journal::UnknownJournal,
+        ConfirmToken,
+        &RulesTable,
+    ) = |c, r, j, t, tb| assert_send(&c.flatten(&OpenGate, r, j, t, tb, MarginMode::Cross));
+    let _: fn(
+        &TradeClient,
+        &dyn RiskHook,
+        &dyn super::journal::UnknownJournal,
+        AutoCloseGrant,
+        &RulesTable,
+    ) = |c, r, j, g, tb| assert_send(&c.auto_close(&OpenGate, r, j, g, tb, MarginMode::Cross));
+    // The shared hook can sit in a `'static` task next to the client.
+    fn send_static<T: Send + Sync + 'static>() {}
+    send_static::<SharedRisk>();
+}
+
+fn futures_limit_qty(rules: &SymbolRules, cid: &ClientId, qty: &str) -> BinanceRequest {
+    bf::new_order(bf::FuturesEntry {
+        rules,
+        mode: Some(PositionMode::OneWay),
+        action: Action::Open(Dir::Long),
+        qty: d(qty),
+        exec: Exec::Limit {
+            price: d("60000"),
+            tif: TimeInForce::Gtc,
+        },
+        ref_price: Some(d("60000")),
+        client_id: dup(cid),
+    })
+    .unwrap()
+}
+
+fn futures_intent(c: &TradeClient, qty: &str) -> OrderIntent {
+    let t = futures();
+    let r = t.lookup("BTCUSDT").unwrap();
+    let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+    OrderIntent::binance(c.account(), futures_limit_qty(r, &id("eAAAA"), qty), &fresh).unwrap()
+}
+
+/// What the preview shows, against what the server received: same names, same order (when
+/// `ordered`), same values; only a client id is masked in the preview.
+fn assert_preview_matches(
+    preview: &super::preview::OrderPreview,
+    sent: Vec<(String, String)>,
+    ordered: bool,
+) {
+    assert_eq!(
+        preview.fields.len(),
+        sent.len(),
+        "{:?} vs {sent:?}",
+        preview.fields
+    );
+    let mut shown: Vec<_> = preview.fields.iter().collect();
+    let mut sent = sent;
+    if !ordered {
+        shown.sort_by(|a, b| a.name.cmp(&b.name));
+        sent.sort();
+    }
+    for (f, (name, value)) in shown.iter().zip(&sent) {
+        assert_eq!(&f.name, name);
+        let lower = name.to_ascii_lowercase();
+        let is_id = lower.ends_with("clientorderid")
+            || lower.ends_with("clordid")
+            || lower == "clientalgoid";
+        if is_id {
+            let tail: String = value
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            assert_eq!(f.value, format!("…{tail}"), "{name}");
+            assert_ne!(&f.value, value, "a client id must be masked");
+        } else {
+            assert_eq!(&f.value, value, "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_preview_equals_the_form_the_binance_server_receives() {
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let intent = futures_intent(&c, "0.002");
+    let preview = intent.preview();
+    assert_eq!(preview.symbol, "BTCUSDT");
+    assert_eq!(preview.path, "/fapi/v1/order");
+    assert_eq!(preview.field("quantity"), Some("0.002"));
+    assert_eq!(preview.field("price"), Some("60000"));
+    // No client id in full anywhere in what the window may print.
+    assert!(!format!("{preview:?}").contains("eAAAA"));
+    c.submit(
+        &OpenGate,
+        &NoRisk,
+        &NoJournal,
+        ConfirmToken::for_preview(&preview),
+        intent,
+    )
+    .await
+    .unwrap();
+    let raw = fake.raw();
+    assert_eq!(raw.len(), 1);
+    let (method, target, body) = &raw[0];
+    assert_eq!(
+        (method.as_str(), target.as_str()),
+        ("POST", "/fapi/v1/order")
+    );
+    let sent: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .filter(|(k, _)| !matches!(k.as_str(), "recvWindow" | "timestamp" | "signature"))
+        .collect();
+    assert_preview_matches(&preview, sent, true);
+}
+
+#[tokio::test]
+async fn the_preview_equals_the_json_the_okx_server_receives() {
+    let fake = serve(gen_okx);
+    let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+    let intent = okx_entry_intent(&c, "eAAAA");
+    let preview = intent.preview();
+    assert_eq!(preview.symbol, "BTC-USDT-SWAP");
+    assert_eq!(preview.field("sz"), Some("2"));
+    assert!(!format!("{preview:?}").contains("eAAAA"));
+    c.submit(
+        &OpenGate,
+        &NoRisk,
+        &NoJournal,
+        ConfirmToken::for_preview(&preview),
+        intent,
+    )
+    .await
+    .unwrap();
+    let raw = fake.raw();
+    assert_eq!(raw.len(), 1);
+    let (method, target, body) = &raw[0];
+    assert_eq!(
+        (method.as_str(), target.as_str()),
+        ("POST", "/api/v5/trade/order")
+    );
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_preview_matches(&preview, super::preview::flatten_json(&json), false);
+}
+
+#[tokio::test]
+async fn a_token_for_another_quantity_is_refused_and_nothing_is_sent() {
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let shown = futures_intent(&c, "0.002");
+    let old_token = ConfirmToken::for_preview(&shown.preview());
+    // The user changed the quantity after confirming: a new request, the old token.
+    let changed = futures_intent(&c, "0.003");
+    assert_ne!(
+        shown.preview().field("quantity"),
+        changed.preview().field("quantity")
+    );
+    let err = c
+        .submit(&OpenGate, &NoRisk, &NoJournal, old_token, changed)
+        .await
+        .unwrap_err();
+    assert_eq!(err, SubmitError::ConfirmationMismatch);
+    assert_eq!(fake.count("POST"), 0);
+    // The same request still goes with its own token, and an old token cannot be reused for
+    // it: tokens are single use, so the next one is made from a preview again.
+    let ok = c
+        .submit(
+            &OpenGate,
+            &NoRisk,
+            &NoJournal,
+            ConfirmToken::for_preview(&shown.preview()),
+            shown,
+        )
+        .await;
+    assert!(ok.is_ok(), "{ok:?}");
+    assert_eq!(fake.count("POST /fapi/v1/order"), 1);
+}
+
+#[tokio::test]
+async fn a_token_for_another_client_id_or_another_kind_of_action_is_refused() {
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let t = futures();
+    let r = t.lookup("BTCUSDT").unwrap();
+    let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+    let a = OrderIntent::binance(
+        c.account(),
+        futures_limit_qty(r, &id("eAAAA"), "0.002"),
+        &fresh,
+    )
+    .unwrap();
+    let b = OrderIntent::binance(
+        c.account(),
+        futures_limit_qty(r, &id("eBBBB"), "0.002"),
+        &fresh,
+    )
+    .unwrap();
+    // Same values, other client id: another request, so another confirmation.
+    assert_eq!(
+        c.submit(
+            &OpenGate,
+            &NoRisk,
+            &NoJournal,
+            ConfirmToken::for_preview(&a.preview()),
+            b
+        )
+        .await
+        .unwrap_err(),
+        SubmitError::ConfirmationMismatch
+    );
+    // A cancel-all / close-all confirmation does not confirm one order, and the reverse.
+    assert_eq!(
+        c.submit(
+            &OpenGate,
+            &NoRisk,
+            &NoJournal,
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
+            a
+        )
+        .await
+        .unwrap_err(),
+        SubmitError::ConfirmationMismatch
+    );
+    let other = futures_intent(&c, "0.002");
+    let res = c
+        .cancel_all(
+            &OpenGate,
+            &NoRisk,
+            &NoJournal,
+            ConfirmToken::for_preview(&other.preview()),
+            &t,
+        )
+        .await;
+    assert!(res.is_err());
+    assert!(fake.all().is_empty(), "{:?}", fake.all());
+}
+
+#[tokio::test]
+async fn a_bulk_token_for_another_account_sends_nothing() {
+    let fake = serve(gen_binance);
+    let a = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let b = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    assert_ne!(a.account(), b.account());
+    let t = futures();
+    let token = ConfirmToken::for_bulk(a.account(), BulkAction::CancelAll);
+    let res = b
+        .cancel_all(&OpenGate, &NoRisk, &NoJournal, token, &t)
+        .await;
+    assert!(res.is_err());
+    let token = ConfirmToken::for_bulk(a.account(), BulkAction::Flatten);
+    let res = b
+        .flatten(&OpenGate, &NoRisk, &NoJournal, token, &t, MarginMode::Cross)
+        .await;
+    assert!(res.is_err());
+    assert!(fake.all().is_empty(), "{:?}", fake.all());
+}
+
+#[tokio::test]
+async fn a_cancel_all_token_cannot_flatten_and_the_reverse() {
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let t = futures();
+    let res = c
+        .flatten(
+            &OpenGate,
+            &NoRisk,
+            &NoJournal,
+            ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll),
+            &t,
+            MarginMode::Cross,
+        )
+        .await;
+    assert!(res.is_err());
+    let res = c
+        .cancel_all(
+            &OpenGate,
+            &NoRisk,
+            &NoJournal,
+            ConfirmToken::for_bulk(c.account(), BulkAction::Flatten),
+            &t,
+        )
+        .await;
+    assert!(res.is_err());
+    assert!(fake.all().is_empty(), "{:?}", fake.all());
+}
+
+#[tokio::test]
+async fn a_bulk_confirmation_never_covers_an_entry() {
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let entry = futures_intent(&c, "0.002");
+    assert!(matches!(entry.exposure(), Exposure::Adds { .. }));
+    for action in [BulkAction::CancelAll, BulkAction::Flatten] {
+        let spent = ConfirmToken::for_bulk(c.account(), action)
+            .spend_bulk(c.account(), action)
+            .unwrap();
+        let res = c
+            .submit_spent(
+                &OpenGate,
+                &NoRisk,
+                &NoJournal,
+                spent,
+                futures_intent(&c, "0.002"),
+            )
+            .await;
+        assert_eq!(res.unwrap_err(), SubmitError::ConfirmationMismatch);
+    }
+    assert!(fake.all().is_empty(), "{:?}", fake.all());
+}
+
+#[test]
+fn requests_that_differ_only_in_the_query_have_different_preview_hashes() {
+    let build = |path: &str| {
+        super::preview::OrderPreview::build(
+            unique_account(),
+            super::rules::TradeProduct::OkxSwap,
+            super::request::Method::Get,
+            path,
+            "BTC-USDT-SWAP",
+            Exposure::Neutral,
+            vec![],
+        )
+    };
+    let a = build("/api/v5/trade/order?instId=BTC-USDT-SWAP&clOrdId=aaaa");
+    let b = build("/api/v5/trade/order?instId=BTC-USDT-SWAP&clOrdId=bbbb");
+    // The shown path has no query, the hash still tells the two apart.
+    assert_eq!(a.path, "/api/v5/trade/order");
+    assert_eq!(a.path, b.path);
+    assert_ne!(a.hash, b.hash);
 }

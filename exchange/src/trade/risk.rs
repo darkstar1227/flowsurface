@@ -36,6 +36,7 @@ use super::stream::{PrivateEvent, StreamKey};
 use crate::account::{AccountKey, AccountProduct, AccountVenue};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Which figure an equity observation is (shown in the UI, condition 73).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -480,14 +481,38 @@ impl EquityTracker {
     /// arrives: the tracker counts as stale (new entries under an equity limit are refused
     /// and no automatic close starts) until the caller reads the equity again and feeds it.
     ///
-    /// `epoch` is [`Snapshot::sync_epoch`](super::stream::Snapshot::sync_epoch) of the snapshot
-    /// that was applied. The stream reports `Connected` as soon as it has *sent* a snapshot,
-    /// possibly before this call: until the tracker has applied the account's latest snapshot
-    /// (and with it the positions of `set_positions`), new entries are refused with
-    /// [`RiskRefusal::SnapshotNotApplied`].
-    pub fn snapshot_applied(&mut self, epoch: u64) {
+    /// The tracker takes the snapshot itself: the epoch is read from it here and the position
+    /// book is set in the same call (`as_of_ms` and `notionals` as in [`Self::set_positions`];
+    /// a snapshot carries sizes, not prices, so the caller supplies the notionals). A bare
+    /// number is not accepted, so a caller cannot pass `sync_epoch(account)` without having
+    /// applied anything:
+    ///
+    /// ```compile_fail,E0308
+    /// use flowsurface_exchange::trade::EquityTracker;
+    /// fn apply(tracker: &mut EquityTracker) {
+    ///     tracker.snapshot_applied(0, 0, []);
+    /// }
+    /// ```
+    ///
+    /// The snapshot cannot be forged outside the crate either (its epoch is crate-private):
+    ///
+    /// ```compile_fail,E0451
+    /// use flowsurface_exchange::trade::stream::Snapshot;
+    /// let _ = Snapshot { orders: vec![], positions: vec![], balances: vec![], epoch: 0 };
+    /// ```
+    ///
+    /// The stream reports `Connected` as soon as it has *sent* a snapshot, possibly before
+    /// this call: until the tracker has applied the account's latest snapshot, new entries are
+    /// refused with [`RiskRefusal::SnapshotNotApplied`].
+    pub fn snapshot_applied(
+        &mut self,
+        snapshot: &super::stream::Snapshot,
+        as_of_ms: i64,
+        notionals: impl IntoIterator<Item = (String, Decimal)>,
+    ) {
+        self.set_positions(as_of_ms, notionals);
         self.degraded = true;
-        self.applied_epoch = epoch;
+        self.applied_epoch = snapshot.sync_epoch();
     }
 
     pub fn limits(&self) -> &RiskLimits {
@@ -787,72 +812,204 @@ impl super::gate::sealed::Sealed for RiskSnapshot<'_> {}
 
 impl RiskHook for RiskSnapshot<'_> {
     fn check(&self, view: &RiskView<'_>) -> Result<(), RiskRefusal> {
-        let t = self.tracker;
-        if view.account != t.account {
-            return Err(RiskRefusal::WrongAccount);
-        }
-        // Only entries are judged: reducing, closing and cancelling always pass (condition 72).
-        let Exposure::Adds { notional } = view.exposure else {
-            return Ok(());
+        check_entry(self.tracker, self.now_ms, view)
+    }
+}
+
+/// The one risk check, shared by [`RiskSnapshot`] and [`SharedRisk`] so they cannot drift.
+fn check_entry(t: &EquityTracker, now_ms: i64, view: &RiskView<'_>) -> Result<(), RiskRefusal> {
+    if view.account != t.account {
+        return Err(RiskRefusal::WrongAccount);
+    }
+    // Only entries are judged: reducing, closing and cancelling always pass (condition 72).
+    let Exposure::Adds { notional } = view.exposure else {
+        return Ok(());
+    };
+    // The stream is `Connected` as soon as it sent its snapshot; the positions and equity
+    // this tracker holds are from before it until the caller applied that snapshot.
+    if super::stream::sync_epoch(t.account) != t.applied_epoch {
+        return Err(RiskRefusal::SnapshotNotApplied);
+    }
+    if t.settings_invalid {
+        return Err(RiskRefusal::SettingsInvalid);
+    }
+    if t.trip.is_some() {
+        return Err(RiskRefusal::Locked);
+    }
+    if t.limits.equity_limits_set() && t.freshness(now_ms) != EquityFreshness::Fresh {
+        return Err(RiskRefusal::EquityUnavailable);
+    }
+    // An entry that cannot be valued is refused whether or not a cap is set (review item
+    // 16, as in the single-order cap this replaces): the app never sends an entry it
+    // cannot put a value on.
+    let Some(value) = notional else {
+        return Err(RiskRefusal::NotionalUnknown);
+    };
+    if let Some(cap) = t.limits.max_order_notional
+        && !matches!(
+            value.checked_cmp(&cap),
+            Ok(Ordering::Less | Ordering::Equal)
+        )
+    {
+        return Err(RiskRefusal::SingleOrderCapExceeded);
+    }
+    if let Some(cap) = t.limits.max_symbol_notional {
+        let Some(book) = &t.positions else {
+            return Err(RiskRefusal::PositionUnknown);
         };
-        // The stream is `Connected` as soon as it sent its snapshot; the positions and equity
-        // this tracker holds are from before it until the caller applied that snapshot.
-        if super::stream::sync_epoch(t.account) != t.applied_epoch {
-            return Err(RiskRefusal::SnapshotNotApplied);
+        let age = now_ms.saturating_sub(book.as_of_ms);
+        if age > t.limits.max_equity_age_ms || age < -MAX_FUTURE_SKEW_MS {
+            return Err(RiskRefusal::PositionUnknown);
         }
-        if t.settings_invalid {
-            return Err(RiskRefusal::SettingsInvalid);
+        let held = book
+            .notionals
+            .get(view.symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let after = held
+            .checked_add(&value)
+            .map_err(|_| RiskRefusal::SymbolCapExceeded)?;
+        if !matches!(
+            after.checked_cmp(&cap),
+            Ok(Ordering::Less | Ordering::Equal)
+        ) {
+            return Err(RiskRefusal::SymbolCapExceeded);
         }
-        if t.trip.is_some() {
-            return Err(RiskRefusal::Locked);
+    }
+    Ok(())
+}
+
+/// The risk tracker shared between the GUI and the tasks that send: the second sealed
+/// [`RiskHook`]. `RiskSnapshot` borrows the tracker, so it cannot be moved into a `'static`
+/// future; this holds the tracker behind a lock instead, and reads the clock itself.
+///
+/// The lock is taken inside each method and never held across an `.await` (nothing here is
+/// async). A poisoned lock fails closed: entries are refused with
+/// [`RiskRefusal::StateUnavailable`], reducing, closing and cancelling still pass (as in
+/// `RiskSnapshot`, condition 72). The mutating methods report the poisoning instead of
+/// guessing.
+#[derive(Clone)]
+pub struct SharedRisk {
+    /// The tracker's account, kept outside the lock so a poisoned lock still checks it.
+    account: AccountKey,
+    tracker: Arc<Mutex<EquityTracker>>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+}
+
+impl std::fmt::Debug for SharedRisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedRisk(..)")
+    }
+}
+
+/// The shared tracker's lock was poisoned by a panic: its state cannot be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RiskPoisoned;
+
+impl SharedRisk {
+    /// `clock` returns the current time in unix milliseconds (injected so tests need no wall
+    /// clock).
+    pub fn new(tracker: EquityTracker, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        Self {
+            account: tracker.account,
+            tracker: Arc::new(Mutex::new(tracker)),
+            clock: Arc::new(clock),
         }
-        if t.limits.equity_limits_set() && t.freshness(self.now_ms) != EquityFreshness::Fresh {
-            return Err(RiskRefusal::EquityUnavailable);
-        }
-        // An entry that cannot be valued is refused whether or not a cap is set (review item
-        // 16, as in the single-order cap this replaces): the app never sends an entry it
-        // cannot put a value on.
-        let Some(value) = notional else {
-            return Err(RiskRefusal::NotionalUnknown);
-        };
-        if let Some(cap) = t.limits.max_order_notional
-            && !matches!(
-                value.checked_cmp(&cap),
-                Ok(Ordering::Less | Ordering::Equal)
-            )
-        {
-            return Err(RiskRefusal::SingleOrderCapExceeded);
-        }
-        if let Some(cap) = t.limits.max_symbol_notional {
-            let Some(book) = &t.positions else {
-                return Err(RiskRefusal::PositionUnknown);
+    }
+
+    /// Run `f` on the tracker under the lock. `f` is synchronous: the lock cannot outlive it.
+    pub fn with_tracker<R>(
+        &self,
+        f: impl FnOnce(&mut EquityTracker) -> R,
+    ) -> Result<R, RiskPoisoned> {
+        let mut guard = self.tracker.lock().map_err(|_| RiskPoisoned)?;
+        Ok(f(&mut guard))
+    }
+
+    /// [`EquityTracker::snapshot_applied`] under the lock.
+    pub fn snapshot_applied(
+        &self,
+        snapshot: &super::stream::Snapshot,
+        as_of_ms: i64,
+        notionals: impl IntoIterator<Item = (String, Decimal)>,
+    ) -> Result<(), RiskPoisoned> {
+        self.with_tracker(|t| t.snapshot_applied(snapshot, as_of_ms, notionals))
+    }
+
+    /// [`EquityTracker::observe`] under the lock.
+    pub fn observe(&self, obs: EquityObservation) -> Result<Observed, RiskPoisoned> {
+        self.with_tracker(|t| t.observe(obs))
+    }
+
+    /// [`EquityTracker::set_positions`] under the lock.
+    pub fn set_positions(
+        &self,
+        as_of_ms: i64,
+        notionals: impl IntoIterator<Item = (String, Decimal)>,
+    ) -> Result<(), RiskPoisoned> {
+        self.with_tracker(|t| t.set_positions(as_of_ms, notionals))
+    }
+
+    /// [`EquityTracker::set_limits`] under the lock.
+    pub fn set_limits(&self, limits: RiskLimits) -> Result<(), RiskPoisoned> {
+        self.with_tracker(|t| t.set_limits(limits))
+    }
+
+    /// [`EquityTracker::acknowledge_trip`] under the lock.
+    pub fn acknowledge_trip(&self) -> Result<(), RiskPoisoned> {
+        self.with_tracker(|t| t.acknowledge_trip())
+    }
+
+    /// [`EquityTracker::is_tripped`] under the lock.
+    pub fn is_tripped(&self) -> Result<Option<TripReason>, RiskPoisoned> {
+        self.with_tracker(|t| t.is_tripped())
+    }
+
+    /// [`EquityTracker::freshness`] at the shared clock's now.
+    pub fn freshness(&self) -> Result<EquityFreshness, RiskPoisoned> {
+        let now = (self.clock)();
+        self.with_tracker(|t| t.freshness(now))
+    }
+
+    /// [`EquityTracker::begin_auto_close`] at the shared clock's now.
+    pub fn begin_auto_close(&self, enabled: bool) -> Result<AutoCloseDecision, RiskPoisoned> {
+        let now = (self.clock)();
+        self.with_tracker(|t| t.begin_auto_close(now, enabled))
+    }
+}
+
+impl super::gate::sealed::Sealed for SharedRisk {}
+
+impl RiskHook for SharedRisk {
+    fn check(&self, view: &RiskView<'_>) -> Result<(), RiskRefusal> {
+        let now_ms = (self.clock)();
+        let Ok(t) = self.tracker.lock() else {
+            // Poisoned: only entries are refused, like every other refusal here. The account is
+            // still checked, as in `check_entry`.
+            if view.account != self.account {
+                return Err(RiskRefusal::WrongAccount);
+            }
+            return match view.exposure {
+                Exposure::Adds { .. } => Err(RiskRefusal::StateUnavailable),
+                Exposure::Reduces | Exposure::Neutral => Ok(()),
             };
-            let age = self.now_ms.saturating_sub(book.as_of_ms);
-            if age > t.limits.max_equity_age_ms || age < -MAX_FUTURE_SKEW_MS {
-                return Err(RiskRefusal::PositionUnknown);
-            }
-            let held = book
-                .notionals
-                .get(view.symbol)
-                .copied()
-                .unwrap_or(Decimal::ZERO);
-            let after = held
-                .checked_add(&value)
-                .map_err(|_| RiskRefusal::SymbolCapExceeded)?;
-            if !matches!(
-                after.checked_cmp(&cap),
-                Ok(Ordering::Less | Ordering::Equal)
-            ) {
-                return Err(RiskRefusal::SymbolCapExceeded);
-            }
-        }
-        Ok(())
+        };
+        check_entry(&t, now_ms, view)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(epoch: u64) -> crate::trade::stream::Snapshot {
+        crate::trade::stream::Snapshot {
+            orders: vec![],
+            positions: vec![],
+            balances: vec![],
+            epoch,
+        }
+    }
 
     const ACCT: AccountKey = AccountKey::from_bytes([7; 16]);
     const MIN: i64 = 60_000;
@@ -1530,7 +1687,7 @@ mod tests {
         });
         t.observe(obs(T0, "1000"));
         assert_eq!(t.freshness(T0 + 1), EquityFreshness::Fresh);
-        t.snapshot_applied(0);
+        t.snapshot_applied(&snapshot(0), T0, []);
         assert_eq!(t.freshness(T0 + 1), EquityFreshness::Stale);
         t.observe(obs(T0 + MIN, "1000"));
         assert_eq!(t.freshness(T0 + MIN), EquityFreshness::Fresh);
@@ -1649,5 +1806,189 @@ mod tests {
             ];
             assert_eq!(got, want, "{name}");
         }
+    }
+
+    #[test]
+    fn applying_a_snapshot_sets_the_positions_and_the_epoch_together() {
+        let mut t = tracker(RiskLimits::default());
+        t.snapshot_applied(&snapshot(4), T0, [("BTC-USDT-SWAP".to_string(), d("4500"))]);
+        assert_eq!(t.applied_epoch, 4);
+        assert!(t.positions.is_some());
+        // A position under an invalid symbol makes the book unknown, but the epoch counts.
+        t.snapshot_applied(&snapshot(5), T0, [("btc/usdt".to_string(), d("1"))]);
+        assert_eq!(t.applied_epoch, 5);
+        assert!(t.positions.is_none());
+    }
+
+    // ── SharedRisk ──────────────────────────────────────────────────────
+
+    /// The same tracker twice: one is read through `RiskSnapshot`, the other through
+    /// `SharedRisk`. Each scenario returns a fresh pair of identical trackers.
+    fn scenario(n: usize) -> EquityTracker {
+        match n {
+            0 => tracker(RiskLimits::default()),
+            1 => tracker(RiskLimits {
+                max_order_notional: Some(d("1000")),
+                ..RiskLimits::default()
+            }),
+            // An equity limit and no reading yet.
+            2 => tracker(limits()),
+            3 => EquityTracker::with_invalid_settings(ACCT, EquityBasis::OkxTotalEq),
+            4 => {
+                let mut t = tracker(RiskLimits {
+                    max_symbol_notional: Some(d("2000")),
+                    ..RiskLimits::default()
+                });
+                t.set_positions(T0, [("BTC-USDT-SWAP".to_string(), d("1500"))]);
+                t
+            }
+            // A fresh reading under a limit, then a reading far below: trips.
+            _ => {
+                let mut t = tracker(RiskLimits {
+                    daily_loss_limit: Some(d("100")),
+                    confirm_observations: 1,
+                    ..RiskLimits::default()
+                });
+                t.observe(EquityObservation::rest(
+                    T0,
+                    d("1000"),
+                    EquityBasis::OkxTotalEq,
+                ));
+                t.observe(EquityObservation::rest(
+                    T0 + MIN,
+                    d("800"),
+                    EquityBasis::OkxTotalEq,
+                ));
+                t
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_hook_judges_exactly_like_the_snapshot() {
+        let exposures = [
+            entry(Some("500")),
+            entry(Some("1500")),
+            entry(None),
+            Exposure::Reduces,
+            Exposure::Neutral,
+        ];
+        let accounts = [ACCT, AccountKey::from_bytes([9; 16])];
+        for n in 0..6 {
+            for now in [T0 + MIN, T0 + 2 * MIN, T0 + DAY] {
+                let alone = scenario(n);
+                let shared = SharedRisk::new(scenario(n), move || now);
+                for account in accounts {
+                    for exposure in exposures {
+                        let view = RiskView {
+                            account,
+                            symbol: "BTC-USDT-SWAP",
+                            exposure,
+                        };
+                        assert_eq!(
+                            alone.snapshot(now).check(&view),
+                            shared.check(&view),
+                            "scenario {n}, now {now}, {exposure:?}, account {account:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_hook_reads_the_clock_on_every_check() {
+        use std::sync::atomic::{AtomicI64, Ordering as AO};
+        let now = Arc::new(AtomicI64::new(T0));
+        let clock = now.clone();
+        let shared = SharedRisk::new(scenario(4), move || clock.load(AO::Relaxed));
+        let view = RiskView {
+            account: ACCT,
+            symbol: "BTC-USDT-SWAP",
+            exposure: entry(Some("100")),
+        };
+        assert_eq!(shared.check(&view), Ok(()));
+        // The position reading is now older than `max_equity_age_ms`.
+        now.store(T0 + DAY, AO::Relaxed);
+        assert_eq!(shared.check(&view), Err(RiskRefusal::PositionUnknown));
+    }
+
+    #[test]
+    fn a_snapshot_applied_through_the_shared_hook_is_seen_by_the_next_check() {
+        let shared = SharedRisk::new(scenario(0), || T0);
+        let clone = shared.clone();
+        let snap = snapshot(7);
+        clone
+            .snapshot_applied(&snap, T0, [("BTC-USDT-SWAP".to_string(), d("10"))])
+            .unwrap();
+        // One tracker behind both handles: the clone's write is visible to the original.
+        let epoch = shared.with_tracker(|t| t.applied_epoch).unwrap();
+        assert_eq!(epoch, 7);
+        // The stream of this account is at epoch 0 (not registered), so the entry is refused
+        // exactly as `RiskSnapshot` refuses it.
+        let view = RiskView {
+            account: ACCT,
+            symbol: "BTC-USDT-SWAP",
+            exposure: entry(Some("1")),
+        };
+        assert_eq!(
+            shared.check(&view),
+            shared
+                .with_tracker(|t| t.snapshot(T0).check(&view))
+                .unwrap()
+        );
+        assert_eq!(shared.check(&view), Err(RiskRefusal::SnapshotNotApplied));
+    }
+
+    #[test]
+    fn a_poisoned_shared_hook_refuses_entries_only_and_reports_the_poisoning() {
+        let shared = SharedRisk::new(scenario(0), || T0);
+        let victim = shared.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = victim.with_tracker(|_| panic!("poison the lock on purpose"));
+        }));
+        assert!(panicked.is_err());
+        let view = |exposure| RiskView {
+            account: ACCT,
+            symbol: "BTC-USDT-SWAP",
+            exposure,
+        };
+        assert_eq!(
+            shared.check(&view(entry(Some("1")))),
+            Err(RiskRefusal::StateUnavailable)
+        );
+        assert_eq!(shared.check(&view(Exposure::Reduces)), Ok(()));
+        assert_eq!(shared.check(&view(Exposure::Neutral)), Ok(()));
+        // Same account check as the healthy path and `RiskSnapshot`.
+        let other = RiskView {
+            account: AccountKey::from_bytes([0xEE; 16]),
+            symbol: "BTC-USDT-SWAP",
+            exposure: Exposure::Reduces,
+        };
+        assert_eq!(shared.check(&other), Err(RiskRefusal::WrongAccount));
+        assert_eq!(
+            scenario(0).snapshot(T0).check(&other),
+            Err(RiskRefusal::WrongAccount)
+        );
+        assert_eq!(shared.freshness(), Err(RiskPoisoned));
+        assert_eq!(shared.acknowledge_trip(), Err(RiskPoisoned));
+    }
+
+    #[test]
+    fn the_shared_hook_is_send_sync_static_and_a_hook_of_it_is_a_send_future() {
+        fn needs<T: Send + Sync + 'static>() {}
+        needs::<SharedRisk>();
+        // Taken by a spawned task: the check is plain data work, not an await point.
+        let shared = SharedRisk::new(scenario(0), || T0);
+        let fut = async move {
+            let view = RiskView {
+                account: ACCT,
+                symbol: "BTC-USDT-SWAP",
+                exposure: Exposure::Neutral,
+            };
+            shared.check(&view)
+        };
+        fn send_static<F: std::future::Future + Send + 'static>(_: &F) {}
+        send_static(&fut);
     }
 }
