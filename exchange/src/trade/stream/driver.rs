@@ -912,16 +912,29 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
                 let mut held = shared.key_claim.lock().unwrap_or_else(|p| p.into_inner());
                 // The old claim (if the Keychain item was replaced) is released only after the
                 // new one is held, so a reconnect never opens a gap for another account.
-                if !key_claims::claim_into(
+                match key_claims::claim_into(
                     &mut held,
                     key.account,
                     shared.status_token.unwrap_or(0),
                     creds.key().expose_secret(),
                 ) {
-                    log::warn!("private stream: this API key is already in use by another account");
-                    // Retryable, not terminal: the holder may be a stream that is still shutting
-                    // down (an account deleted and re-added), and the backoff gives it time.
-                    return DownCause::Network;
+                    Ok(()) => {}
+                    Err(key_claims::Refused::Superseded) => {
+                        // A newer stream of this account holds the key: this one was replaced.
+                        // Ending it (never retrying) keeps the old stream from looping forever;
+                        // its status write is token-guarded, so it cannot touch the newer one.
+                        log::info!("private stream: replaced by a newer stream of this account");
+                        return DownCause::Unavailable;
+                    }
+                    Err(key_claims::Refused::Held) => {
+                        log::warn!(
+                            "private stream: this API key is already in use by another account"
+                        );
+                        // Retryable, not terminal: the holder may be a stream that is still
+                        // shutting down (an account deleted and re-added), and the backoff gives
+                        // it time.
+                        return DownCause::Network;
+                    }
                 }
             }
             let client = TradeClient::new(
@@ -1410,6 +1423,42 @@ mod tests {
             .unwrap();
         let cause = rt.block_on(run_leg(&shared, 0, 1, &tx));
         assert_eq!(cause, DownCause::Unavailable);
+    }
+
+    #[test]
+    fn a_replaced_stream_ends_and_a_key_held_by_another_account_is_retried() {
+        let mut ctx = context(AccountVenue::Binance, AccountProduct::UsdM);
+        ctx.load_credentials = Arc::new(|| {
+            Ok(ApiCredentials::new(
+                "replaced-stream-test-key".to_string(),
+                "replaced-stream-test-secret".to_string(),
+                None,
+            ))
+        });
+        let account = ctx.key.account;
+        let mut shared = Shared::new(ctx);
+        shared.status_token = Some(1);
+        let (tx, _rx) = unbounded();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // A newer stream of the same account (higher token) holds the key: this one ends.
+        let _newer = key_claims::claim(account, 5, "replaced-stream-test-key").expect("free key");
+        assert_eq!(
+            rt.block_on(run_leg(&shared, 0, 1, &tx)),
+            DownCause::Unavailable
+        );
+        // The same key held by another account is retryable.
+        shared.status_token = Some(9);
+        drop(_newer);
+        let _other = key_claims::claim(
+            AccountKey::from_bytes([8; 16]),
+            2,
+            "replaced-stream-test-key",
+        )
+        .expect("free key");
+        assert_eq!(rt.block_on(run_leg(&shared, 0, 1, &tx)), DownCause::Network);
     }
 
     // ── Resync ordering, listenKey lifetime, task lifetime, subscriptions ────

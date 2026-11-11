@@ -9,6 +9,7 @@ mod notify;
 mod screen;
 mod style;
 mod theme;
+mod trading;
 mod version;
 mod widget;
 mod window;
@@ -97,6 +98,8 @@ struct Flowsurface {
     proxy_unreadable: bool,
     /// Connection-test verdicts of this run, read by the send gate. Memory only.
     trade_session: TradeSession,
+    /// Startup, private streams, account state and standing alerts. Memory only.
+    trading: trading::TradingState,
     data_sources: Arc<DataSources>,
     audio_stream: AudioStream,
     volume_size_unit: exchange::SizeUnit,
@@ -172,6 +175,7 @@ enum Message {
     IndicatorEditor(indicator_editor::Message),
     NetworkEditor(modal::network_editor::Message),
     ExchangeAccounts(modal::exchange_accounts::Message),
+    Trading(trading::Message),
     Layouts(modal::layout_manager::Message),
     SharedChartResources(manifest::Message),
     AudioStream(modal::audio::Message),
@@ -253,6 +257,11 @@ impl Flowsurface {
             network_config: saved_state.network.clone(),
             proxy_unreadable: saved_state.proxy_unreadable,
             trade_session: TradeSession::default(),
+            trading: trading::TradingState::new(if saved_state.proxy_unreadable {
+                ProxyState::Broken
+            } else {
+                ProxyState::from_config(saved_state.network.proxy.as_ref())
+            }),
             network_editor: NetworkEditor::new(&saved_state.network, None),
             exchange_accounts: modal::exchange_accounts::ExchangeAccounts::new(
                 &saved_state.exchange_accounts,
@@ -316,7 +325,11 @@ impl Flowsurface {
             open_main_window
                 .chain(load_layout)
                 .chain(restore_detached)
-                .chain(launch_sidebar.map(Message::Sidebar)),
+                .chain(launch_sidebar.map(Message::Sidebar))
+                // Locks the saved unresolved sends before any private stream can start.
+                .chain(Task::perform(trading::boot(), |report| {
+                    Message::Trading(trading::Message::Booted(report))
+                })),
         )
     }
 
@@ -776,6 +789,9 @@ impl Flowsurface {
                         // An explicit choice settles the unknown proxy for the next start; this
                         // session stays `Broken` (`proxy_unreadable`) until it is restarted.
                         self.network_config.proxy_unknown = false;
+                        // Streams and clients read the proxy at every connect and request:
+                        // from now on they refuse to run with the snapshot they were built on.
+                        self.trading.set_proxy(self.current_proxy_state());
 
                         let main_window = self.main_window.id;
                         let dashboard = self.active_dashboard_mut();
@@ -831,48 +847,94 @@ impl Flowsurface {
             }
             Message::ExchangeAccounts(msg) => {
                 let signed = self.signed_client_for_current_proxy();
-                let (task, action) = self.exchange_accounts.update(msg, &signed);
+                let trading = &self.trading;
+                let (task, action) = self
+                    .exchange_accounts
+                    .update(msg, &signed, &|id| trading.closer_for(id));
                 let task = task.map(Message::ExchangeAccounts);
 
+                let mut persist = false;
+                let mut extra = Vec::new();
                 match action {
                     Some(modal::exchange_accounts::Action::Exit) => {
                         self.sidebar.set_menu(Some(sidebar::Menu::Settings));
                     }
                     Some(modal::exchange_accounts::Action::Tested(meta, report)) => {
                         // The gate reads this session, never the modal's row status.
-                        match report {
-                            Some(report) => self.trade_session.record(&meta, &report),
-                            None => self.trade_session.invalidate(meta.id),
+                        let usable = match &report {
+                            Some(report) => {
+                                self.trade_session.record(&meta, report);
+                                exchange::account::is_usable(meta.env, &report.verdict)
+                            }
+                            None => {
+                                self.trade_session.invalidate(meta.id);
+                                false
+                            }
+                        };
+                        // A usable account gets a new stream (a re-test brings an AuthFailed
+                        // account back); anything else closes its stream.
+                        extra.push(
+                            self.trading
+                                .on_tested(&meta, usable, signed)
+                                .map(Message::Trading),
+                        );
+                    }
+                    Some(modal::exchange_accounts::Action::Voided(metas)) => {
+                        for meta in &metas {
+                            self.trade_session.invalidate(meta.id);
+                            extra.push(
+                                self.trading
+                                    .on_tested(meta, false, signed.clone())
+                                    .map(Message::Trading),
+                            );
                         }
                     }
-                    Some(
-                        modal::exchange_accounts::Action::Persist
-                        | modal::exchange_accounts::Action::Removed(_),
-                    ) => {
-                        if let Some(modal::exchange_accounts::Action::Removed(id)) = &action {
-                            self.trade_session.invalidate(*id);
-                        }
-                        let main_window = self.main_window.id;
-                        let dashboard = self.active_dashboard_mut();
-
-                        let mut active_windows = dashboard
-                            .popout
-                            .keys()
-                            .copied()
-                            .collect::<Vec<window::Id>>();
-                        active_windows.push(main_window);
-
-                        return Task::batch([
-                            task,
-                            window::collect_window_specs(
-                                active_windows,
-                                Message::SaveStateRequested,
-                            ),
-                        ]);
+                    Some(modal::exchange_accounts::Action::DeleteFailed(id)) => {
+                        self.trade_session.invalidate(id);
+                        self.trading.remove(id);
                     }
+                    Some(modal::exchange_accounts::Action::RiskSaved(id, settings)) => {
+                        self.trading.apply_risk_settings(id, &settings);
+                        persist = true;
+                    }
+                    Some(modal::exchange_accounts::Action::Removed(id)) => {
+                        self.trade_session.invalidate(id);
+                        self.trading.remove(id);
+                        persist = true;
+                    }
+                    Some(modal::exchange_accounts::Action::Persist) => persist = true,
                     None => {}
                 }
-                return task;
+
+                if persist {
+                    let main_window = self.main_window.id;
+                    let dashboard = self.active_dashboard_mut();
+
+                    let mut active_windows = dashboard
+                        .popout
+                        .keys()
+                        .copied()
+                        .collect::<Vec<window::Id>>();
+                    active_windows.push(main_window);
+
+                    extra.push(window::collect_window_specs(
+                        active_windows,
+                        Message::SaveStateRequested,
+                    ));
+                }
+                extra.push(task);
+                return Task::batch(extra);
+            }
+            Message::Trading(msg) => {
+                let (task, effects) = self
+                    .trading
+                    .update(msg, chrono::Utc::now().timestamp_millis());
+                // The stream says the exchange refused the login or the Keychain failed: the
+                // session verdict is void until the account is tested again (condition 57).
+                for id in effects.invalidate {
+                    self.trade_session.invalidate(id);
+                }
+                return task.map(Message::Trading);
             }
             Message::Sidebar(message) => {
                 let (task, action) = self.sidebar.update(message);
@@ -1051,6 +1113,8 @@ impl Flowsurface {
             .into()
         };
 
+        let content = self.with_standing_alerts(content);
+
         toast::Manager::new(
             content,
             self.notifications.toasts(),
@@ -1061,6 +1125,16 @@ impl Flowsurface {
             Message::RemoveNotification,
         )
         .into()
+    }
+
+    /// The alerts that must stay on screen, above the content of every window (the main window
+    /// and each popout; a toast fades, these do not).
+    fn with_standing_alerts<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
+        let alerts = trading::standing_alerts(&self.trading, &self.trade_session);
+        match trading::alerts_view(alerts) {
+            Some(banners) => column![banners, content].into(),
+            None => content,
+        }
     }
 
     fn view_detached(&self, id: window::Id, layout_id: uuid::Uuid) -> Element<'_, Message> {
@@ -1092,6 +1166,8 @@ impl Flowsurface {
             .into(),
             None => container(text("Layout not found")).into(),
         };
+
+        let content = self.with_standing_alerts(content);
 
         toast::Manager::new(
             content,
@@ -1139,6 +1215,7 @@ impl Flowsurface {
         let exchange_streams =
             Dashboard::market_subscriptions(&streams, &self.data_sources.exchange)
                 .map(Message::MarketWsEvent);
+        let trading = self.trading.subscription().map(Message::Trading);
 
         let tick = iced::window::frames().map(Message::Tick);
 
@@ -1187,6 +1264,7 @@ impl Flowsurface {
         Subscription::batch(vec![
             tab_drag,
             exchange_streams,
+            trading,
             sidebar,
             window_events,
             tick,
@@ -2090,7 +2168,9 @@ impl Flowsurface {
 
                 dashboard_modal(
                     base,
-                    self.exchange_accounts.view().map(Message::ExchangeAccounts),
+                    self.exchange_accounts
+                        .view(&self.trading)
+                        .map(Message::ExchangeAccounts),
                     Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(None)),
                     padding,
                     Alignment::End,

@@ -472,5 +472,18 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 - **`SharedRisk`**：第二個 sealed `RiskHook`，持有 `Arc<Mutex<EquityTracker>>` 與注入的時間來源，可 `Clone`（同一個 tracker）。判斷邏輯與 `RiskSnapshot` 共用同一個函式 `check_entry`，不會分歧（對照測試 `the_shared_hook_judges_exactly_like_the_snapshot`）。鎖只在各方法內取、不跨 `.await`（方法都是同步的）。**鎖 poisoned 時 fail closed**：進場回 `RiskRefusal::StateUnavailable`，平倉、撤單照常通過（條件 72）；會改狀態的方法回 `Err(RiskPoisoned)`，GUI 要顯示成風控狀態不可用。快照與事件走 `snapshot_applied`／`observe`／`set_positions`／`set_limits`，同一把鎖。`RiskRefusal` 新增 `StateUnavailable`（`data` 的風控日誌對應為 `state_unavailable`）。
 - **`StreamCloser`**：`PrivateStream::closer()` 回傳可 `Clone` 的控制把手，`shutdown(&self)` 與 `PrivateStream::shutdown(self)` 語意相同（等 listenKey DELETE 回覆才回傳）。冪等：supervisor 只處理一次 shutdown，之後的呼叫（含同時發出的）不再送 DELETE。**殘餘風險／用法**：stream 已被 drop（subscription 已移除）或已結束時，closer 立即回傳且不關 listenKey，所以必須在移除 subscription **之前** `await closer.shutdown()`，再刪 Keychain。
 - **送出值預覽與權杖雜湊（條件 69）**：`OrderIntent::preview() -> OrderPreview`（可 `Clone`、唯讀）列出 builder 取整後的實際參數：Binance 依送出順序，OKX 的 JSON body 攤平（`attachAlgoOrds[0].slTriggerPx`）並依名稱排序。client id 只顯示末四碼（`…AAAA`）；簽名、timestamp、憑證不在其中。`ConfirmToken::for_preview(&preview)` 綁定預覽的 SHA-256（涵蓋帳戶、產品、method、path、symbol 與完整參數，含完整 client id）；`approve` 內比對，不符回 `SubmitError::ConfirmationMismatch`，什麼都不送。雜湊欄位是 crate 私有，複製後被改過的預覽仍只能確認原本的請求。重建請求（連 client id 都會變）就需要重新確認。
-- **取消全部／全平**：`ConfirmToken::for_bulk()`。訂單權杖不能用在 `cancel_all`／`flatten`，批次權杖也不能用在 `submit`（皆拒絕）。`ConfirmToken::user_confirmed()`（沒有綁定的權杖）已移除。
+- **取消全部／全平**：`ConfirmToken::for_bulk(account, BulkAction)`。權杖綁定帳戶與動作；訂單權杖不能用在 `cancel_all`／`flatten`，批次權杖不放行 `Adds`、也不能用在 `submit`（皆拒絕）。`ConfirmToken::user_confirmed()`（沒有綁定的權杖）已移除。
 - **測試對應**：`the_preview_equals_the_form_the_binance_server_receives`、`the_preview_equals_the_json_the_okx_server_receives`（逐欄比對假伺服器收到的 body）、`a_token_for_another_quantity_is_refused_and_nothing_is_sent`、`a_token_for_another_client_id_or_another_kind_of_action_is_refused`、`a_closer_*`、`two_racing_closers_*`、`a_poisoned_shared_hook_*`。
+
+## c2b-1 補充：GUI 接線（`src/trading.rs`）
+
+c2b-1 只接私有 stream、風控狀態與常駐警示；**沒有任何下單路徑**（不呼叫 `submit`／`cancel_all`／`flatten`／`auto_close`，測試 `the_only_trade_calls_here_are_reads` 掃 `trading.rs` 原始碼（`.flatten(` 只允許無參數的 `Stream::flatten`）；`main.rs` 與 `exchange_accounts.rs` 以 grep 確認）。`LIVE_SENDING_ENABLED` 仍為 false。
+
+- **開機順序**：先非同步讀 Unknown store，再依結果套用；讀取失敗 → `block_all_entries` 並顯示「日誌無法讀取」警示，不鎖任何紀錄；讀取成功 → 每筆紀錄 `lock_from_record`，個別失敗（壞 id）保留在警示中，不吞掉。開機報告套用前 `runs()` 為空，所以沒有任何 stream 會先於鎖定啟動。報告不含 client id。c2b-1 **不**跑 `resolve_unknown`（需要憑證，Unknown 面板在 c2b-3）；紀錄維持鎖定、唯讀顯示。
+- **stream 生命週期**：只有本次 session Test 通過的帳戶才有 stream（Binance 現貨不建 stream，狀態 `Unavailable`，文字寫明未在 testnet 驗證）。重新 Test：先 `closer.shutdown()` 關舊 listenKey，再以 generation+1 建新 stream（S1-b：`AuthFailed` 之後重測可重新允許平倉）。舊 generation 遲到的輸出一律忽略（`key != 目前 key`）。`AuthFailed` 保留，不自動重建；`InvalidateSession` 使 session 判定失效並標記需重測。
+- **風控 tracker**：每帳戶一個 `SharedRisk`，整個 app 生命週期不換；stream 重啟、設定變更都只經 `set_limits`／`snapshot_applied`／`observe`，不替換 tracker（`a_risk_tracker_survives_a_new_stream`）。
+- **刪帳戶順序**：先在期限內（15 秒）`closer.shutdown()`，再刪 Keychain；逾時仍刪（`delete_after_close` 測試）。刪除失敗 → session 判定作廢，stream 已關閉。
+- **proxy**：stream 與淨值讀取每次連線都讀即時的 `proxy_cell`；與建 client 時的快照不符就拒絕連線／簽名（fail closed）。proxy 設定不可讀 → 初始為 `Broken`。
+- **未計價部位 fail closed**：`Position` 沒有價格、此版本沒有價格來源，所以只要持有任何部位，名目價值就以哨兵 `?` 提供給 tracker → 有單一 symbol 上限時進場回 `PositionUnknown`。價格來源由後續階段補上。
+- **淨值輪詢**：只輪詢 `Connected` 的帳戶，間隔為 `max_equity_age/3`（夾在 5–60 秒）；憑證只在 `spawn_blocking` 內短暫載入，失敗 → 無觀測（淨值會變陳舊並顯示警示）。
+- **常駐警示**：主視窗與 popout 都顯示；內容含日誌／紀錄狀態、未測試、`AuthFailed`（全部下單含撤單與平倉暫停）、重連／重同步、風控鎖、風控狀態不可用、淨值陳舊、「未設任何風控上限」。
