@@ -22,6 +22,7 @@ pub mod manual;
 pub mod okx;
 pub mod outcome;
 pub mod preview;
+pub mod protect;
 pub mod queries;
 pub mod request;
 pub mod risk;
@@ -46,6 +47,10 @@ pub use journal::{JournalError, UnknownJournal};
 pub use manual::{ManualContext, ManualSpec, build_intent};
 pub use outcome::{ItemRejection, Outcome, RejectKind};
 pub use preview::{OrderPreview, PreviewField};
+pub use protect::{
+    MAX_TARGETS, Offset, PlanError, PositionProtection, ProtectPlan, ProtectRole, ProtectSpec,
+    Protection, Rounding, TargetLeg, TargetSpec, orphan_protectives, plan, protected_status,
+};
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
 pub use risk::{
     AutoCloseDecision, AutoCloseGrant, DrawdownAnchor, EquityBasis, EquityFreshness,

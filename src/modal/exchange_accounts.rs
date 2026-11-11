@@ -78,7 +78,8 @@ impl std::fmt::Debug for Redacted {
 }
 
 type TestOutcome = Result<Box<CheckReport>, String>;
-type SaveOutcome = Result<AccountMeta, String>;
+// Boxed: `AccountMeta` grew with the protect defaults and would make this variant the largest.
+type SaveOutcome = Result<Box<AccountMeta>, String>;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -354,7 +355,7 @@ impl ExchangeAccounts {
                 match outcome {
                     Ok(meta) => {
                         self.rows.push(Row {
-                            meta,
+                            meta: *meta,
                             status: Status::NotTested,
                             delete_error: None,
                             deleting: false,
@@ -867,7 +868,7 @@ fn save_task(meta: AccountMeta, creds: ApiCredentials, others: Vec<AccountMeta>)
                 // Keychain first: no account is listed unless its credentials were stored
                 // and verified.
                 match save_credentials(&meta, &creds) {
-                    Ok(()) => Ok(meta),
+                    Ok(()) => Ok(Box::new(meta)),
                     Err(e) => {
                         log::warn!("Saving exchange credentials failed: {e}");
                         Err(format!("Could not save to the Keychain: {e}"))

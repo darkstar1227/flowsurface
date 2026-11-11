@@ -21,12 +21,13 @@ use exchange::account::{
 };
 use exchange::signed_http::SignedHttp;
 use exchange::trade::stream::{
-    CredentialsUnavailable, PositionSide, PrivateEvent, StreamCloser, StreamContext, StreamKey,
-    StreamOutput, StreamState, run,
+    CredentialsUnavailable, OrderCategory, PositionSide, PrivateEvent, StreamCloser, StreamContext,
+    StreamKey, StreamOutput, StreamState, run,
 };
 use exchange::trade::{
-    Decimal, EquityBasis, EquityFreshness, EquityObservation, OpenOrder, Position, RestoreError,
-    SharedRisk, StreamEquityFeed, TradeClient, UnknownRecord, block_all_entries, lock_from_record,
+    Decimal, Dir, EquityBasis, EquityFreshness, EquityObservation, OpenOrder, Position,
+    PositionProtection, RestoreError, SharedRisk, StreamEquityFeed, TradeClient, UnknownRecord,
+    block_all_entries, lock_from_record,
 };
 use iced::futures::{Stream, StreamExt, stream};
 use iced::{Element, Subscription, Task};
@@ -286,6 +287,9 @@ enum Phase {
 pub struct HeldPosition {
     pub symbol: String,
     pub side: PositionSide,
+    /// Long or short. One-way size is signed on the wire, so this is where the direction is
+    /// kept (the protection status needs it).
+    pub dir: Dir,
     /// Absolute size.
     pub qty: Decimal,
 }
@@ -301,6 +305,10 @@ struct AccountRuntime {
     risk: SharedRisk,
     feed: StreamEquityFeed,
     orders: Vec<OpenOrder>,
+    /// A conditional (algo) order event arrived after the last snapshot: the order list may
+    /// not match the exchange until the next snapshot (the stream reads it again on such an
+    /// event). Never cleared by an event, only by a snapshot.
+    orders_dirty: bool,
     positions: Vec<HeldPosition>,
     seen_trades: HashSet<String>,
     seen_order: VecDeque<String>,
@@ -356,6 +364,7 @@ impl AccountRuntime {
             risk_unavailable: false,
             equity_inflight: false,
             book_trusted: false,
+            orders_dirty: false,
         }
     }
 
@@ -408,12 +417,13 @@ impl AccountRuntime {
                 symbol: p.symbol.clone(),
                 side: if p.hedge_side {
                     match p.dir {
-                        exchange::trade::Dir::Long => PositionSide::Long,
-                        exchange::trade::Dir::Short => PositionSide::Short,
+                        Dir::Long => PositionSide::Long,
+                        Dir::Short => PositionSide::Short,
                     }
                 } else {
                     PositionSide::Both
                 },
+                dir: p.dir,
                 qty: p.qty,
             })
             .collect();
@@ -432,6 +442,7 @@ impl AccountRuntime {
         ) -> Result<(), exchange::trade::RiskPoisoned>,
     ) {
         self.orders = orders.to_vec();
+        self.orders_dirty = false;
         self.book_trusted = true;
         self.set_positions_from_snapshot(positions);
         let notionals = position_notionals(&self.positions);
@@ -447,13 +458,36 @@ impl AccountRuntime {
         if qty.is_zero() {
             return;
         }
-        // One-way size is signed on the wire; only the absolute size is held.
+        // One-way size is signed on the wire; the direction is kept, then only the absolute
+        // size is held.
         let abs = qty.checked_abs().unwrap_or(qty);
+        let dir = match side {
+            PositionSide::Long => Dir::Long,
+            PositionSide::Short => Dir::Short,
+            PositionSide::Both if qty.is_negative() => Dir::Short,
+            PositionSide::Both => Dir::Long,
+        };
         self.positions.push(HeldPosition {
             symbol: symbol.to_string(),
             side,
+            dir,
             qty: abs,
         });
+    }
+
+    /// The held positions in the exchange crate's form, for the protection functions.
+    fn exchange_positions(&self) -> Vec<Position> {
+        self.positions
+            .iter()
+            .map(|p| Position {
+                symbol: p.symbol.clone(),
+                dir: p.dir,
+                qty: p.qty,
+                hedge_side: p.side != PositionSide::Both,
+                margin: None,
+                leverage: None,
+            })
+            .collect()
     }
 
     fn has_equity_limits(&self) -> bool {
@@ -623,8 +657,25 @@ impl TradingState {
     /// synchronised, or none whose snapshot was applied since it last connected.
     pub fn lists_stale(&self, id: Uuid) -> bool {
         self.accounts.get(&id).is_none_or(|rt| {
-            rt.state != Some(StreamState::Connected) || !rt.book_trusted || rt.needs_retest
+            rt.state != Some(StreamState::Connected)
+                || !rt.book_trusted
+                || rt.needs_retest
+                || rt.orders_dirty
         })
+    }
+
+    /// The protection of each held position, judged from the last snapshot and the events
+    /// after it. When the lists may be stale every answer is `Undetermined`, which reads
+    /// "cannot tell", never "protected".
+    pub fn protection(&self, id: Uuid) -> Vec<PositionProtection> {
+        let Some(rt) = self.accounts.get(&id) else {
+            return Vec::new();
+        };
+        exchange::trade::protected_status(
+            &rt.exchange_positions(),
+            &rt.orders,
+            self.lists_stale(id),
+        )
     }
 
     /// The reason of the account's risk lock, when one is on.
@@ -1036,6 +1087,13 @@ impl TradingState {
                 let notionals = position_notionals(&rt.positions);
                 let r = rt.risk.set_positions(now_ms, notionals);
                 rt.note_poisoned(r);
+            }
+            // A conditional order changed (placed, triggered, cancelled, finished): the order
+            // list is out of date. Conservative on purpose: nothing is patched in place (a
+            // `Triggered` or `Finished` status does not say what remains open); the list is
+            // marked out of date and the stream reads it again (see the stream machine).
+            PrivateEvent::Order(update) if update.category == OrderCategory::Algo => {
+                rt.orders_dirty = true;
             }
             _ => {}
         }
@@ -2480,5 +2538,131 @@ mod tests {
         assert!(t.bulk_running(id));
         t.finish_bulk(id);
         assert!(!t.bulk_running(id));
+    }
+
+    // ── d1: protection status from the lists ────────────────────────────
+
+    fn algo_update(category: OrderCategory) -> Box<PrivateEvent> {
+        Box::new(PrivateEvent::Order(exchange::trade::stream::OrderUpdate {
+            symbol: "BTCUSDT".into(),
+            client_id: None,
+            order_id: None,
+            category,
+            side: None,
+            status: exchange::trade::stream::OrderStatus::Triggered,
+            price: None,
+            qty: None,
+            filled_qty: None,
+            reduce_only: None,
+            position_side: None,
+            time_ms: None,
+        }))
+    }
+
+    fn long_stop() -> OpenOrder {
+        use exchange::trade::{OpenKind, ProtectRole, Side};
+        OpenOrder {
+            symbol: "BTCUSDT".into(),
+            id: "7".into(),
+            kind: OpenKind::Algo(None),
+            side: Some(Side::Sell),
+            position_side: None,
+            qty: None,
+            trigger_price: None,
+            close_position: true,
+            reduce_only: false,
+            role: Some(ProtectRole::Stop),
+        }
+    }
+
+    fn connect_with_stop(t: &mut TradingState, m: &AccountMeta, key: StreamKey) {
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::State(StreamState::Connected)),
+            0,
+        );
+        t.accounts.get_mut(&m.id).unwrap().apply_snapshot(
+            &[long_stop()],
+            &[held("BTCUSDT", 2)],
+            |r, n| r.set_positions(0, n),
+        );
+    }
+
+    #[test]
+    fn an_algo_order_event_makes_the_lists_undetermined_until_the_next_snapshot() {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        assert!(!t.lists_stale(m.id));
+        assert_eq!(
+            t.protection(m.id)
+                .iter()
+                .map(|p| p.protection)
+                .collect::<Vec<_>>(),
+            vec![exchange::trade::Protection::Stop]
+        );
+        // A plain order event leaves the lists as they were.
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::Event(algo_update(OrderCategory::Plain))),
+            0,
+        );
+        assert!(!t.lists_stale(m.id));
+        // An algo event: nothing can be said about protection or orphans.
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::Event(algo_update(OrderCategory::Algo))),
+            0,
+        );
+        assert!(t.lists_stale(m.id));
+        assert_eq!(
+            t.protection(m.id)
+                .iter()
+                .map(|p| p.protection)
+                .collect::<Vec<_>>(),
+            vec![exchange::trade::Protection::Undetermined]
+        );
+        // The snapshot that follows the read clears it.
+        t.accounts
+            .get_mut(&m.id)
+            .unwrap()
+            .apply_snapshot(&[], &[held("BTCUSDT", 2)], |r, n| r.set_positions(0, n));
+        assert!(!t.lists_stale(m.id));
+        assert_eq!(
+            t.protection(m.id)
+                .iter()
+                .map(|p| p.protection)
+                .collect::<Vec<_>>(),
+            vec![exchange::trade::Protection::Unprotected]
+        );
+    }
+
+    #[test]
+    fn the_direction_of_a_one_way_position_survives_the_signed_size() {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        let rt = t.accounts.get_mut(&m.id).unwrap();
+        rt.apply_position_event("ETHUSDT", PositionSide::Both, Decimal::from_int(-3));
+        rt.apply_position_event("SOLUSDT", PositionSide::Short, Decimal::from_int(1));
+        let dir_of = |rt: &AccountRuntime, s: &str| {
+            rt.positions.iter().find(|p| p.symbol == s).map(|p| p.dir)
+        };
+        assert_eq!(dir_of(rt, "ETHUSDT"), Some(Dir::Short));
+        assert_eq!(dir_of(rt, "SOLUSDT"), Some(Dir::Short));
+        assert_eq!(dir_of(rt, "BTCUSDT"), Some(Dir::Long));
+        // A short is not protected by a sell stop; the sell stop of the long is.
+        let by_symbol: Vec<_> = t
+            .protection(m.id)
+            .into_iter()
+            .map(|p| (p.symbol, p.protection))
+            .collect();
+        assert!(by_symbol.contains(&(
+            "ETHUSDT".to_string(),
+            exchange::trade::Protection::Unprotected
+        )));
+        assert!(by_symbol.contains(&("BTCUSDT".to_string(), exchange::trade::Protection::Stop)));
+    }
+
+    #[test]
+    fn protection_is_empty_for_an_unknown_account() {
+        let t = booted();
+        let id = Uuid::new_v4();
+        assert!(t.protection(id).is_empty());
     }
 }

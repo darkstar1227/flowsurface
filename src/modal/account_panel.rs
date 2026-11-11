@@ -370,8 +370,17 @@ impl AccountPanel {
         }
         col =
             col.push(text(format!("Positions ({})", trading.positions(meta.id).len())).size(small));
+        // Protection per position: "cannot tell" while the lists may be out of date, never
+        // "protected" (a status line only; the banners and actions come in d5).
+        let protection = trading.protection(meta.id);
         for p in trading.positions(meta.id) {
             col = col.push(text(format!("  {} {:?} {}", p.symbol, p.side, p.qty)).size(small));
+            if let Some(status) = protection
+                .iter()
+                .find(|s| s.symbol == p.symbol && s.dir == p.dir)
+            {
+                col = col.push(text(format!("    {}", status.protection.label())).size(small));
+            }
         }
 
         // Cancel all / close all.
