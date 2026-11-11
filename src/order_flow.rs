@@ -237,6 +237,8 @@ pub struct PrepareInput {
     pub mode: Option<PositionMode>,
     /// What the account holds on the request's symbol, and whether that can be trusted.
     pub held: Holdings,
+    /// Automatic protection is still at work for an earlier entry on the symbol (M3).
+    pub auto_active: bool,
     pub request: PrepareRequest,
     pub ref_price: Option<Decimal>,
     pub signed: SignedHttp,
@@ -276,6 +278,7 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
         meta,
         mode,
         held,
+        auto_active,
         request,
         ref_price,
         signed,
@@ -293,6 +296,11 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
             // placed while the positions cannot be told, is refused when it would be attached.
             if matches!(resolved, Resolved::Attach(_)) {
                 protect_attach::check_new_entry(meta.product, mode, dir, &held)?;
+                // Binance futures protection is sent by the app after the fill; one entry at a
+                // time per symbol (OKX carries its protection on the order).
+                if auto_active && meta.venue != AccountVenue::Okx {
+                    return Err(protect_attach::AUTO_STILL_ACTIVE.to_string());
+                }
             }
             Some(resolved)
         }
@@ -1056,15 +1064,27 @@ mod tests {
         sync::<SessionGate<'static>>();
     }
 
-    /// The only caller of `submit` in the GUI is `send`, only here, and the manual path never
-    /// uses the automatic ones (condition 71, 72). d2 adds no allowed file: the protection
-    /// that goes with an entry is either a field of the entry order itself (OKX, built by
-    /// `build_intent`) or only remembered (`protect_attach.rs`); nothing sends it.
+    /// The only caller of `submit` in the GUI is `send`, only here (condition 71). The automatic
+    /// paths are called from `auto_flow.rs` only (d3, condition 72): it is the one allowed file
+    /// for everything that builds, authorises or sends an automatic request, and the manual path
+    /// never uses them. Files are compared by their path under `src/`, not by their name.
     #[test]
-    fn submit_is_called_from_this_file_only_and_never_the_automatic_paths() {
+    fn submit_is_called_from_this_file_only_and_the_automatic_paths_from_auto_flow_only() {
+        const AUTO_FILES: [&str; 1] = ["auto_flow.rs"];
+        const AUTO_CALLS: [&str; 7] = [
+            "submit_auto(",
+            "AutoIntent::new(",
+            "AutoGrant::from_entry(",
+            ".authorise(",
+            ".cancel_intent(",
+            ".with_basis(",
+            ".add_fill(",
+        ];
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut stack = vec![src_dir];
+        let mut stack = vec![src_dir.clone()];
         let mut submit_files = Vec::new();
+        let mut auto_files = Vec::new();
+        let mut mint_files = Vec::new();
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -1075,21 +1095,33 @@ mod tests {
                 if path.extension().is_none_or(|e| e != "rs") {
                     continue;
                 }
+                let name = path
+                    .strip_prefix(&src_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 let text = std::fs::read_to_string(&path).unwrap();
                 // Only the code, not the tests of the file (they quote the words).
                 let code = text.split("#[cfg(test)]").next().unwrap_or_default();
                 if code.contains(".submit(") {
-                    submit_files.push(path.file_name().unwrap().to_string_lossy().to_string());
+                    submit_files.push(name.clone());
                 }
-                for banned in ["submit_auto(", "AutoIntent::new(", "block_on("] {
-                    assert!(
-                        !code.contains(banned),
-                        "{} contains {banned}",
-                        path.display()
-                    );
+                if AUTO_CALLS.iter().any(|call| code.contains(call)) {
+                    auto_files.push(name.clone());
                 }
+                // The grant is made from the confirmed intent, in the confirmation handler only.
+                if code.contains("auto_flow::mint(") {
+                    mint_files.push(name);
+                }
+                assert!(
+                    !code.contains("block_on("),
+                    "{} contains block_on(",
+                    path.display()
+                );
             }
         }
         assert_eq!(submit_files, vec!["order_flow.rs".to_string()]);
+        assert_eq!(auto_files, AUTO_FILES.map(String::from).to_vec());
+        assert_eq!(mint_files, vec!["main.rs".to_string()]);
     }
 }

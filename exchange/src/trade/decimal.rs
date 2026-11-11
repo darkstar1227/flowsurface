@@ -184,6 +184,27 @@ impl Decimal {
         Ok(Decimal::normalized(mantissa, scale))
     }
 
+    /// `self / other`, cut towards zero at `scale` decimals (a volume-weighted average price,
+    /// which needs no more than the tick that rounds it afterwards).
+    pub fn checked_div_trunc(&self, other: &Decimal, scale: u32) -> Result<Decimal, DecimalError> {
+        if other.mantissa == 0 {
+            return Err(DecimalError::ZeroStep);
+        }
+        let num = self
+            .mantissa
+            .checked_mul(pow10(
+                scale
+                    .checked_add(other.scale)
+                    .ok_or(DecimalError::Overflow)?,
+            )?)
+            .ok_or(DecimalError::Overflow)?;
+        let den = other
+            .mantissa
+            .checked_mul(pow10(self.scale)?)
+            .ok_or(DecimalError::Overflow)?;
+        Ok(Decimal::normalized(num / den, scale))
+    }
+
     /// Absolute value; `i128::MIN` has none and is an overflow, not a panic.
     pub fn checked_abs(&self) -> Result<Decimal, DecimalError> {
         Ok(Decimal {
@@ -303,6 +324,35 @@ mod tests {
 
     fn d(s: &str) -> Decimal {
         Decimal::parse(s).unwrap()
+    }
+
+    #[test]
+    fn division_cuts_towards_zero_at_the_given_scale() {
+        assert_eq!(
+            d("60010")
+                .checked_div_trunc(&d("3"), 4)
+                .unwrap()
+                .to_plain_string(),
+            "20003.3333"
+        );
+        assert_eq!(
+            d("0.12")
+                .checked_div_trunc(&d("0.04"), 2)
+                .unwrap()
+                .to_plain_string(),
+            "3"
+        );
+        assert_eq!(
+            d("-7")
+                .checked_div_trunc(&d("2"), 0)
+                .unwrap()
+                .to_plain_string(),
+            "-3"
+        );
+        assert_eq!(
+            d("1").checked_div_trunc(&Decimal::ZERO, 2),
+            Err(DecimalError::ZeroStep)
+        );
     }
 
     #[test]

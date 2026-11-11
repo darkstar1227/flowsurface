@@ -190,7 +190,7 @@ pub fn orphan_protectives<'a>(
 // ── Trigger prices and quantities from a fill ───────────────────────────
 
 /// How far a trigger is from the entry fill price.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Offset {
     /// Percent of the fill price (`1.5` = 1.5 %).
     Percent(Decimal),
@@ -198,7 +198,7 @@ pub enum Offset {
     Distance(Decimal),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetSpec {
     pub offset: Offset,
     /// Whole percent of the filled quantity; all targets sum to 100.
@@ -207,7 +207,7 @@ pub struct TargetSpec {
 
 /// Which price a trigger watches. Neutral twin of the venue types, so `exchange` need not know
 /// the saved-settings type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum TriggerBasis {
     #[default]
     Last,
@@ -215,13 +215,13 @@ pub enum TriggerBasis {
 }
 
 /// A trailing stop: callback rate in percent, and where the trail starts (`None` = at once).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TrailingSpec {
     pub callback_pct: Decimal,
     pub activation: Option<Offset>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct ProtectSpec {
     pub stop: Option<Offset>,
     pub targets: Vec<TargetSpec>,
@@ -229,7 +229,22 @@ pub struct ProtectSpec {
     pub trigger_price: TriggerBasis,
 }
 
+/// A hash of everything a [`ProtectSpec`] decides (trigger basis, distances, shares, trailing
+/// parameters). It is made from a spec only, so two equal fingerprints mean the same settings.
+/// In memory only: never saved or sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecFingerprint(u64);
+
 impl ProtectSpec {
+    /// The fingerprint of these settings. `DefaultHasher::new()` uses fixed keys, so the value
+    /// is the same for the same settings within one run (which is all it is used for).
+    pub fn fingerprint(&self) -> SpecFingerprint {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.hash(&mut h);
+        SpecFingerprint(h.finish())
+    }
+
     /// Nothing to attach. A spec with only a trailing stop is not empty.
     pub fn is_empty(&self) -> bool {
         self.stop.is_none() && self.targets.is_empty() && self.trailing.is_none()
@@ -425,6 +440,7 @@ mod tests {
             close_position: false,
             reduce_only: false,
             role: Some(role),
+            attached: None,
         })
     }
 

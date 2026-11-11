@@ -18,6 +18,17 @@ pub const KEEPALIVE_EVERY: Duration = Duration::from_secs(25 * 60);
 /// the requests that arrive meanwhile are merged into one.
 pub const MIN_RESYNC_INTERVAL: Duration = Duration::from_secs(2);
 
+/// The least time between two reads that a conditional (algo) order event asks for. Protective
+/// orders placed and cancelled by the app itself produce such events in bursts (each placement,
+/// each trigger, each cancel); a read for each would use the shared rate limit for nothing.
+pub const ALGO_RESYNC_INTERVAL: Duration = Duration::from_secs(8);
+
+/// After this many reads in a row that were repeated because more events arrived while they
+/// ran, the machine stops chasing the events: the snapshot was delivered, but the lists stay
+/// marked out of date (and a warning is logged) until a read finishes with nothing new asked.
+/// Without it a steady stream of algo events could keep the app reading for ever.
+pub const MAX_RESYNC_REPEATS: u8 = 3;
+
 /// Where a private stream stands. `Connected` means connected **and** synchronised by REST;
 /// connected but not yet synchronised is `Resyncing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -131,6 +142,10 @@ pub struct Machine {
     synced: bool,
     resync_running: bool,
     resync_again: bool,
+    /// The widest spacing asked for by the events folded into the next read.
+    resync_spacing: Duration,
+    /// Reads repeated one after another because events kept arriving.
+    resync_repeats: u8,
     /// The newest `now` the machine has been told (it reads no clock itself).
     now: Duration,
     /// When the latest REST read was (or will be) started.
@@ -153,6 +168,8 @@ impl Machine {
             synced: false,
             resync_running: false,
             resync_again: false,
+            resync_spacing: MIN_RESYNC_INTERVAL,
+            resync_repeats: 0,
             now: Duration::ZERO,
             last_resync_start: None,
             auth_failed: false,
@@ -213,19 +230,21 @@ impl Machine {
             self.keepalive_due = Some(now + KEEPALIVE_EVERY);
             self.keepalive_running = false;
         }
-        self.start_resync(Duration::ZERO)
+        self.start_resync(Duration::ZERO, MIN_RESYNC_INTERVAL)
     }
 
-    fn start_resync(&mut self, after: Duration) -> Vec<Command> {
+    fn start_resync(&mut self, after: Duration, interval: Duration) -> Vec<Command> {
         self.synced = false;
         if self.resync_running {
             self.resync_again = true;
+            self.resync_spacing = self.resync_spacing.max(interval);
             Vec::new()
         } else {
             self.resync_running = true;
-            let spacing = self.last_resync_start.map_or(Duration::ZERO, |t| {
-                (t + MIN_RESYNC_INTERVAL).saturating_sub(self.now)
-            });
+            self.resync_spacing = MIN_RESYNC_INTERVAL;
+            let spacing = self
+                .last_resync_start
+                .map_or(Duration::ZERO, |t| (t + interval).saturating_sub(self.now));
             let after = after.max(spacing);
             self.last_resync_start = Some(self.now + after);
             vec![Command::Resync { after }]
@@ -287,20 +306,22 @@ impl Machine {
             // matches, and protection is judged from it. Plain order events are left as they
             // were (they would read the lists again for every fill). `start_resync` spaces
             // reads and folds one that is already running into a repeat.
-            E::ResyncRequired(_)
-            | E::Order(super::events::OrderUpdate {
+            E::ResyncRequired(_) => self.resync_for_event(MIN_RESYNC_INTERVAL),
+            E::Order(super::events::OrderUpdate {
                 category: super::events::OrderCategory::Algo,
                 ..
-            }) => {
-                if self.legs.contains(&Leg::Down) {
-                    // Everything is read again when the connections are back.
-                    self.synced = false;
-                    Vec::new()
-                } else {
-                    self.start_resync(Duration::ZERO)
-                }
-            }
+            }) => self.resync_for_event(ALGO_RESYNC_INTERVAL),
             _ => Vec::new(),
+        }
+    }
+
+    fn resync_for_event(&mut self, interval: Duration) -> Vec<Command> {
+        if self.legs.contains(&Leg::Down) {
+            // Everything is read again when the connections are back.
+            self.synced = false;
+            Vec::new()
+        } else {
+            self.start_resync(Duration::ZERO, interval)
         }
     }
 
@@ -320,12 +341,26 @@ impl Machine {
             self.resync_again = false;
             let after = self.resync_backoff.delay();
             self.resync_backoff.record_failure();
-            return self.start_resync(after);
+            return self.start_resync(after, MIN_RESYNC_INTERVAL);
         }
         if self.resync_again {
             self.resync_again = false;
-            return self.start_resync(Duration::ZERO);
+            self.resync_repeats = self.resync_repeats.saturating_add(1);
+            if self.resync_repeats > MAX_RESYNC_REPEATS {
+                // Liveness: the snapshot of this read was delivered, but events kept arriving
+                // while it ran. Stop chasing them: the lists stay marked out of date and one
+                // more read is made after a long pause, so the mark cannot stay for ever.
+                self.resync_repeats = 0;
+                log::warn!(
+                    "Private stream: the order and position lists kept changing while they \
+                     were read; they stay marked out of date for now."
+                );
+                return self.start_resync(ALGO_RESYNC_INTERVAL * 4, ALGO_RESYNC_INTERVAL);
+            }
+            let interval = self.resync_spacing;
+            return self.start_resync(Duration::ZERO, interval);
         }
+        self.resync_repeats = 0;
         self.synced = true;
         self.resync_backoff.record_success();
         for b in &mut self.backoffs {
@@ -718,6 +753,76 @@ mod tests {
         assert_eq!(m.state(), StreamState::Resyncing);
         // More algo events while the read runs are merged into one repeat.
         assert!(m.on_event(&update(OrderCategory::Algo)).is_empty());
+    }
+
+    fn algo_update() -> PrivateEvent {
+        use super::super::events::{OrderCategory, OrderStatus, OrderUpdate};
+        PrivateEvent::Order(OrderUpdate {
+            symbol: "BTCUSDT".into(),
+            client_id: None,
+            order_id: None,
+            category: OrderCategory::Algo,
+            side: None,
+            status: OrderStatus::Finished,
+            price: None,
+            qty: None,
+            filled_qty: None,
+            reduce_only: None,
+            position_side: None,
+            time_ms: None,
+        })
+    }
+
+    #[test]
+    fn an_algo_event_waits_longer_than_other_reasons_for_a_read() {
+        let mut m = connected(1, false);
+        // A read has just started and finished.
+        m.on_event(&PrivateEvent::ResyncRequired(ResyncReason::MalformedFrame));
+        let at = T0 + Duration::from_secs(20);
+        m.observe(at);
+        m.resync_done(true);
+        // A few seconds later an algo event is spaced by the long interval ...
+        let first = m.on_event(&algo_update());
+        let [Command::Resync { after }] = first.as_slice() else {
+            panic!("{first:?}")
+        };
+        assert!(*after <= ALGO_RESYNC_INTERVAL);
+        m.resync_done(true);
+        m.observe(at + Duration::from_secs(3));
+        let next = m.on_event(&algo_update());
+        let [Command::Resync { after }] = next.as_slice() else {
+            panic!("{next:?}")
+        };
+        assert!(
+            *after > MIN_RESYNC_INTERVAL && *after <= ALGO_RESYNC_INTERVAL,
+            "{after:?}"
+        );
+    }
+
+    #[test]
+    fn events_that_keep_arriving_cannot_keep_the_reads_going_for_ever() {
+        let mut m = connected(1, false);
+        m.observe(T0 + Duration::from_secs(60));
+        let started = m.on_event(&algo_update());
+        assert_eq!(started.len(), 1);
+        // Every read finishes with a newer event folded into it: repeated up to the limit ...
+        for _ in 0..MAX_RESYNC_REPEATS {
+            assert!(m.on_event(&algo_update()).is_empty());
+            let cmds = m.resync_done(true);
+            assert_eq!(cmds.len(), 1, "{cmds:?}");
+        }
+        // ... then the machine stops chasing: the lists stay marked out of date, the next read
+        // comes after a long pause, and no further repeat is started right away.
+        assert!(m.on_event(&algo_update()).is_empty());
+        let cmds = m.resync_done(true);
+        let [Command::Resync { after }] = cmds.as_slice() else {
+            panic!("{cmds:?}")
+        };
+        assert!(*after >= ALGO_RESYNC_INTERVAL * 4, "{after:?}");
+        assert_eq!(m.state(), StreamState::Resyncing);
+        // That read ends with nothing new asked: synchronised again.
+        assert!(m.resync_done(true).is_empty());
+        assert_eq!(m.state(), StreamState::Connected);
     }
 
     #[test]

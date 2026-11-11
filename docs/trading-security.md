@@ -549,7 +549,7 @@ c2b-1 只接私有 stream、風控狀態與常駐警示；**沒有任何下單�
 - **準備階段檢查**（`protect_attach::check_against_price`，內部用 `exchange::trade::entry_protection` 即 `plan`）：基準價為限價（限價單）或參考價（市價單，沒有就拒絕）。`Distance` 止損距離不小於基準價時拒絕（不分方向）；任何 `PlanError`（觸發價不在正確一側、份額在 step 下拿不到數量）一律拒絕，不會把設定默默降級。Binance 合約另對各段止盈數量（有追蹤時含總量）套 `check_qty`（市價 lot 規則的最小與最大值，與 `new_algo_order` 相同），不合即在進場前拒絕（d3 前置 (4) 中確認前能做的部分；成交後以實際成交價重算、送出前比對標記價仍留給 d3）。
 - **OKX 進場附掛**：`ManualContext.protect: Option<&ProtectSpec>`；`build_intent` 對限價與市價進場組單段 `OkxAttach`（觸發價由 `plan` 取整，附掛 `ClientId` 在 builder 內產生，沿用既有 `Role`），預覽 `fields` 含 `attachAlgoOrds[0].*`。空 spec 不附掛；追蹤或多段在 builder 層也拒絕（`TradeError::ProtectionNotPossible`）。`prepare_steps` 在列出附掛前核對預覽確實含 `attachAlgoOrds[0].*`，沒有就拒絕。限價離市價很遠時，OKX 的 `leg()` 會以參考價（市價）檢查觸發方向，可能回 `TriggerOnWrongSide`，這會讓進場被拒而不是無保護送出。Binance 合約進場單內容不變（測試 `a_binance_entry_is_sent_unchanged_whatever_the_protection`）。測試：`the_preview_of_an_okx_entry_with_attached_protection_equals_the_json_the_server_receives`（預覽等於伺服器收到的 JSON，附掛含在內）、`an_okx_entry_carries_the_attached_triggers_in_its_preview`、`okx_refuses_what_an_entry_cannot_carry_and_never_sends_it_bare`。
 - **`ProtectSpec` 納入 `trailing` 與 `trigger_price`**（d1 審查 d3 前置 (1)）：`spec()` 驗證後保留兩者；只設追蹤止損時 spec 不為空（`ProtectSpec::is_empty`）；`is_empty` 與 `ProtectDefaults::is_empty` 不一致時回 `ProtectError::Dropped`，不會把有內容的設定當成「沒東西」。測試 `the_spec_keeps_trailing_and_the_trigger_price`、`both_is_empty_answers_agree`。`plan` 的輸出不含追蹤。
-- **確認視窗**（`protect_attach::confirmation_lines`）：OKX 列出附掛的 TP／SL（讀自預覽欄位），並註明只在進場**完全成交**後才由交易所建立、app 關閉仍有效；Binance 合約列出「進場成交後自動送出」區塊（止損／各段止盈／追蹤、互撤、**只在 app 執行中有效，離線或斷線不保護**，條件 81-2）；沒有設定保護時明說 "No protective orders are set"。確認一次涵蓋這些內容，LIVE 的 700 ms 延遲不變。**注意（B2 已修）**：這一版沒有東西消費 `PendingAttach`（d3 才做），所以 Binance 的 `AfterFill` 區塊開頭是 "Planned after the entry fills (not sent by this build):"，並多一行警告 "This build does not send them yet: place the protective orders by hand after the fill."。**d3 接上送出路徑時必須移除這行警告並還原開頭文字**（程式在 `protect_attach::confirmation_lines` 的 `AfterFill` 分支旁有註解；測試 `the_after_fill_block_says_it_is_not_sent_by_this_build` 要一併改）。
+- **確認視窗**（`protect_attach::confirmation_lines`）：OKX 列出附掛的 TP／SL（讀自預覽欄位），並註明只在進場**完全成交**後才由交易所建立、app 關閉仍有效；Binance 合約列出「進場成交後自動送出」區塊（止損／各段止盈／追蹤、互撤、**只在 app 執行中有效，離線或斷線不保護**，條件 81-2）；沒有設定保護時明說 "No protective orders are set"。確認一次涵蓋這些內容，LIVE 的 700 ms 延遲不變。**（d3 已接上送出路徑）**：`AfterFill` 區塊開頭為 "Sent automatically after the entry fills:"，B2 的過渡警告與測試 `the_after_fill_block_says_it_is_not_sent_by_this_build` 已移除，改為 `the_after_fill_block_says_it_is_sent_automatically`。
 - **`PendingAttach` 記憶體表**（`PendingAttachTable`，放在 `TradingState`，不存檔、不寫 log，`Debug` 不印 id）：key 為進場單 client id，值為確認當時列出的保護內容（帳戶、symbol、方向、是否限價、種類 `OkxOnEntry`／`AfterFill`、spec、列出的文字）。確認送出時由 `main.confirm_order` 登記（內容取自確認視窗保存的 `AttachPlan`，不從帳戶目前設定重算）；`SendSummary` 不帶完整 id，所以用 (帳戶, symbol) 對回 key。結果處理（`retention`，不用萬用分支）：`Accepted`／`Found`／`Unresolved`／`Partial` 保留；`Rejected`／`NotSent`／`Refused`／`RulesExpired`／`ConfirmationMismatch`／`NotPlacedPresumed` 移除（後三者沒有送出，brief 只列前三者，這是補充判斷）。條目在進場成交或被撤後**不會自動消失**（d3 才消費），所以面板文字與關閉提醒會持續到重啟或帳戶被刪除；進場結果為 `Unresolved` 後，由 `account_flow` 查到未成立（`NotPlaced`）、或被手動解除／丟棄時，以紀錄的 client id 呼叫 `TradingState::entry_gone` 移除。
 - **面板**：`TradingState::protection` 對有 `PendingAttach` 的 symbol 一律回新的 `Protection::EntryPending`（"Entry protection pending, not in force yet"），即使清單上有止損、或清單過期也是；不會顯示成已保護。`Protection::EntryPending` 只由 GUI 設定，`protected_status` 不產生。
 - **關閉提醒**（條件 81-3）：主視窗收到關閉要求，且有「Binance 合約、由 app 成交後送出（`AfterFill`）」的限價進場 `PendingAttach` 時（OKX 的附掛在交易所端，app 關閉仍有效，不算），第一次改為 toast 警告並不關閉；10 秒內第二次關閉要求才關閉（`protect_attach::hold_close`，純函式）。
@@ -562,6 +562,111 @@ c2b-1 只接私有 stream、風控狀態與常駐警示；**沒有任何下單�
 - **B1（反向單不當成進場附掛）**：`PrepareInput.held: Holdings`（`protect_attach`，由 `main.rs` 從 `TradingState::positions` 與 `lists_stale` 取該 symbol 的持倉方向）。`prepare_steps` 在 `resolve` 之後、組附掛之前，只要結果是 `Resolved::Attach`，就呼叫 `protect_attach::check_new_entry`：one-way 合約帳戶有反向持倉，回 "This order reduces or reverses a position; protective defaults apply to new entries only. Choose "No protection" to send it."；持倉清單過期或未知，回同類訊息並說明無法判定。`Resolved::Nothing`／`SwitchOff` 不受影響，所以選 "No protection" 仍可送出減倉單。hedge 帳戶與現貨不受影響。縱深防禦：`entry_of(spec, product)` 對現貨 `Short` 回 `None`，不產生 `AttachNote`。測試：`one_way_contract_orders_against_a_position_or_unknown_positions_are_refused`、`hedge_and_spot_accounts_are_not_affected_by_the_position_check`、`choosing_no_protection_leaves_nothing_to_check`、`a_spot_sale_is_never_an_entry_so_it_gets_no_protection_note`。
 - **S1**：`PendingAttachTable::register` 已有同 (帳戶, symbol) 的 sending 時拒絕登記（回 `false`、計數、`TradingState::register_attach` 記 warn），不再覆蓋刪舊條目。測試 `a_second_registration_for_a_send_in_flight_is_refused`。
 - **S2**：關閉提醒只攔 `window::Event::CloseRequested`（主視窗）。macOS 的 Cmd+Q／選單結束是否經過這裡，無法在不執行 app 的情況下確認（winit 的 `terminate:` 可能不送 `CloseRequested`）；**列為手動確認項**：有 Binance `AfterFill` 限價進場單 pending 時按 Cmd+Q，看是否出現關閉提醒。
-- **S3（d3 待辦）**：prepare 與 confirm 之間帳戶預設被改掉（例如關掉 `auto_attach`）時，d3 消費 `PendingAttach` 前要再檢查一次開關，以較嚴者為準（開關已關就不送，並提示）。
+- **S3（d3 已做，見 d3 補充）**：prepare 與 confirm 之間帳戶預設被改掉（例如關掉 `auto_attach`）時，d3 消費 `PendingAttach` 前要再檢查一次開關，以較嚴者為準（開關已關就不送，並提示）。
 - **S4**：`ExchangeAccounts` 的 `RiskSave`／`ProtectSave` 對正在刪除的帳戶不處理。測試 `an_account_being_deleted_takes_no_risk_or_protect_save`。
 - **S5**：Distance 文案帶 quote 幣別（`protect_attach::quote_of` 由 symbol 名稱判讀，取不到就寫 "price units"）。測試 `a_distance_names_its_quote_currency_or_price_units`。
+
+## d3 補充：成交後自動附掛、互撤、`AutoGrant`（第一個呼叫 `submit_auto` 的段）
+
+這一段第一次讓 app 自己送單（Binance USDⓈ-M 的保護單與撤單）。送單點仍只有兩個：手動單 `src/order_flow.rs`（`.submit(`），自動單 `src/auto_flow.rs`（`submit_auto(`、`AutoIntent::new(`，**唯一允許檔案**）。`LIVE_SENDING_ENABLED` 仍為 false；Live 帳戶的自動單和手動單一樣被 `SessionGate` 擋下（測試 `a_closed_gate_stops_a_granted_request_too`；`trade_gate` 既有的 Live 測試涵蓋 Reduce 與 Entry 兩類）。
+
+### 1. `AutoGrant`（`exchange/src/trade/grant.rs`）
+- **由確認過的 `OrderIntent` 產生**（`AutoGrant::from_entry`，在 `confirm_order` 內、進場送出之前）：帳戶、symbol、方向、數量都取自 intent，不收呼叫端的字串。只接受 Binance USDⓈ-M `POST /fapi/v1/order` 且 `Exposure::Adds` 的進場；角色清單（止損、最多 3 段止盈、追蹤）來自確認視窗列出的 `ProtectSpec`。產生失敗就不送進場（顯示錯誤）。
+- **不可 `Clone`**（`compile_fail` doctest），`Debug` 遮蔽；App 端的 `GrantCell` 只是包 `Arc<Mutex<_>>` 的把手，鎖只在一次檢查內持有，不跨 await。
+- **`submit_auto` 現在收 `GrantedAuto`**，只有 `AutoGrant::authorise` 能造出（欄位 `pub(crate)`）。檢查：帳戶、symbol、path／method 配對、`clientAlgoId` 是這個 grant 發出的、只減倉、未過期（只限新掛單）、角色對應 `type`、平倉方向、`positionSide`、已有成交、`closePosition` 或 `reduceOnly` 且數量 ≤ 累計成交；id 單次使用；撤單只能撤「這個 grant 發出且已送出、尚未撤過」的 id。檢查通過才改狀態。
+- **撤單權限比掛單期限長**：grant 過期後不能再掛，但仍可撤自己掛過的單。
+- `RiskClose`（風控平倉）走另一條 `submit_auto_unbound`（`pub(super)`，只有 `bulk.rs` 呼叫；`source_rules_tests.rs` 的 `a_granted_request_is_made_by_the_grant_only_and_the_unbound_send_is_for_bulk_only` 掃描）。
+- 測試：`grant/tests.rs`（帳戶不符、symbol 不符、Adds、數量超過、角色不在清單、過期、重用、撤單重複皆被拒；相符才送）、`send_tests.rs::auto_grant`（假伺服器：只有 grant 涵蓋的請求到達伺服器）。
+
+### 2. 部分成交策略（`exchange/src/trade/auto_attach.rs`、`src/auto_flow.rs`）
+Binance 條件單不能修改，所以**不做「撤舊掛新」**：
+- **首筆成交**：送一張 `closePosition` 的 `STOP_MARKET` 全平止損（涵蓋之後所有成交的部位）。
+- **進場結束**（`Filled`，或部分成交後 `Canceled`／`Expired`）：依累計成交量與均價，one-way 送止盈（`reduceOnly`，數量依份額，最後一段吃剩餘）與追蹤；hedge 只送單段 `closePosition` 止盈、不送追蹤。
+- `Filled` 更新帶的數量比已收到的成交多時，等成交補齊再送（不猜）；進場結果 Unknown 時只累計、不送，查到 Found 才送。
+- 部分成交後取消，只保護已成交的量；沒成交就取消的進場直接移除。
+- 價格以實際均價重算，逐段 `check_qty`，並以當下標記價（取不到就用成交均價；報告有說明）檢查不會「一送出就觸發」。任一段算不出來，整個階段都不送（不半送）。
+
+### 3. 互撤（`CancelSibling`）
+- **（以第 8 節為準，已改）** 規則以「被撤的對象」來定：止損觸發 → 撤止盈與追蹤；追蹤觸發 → 撤止盈；全平止損只在「有保護單 `Finished`、清單新鮮、該方向已無部位」時才撤。事件重複不重撤（狀態已離開 `Open`）。每次撤單都經 grant 的 `cancel_intent` → `authorise`。撤單被拒絕不再當成「已不存在」（第 8 節 M1）。
+
+### 4. 不重試、可見的失敗
+- `PlanError`、`check_qty`、Rejected、Unknown、429、grant 拒絕一律**不重送**，只寫成帳戶面板的一行錯誤（`TradingState::auto_notes`，最多 12 行，英文，含交易所 `code`，不含 client id 與交易所 `msg`），供 d4 做按鈕。Unknown 只做唯讀查詢（`resolve_unknown`）。
+- 面板開關（S3）在**送出當下**再讀一次（`run_auto_jobs` 的 `switch`），關掉就不送並顯示「not protected」。grant 過期的失敗也有一行。
+
+### 5. 其他 d3 項目
+- **N1**：`confirm_order` 在取出 intent 前以當下 `Holdings` 重跑 `check_new_entry`，與預覽時不同（現在反向或清單過期）就不送、要求重新預覽。**N3**：`TradingState::holdings(id, symbol)`，prepare 與 confirm 共用（測試 `holdings_name_the_directions_on_the_symbol_and_say_when_the_list_is_stale`）。
+- **resync 活性**（`stream/machine.rs`）：algo 事件觸發的讀取最小間隔 8 秒（`ALGO_RESYNC_INTERVAL`）；連續 3 次（`MAX_RESYNC_REPEATS`）因事件被折疊而重讀後，不再追，snapshot 照送、清單仍標為過期並 `log::warn!`，32 秒後再讀一次。測試 `an_algo_event_waits_longer_than_other_reasons_for_a_read`、`events_that_keep_arriving_cannot_keep_the_reads_going_for_ever`。
+- **偏離 4**：OKX 限價進場的附掛 TP／SL 方向改以限價（進位後送出的價）檢查，不再用市價（`okx.rs::place_order`，測試 `a_limit_entry_checks_its_attached_triggers_against_the_limit_price`）。
+- **OKX `attachAlgoOrds`**：`orders-pending` 的一般單解析出 `OpenOrder.attached`（只標種類，**不是**保護中，`role` 仍為 `None`）；帳戶面板對掛著限價進場、尚無持倉的 symbol 顯示 "Protection is attached on the exchange; it acts only once the entry is fully filled"。測試 `an_okx_entry_with_attached_orders_says_which_kind_without_being_in_force`。
+- **移除 d2 B2 過渡文字**（見 d2 補充）。`protect_attach.rs` 模組說明不再寫「沒有東西消費」。
+
+### 6. 掃描測試（明列允許檔案）
+- `order_flow.rs::submit_is_called_from_this_file_only_and_the_automatic_paths_from_auto_flow_only`：`.submit(` 只在 `order_flow.rs`；`submit_auto(`／`AutoIntent::new(` 只在 `auto_flow.rs`；全 `src/` 不出現 `block_on(`。
+- `order_confirm.rs::the_tokens_come_from_the_stored_values_in_the_confirmation_files_only`：`for_preview(`／`for_bulk(` 規則不變；`auto_flow.rs` 只允許唯讀的 `.resolve_unknown(`。
+- `trading.rs::the_only_trade_calls_here_are_reads`：`trading.rs` 仍不含任何送單呼叫。注意：掃描以第一個 `#[cfg(test)]` 截斷，所以 `auto_flow.rs` 的正式程式碼不能在測試模組之前放 `#[cfg(test)]` 項目。
+
+### 7. 給 security-review 的重點與已知限制
+- 重點 diff：`exchange/src/trade/grant.rs`（`authorise`、`issue`、`cancel_intent`）、`client.rs`（`submit_auto`／`submit_auto_unbound`）、`src/auto_flow.rs`（`run`、`Sender::step`、`AutoBook`）、`src/main.rs`（`confirm_order`、`run_auto_jobs`）。
+- 測試用的 `test-support` feature（`exchange/Cargo.toml`）只由根 crate 的 dev-dependency 啟用，內容是固定的 BTCUSDT 規則；正常 build 不含。
+- `auto_flow::run` 本身（Keychain → client → gate）沒有假伺服器測試（GUI 的 tokio 只有 `rt` feature）；送出行為由 exchange 的 `send_tests::auto_grant` 與 `auto_attach` 測試涵蓋，`run` 與 `order_flow::send` 結構對應，需手動 testnet 確認。
+- 風控日誌寫入失敗不阻擋自動送單（`Sender::step` 只 `log::warn!`），與手動路徑一致（d3 審查順手 3）。
+- 已知缺口：app 在成交前關閉就不會附掛（確認視窗與關閉提醒已說明）；Hedge 帳戶沒有追蹤、止盈單段；沒有現價時以成交均價檢查觸發方向。
+
+## 8. d3 審查後修正（M1–M4、grant 綁定、順手項）
+
+security-review 判 BLOCK 的四項與 AutoGrant 綁定補齊（2026-11-11 使用者決定不延後）。所有失敗都寫成帳戶面板的一行（`TradingState::auto_notes`），沒有「靜默失去保護」的路徑。
+
+### M1 撤兄弟單的拒絕與 Unknown 可見
+- `auto_flow::rejected_step`：撤單只有「交易所拒絕、`RejectKind::Exchange`、且 code 在 `CANCEL_NOT_FOUND`」才算 `Gone`。**白名單目前留空**（algo 撤單「不存在」的 code 尚未對 testnet 核對，見 `unknown.rs`），所以 429／418／403／時鐘／任何交易所錯誤一律 `Failed`，文案為 "could not be cancelled (the exchange refused it, code X); it may already be gone — check the open orders and cancel it by hand"。
+- 撤單結果 `Unknown`（DELETE 沒有 lookup）同樣寫 note，不重試。`Failed`／`Unknown` 的單改為 `Live::CancelFailed`（不是 `Cancelled`），條目留在 book；之後 algo `Canceled` 事件會把它轉成 `Cancelled`。
+- 測試：`a_refused_cancel_is_a_failure_unless_the_code_says_the_order_is_gone`、`a_cancel_that_failed_or_is_unknown_is_written_down_and_not_taken_as_cancelled`。
+
+### M2 不再靠「觸發」撤掉唯一的全平止損
+- `Live::Fired` 拆成 `Triggered` 與 `Finished`，`Triggered → Finished` 可升級。止損觸發 → 撤止盈與追蹤；追蹤觸發 → 撤止盈；止盈觸發什麼都不撤。
+- 全平止損只由 `release_stop` 釋放：有（非止損的）保護單 `Finished`、清單新鮮（`!stale`）、且 `Holdings` 已無 `e.dir` 方向的部位，才把仍開著的單全部撤掉。清單 stale 就等（不寫 note、不撤）；部位仍在就保留止損，並在「已沒有其他開著的減倉單」時寫一次 note "The other protective orders filled but a position remains; the stop-loss was kept."（每個條目一次）。`fired()` 與 `done()` 的掃描都跳過 `StopLoss`。
+- 觸發後 `Rejected`／`Expired` 視為未生效：該單轉 `Failed`、止損的 `closed` 還原，並寫 note。
+- 既有測試 `a_take_profit_cancels_the_stop_only_when_it_was_the_last_one` 的規格改變（止盈 `Triggered` 不再撤止損），改為下列測試：`a_triggered_take_profit_does_not_cancel_the_stop`、`a_finished_take_profit_with_a_position_left_keeps_the_stop_and_says_so_once`、`a_finished_take_profit_with_a_fresh_flat_list_cancels_the_stop_once`、`a_finished_trailing_stop_with_a_position_left_never_cancels_the_stop`、`a_stale_list_holds_the_stop_until_it_is_fresh`、`an_order_refused_after_it_triggered_did_not_take_effect_and_says_so`。
+- 偏離：「部位仍在」的 note 只在沒有其他開著的減倉單時才寫（多段止盈的第一段完成、部位本來就該還在，不算異常）。
+
+### M3 同帳戶同 symbol 一次一筆自動附掛
+- `AutoBook::is_active` 與 `TradingState::auto_active(id, symbol)`；`prepare`（`PrepareInput.auto_active`，只對 Binance 合約的附掛）與 `confirm_order`（N1 檢查旁）都檢查，文案 `protect_attach::AUTO_STILL_ACTIVE`。只看還有工作要做的條目：送出中、有階段未結束、或有開著的單且最後結果不是 Unknown／`CancelFailed`；進場結果 Unresolved（另有 Unknown 鎖）與已放棄（`attention`）的條目不算，所以不會永久擋住 symbol。
+- 測試：`an_entry_with_work_left_is_active_and_one_that_was_given_up_is_not`、`an_unknown_entry_or_order_does_not_block_the_symbol_for_ever`、`a_second_entry_with_automatic_protection_waits_for_the_first_to_end`（trading）。d4 再提供「我已處理」按鈕。
+
+### M4 沒有通知就沒有保護的路徑
+- **M4-1**：結束狀態（`Canceled`／`Expired`／`Rejected`）一律用 `update.filled_qty` 當 `expected`；交易所回報的量大於已見成交時不悄悄移除，寫 "Some fills of the entry were not seen; the position may not be protected. Check it."。已見成交為 0 時放棄該條目（不再送）；已見成交 > 0 時仍依已見的量掛止盈。測試 `an_entry_that_ended_with_fills_not_seen_is_not_removed_quietly`、`a_status_with_more_filled_than_seen_still_protects_what_was_seen`。
+- **M4-2**：去重鍵改為 `(symbol, trade_id)`（`AccountRuntime::note_fill(symbol, trade_id)`）。測試 `the_same_trade_id_on_two_symbols_is_two_fills`。
+- **M4-3**：`e.closed`（止損已觸發）後不掛止盈與追蹤（`rest` 設為 `NotWanted`），之後的成交寫一次 note "The entry filled again after its stop-loss closed the position; that part is not protected."。測試 `a_stop_that_closed_the_position_gets_no_take_profit_and_a_later_fill_is_noted`。
+- **M4-4**：重連後第一份 snapshot（`book_trusted` 由 false 轉 true）時，`AutoBook::after_reconnect` 對尚未完成的條目檢查：沒有可能是它的進場掛單、且該 symbol 有 `e.dir` 方向的部位（或已見成交少於預期），就寫 note 並放棄該條目，**不自動補送**（補送屬 d4 的手動重試）。偏離：`OpenOrder.id` 是交易所單號、不是 client id，所以「進場還掛著」以 symbol、開倉方向、非 reduce-only 的一般單判斷。測試 `a_reconnect_that_finds_a_position_and_no_entry_order_notes_it_and_sends_nothing`、`a_reconnect_does_not_cry_wolf`、trading 的 `a_reconnect_that_finds_a_position_and_no_entry_order_is_noted_and_sends_nothing`。
+
+### AutoGrant 綁定（`exchange/src/trade/grant.rs`）
+- grant 存**進場 client id** 與 **spec 指紋**（`ProtectSpec::fingerprint()`，對停損／各段止盈（觸發價基準、百分比或價差、份額）／追蹤參數做雜湊，只在記憶體，不存檔）。`from_entry(intent, roles, &spec, ..)` 從 intent 取 client id。
+- 掛單必須帶 `Basis`（`AutoIntent::with_basis`，由 `StageInput::basis(entry_id)` 以同一個 `spec` 產生）；`check_place` 比對：沒有 basis → `NotBound`、client id 不符 → `WrongEntry`、指紋不符 → `SpecMismatch`。撤單不需要 basis（id 一定是 grant 發出的）。
+- 每個角色累計已授權的 `reduceOnly` 數量 ≤ 累計成交（`TotalTooLarge`），止盈各段加總不會超過 filled；授權即計入，失敗的送出不退回（不重送）。
+- `add_fill(entry_id, qty)` 只接受與 grant 進場 client id 相符的成交（回傳 `false` 且不加），`AutoBook::on_fill` 也不計入本地的 `filled`，兩邊保持一致。
+- 測試：`grant/tests.rs::a_placement_must_name_the_grants_entry_and_the_confirmed_settings`（無 basis、別的進場、停損距離、份額、觸發價基準）、`a_fill_of_another_entry_is_not_added`、`the_take_profit_legs_together_stay_within_what_filled`；假伺服器測試改為帶 basis。
+- 限制：進場 client id 與 spec 仍由呼叫端（`auto_flow.rs`，唯一允許檔案）傳入 basis，grant 只比對、不能自行推得；這屬於「同一個檔案內的一致性」，由掃描測試限制只有 `auto_flow.rs` 能用 `.with_basis(`、`.authorise(`、`.cancel_intent(`、`AutoGrant::from_entry(`、`.add_fill(`，且 `auto_flow::mint(` 只在 `main.rs`（相對路徑比對，不只看檔名）。
+
+### 順手項
+- 順手 2：`register_attach`／`register_okx_attach` 回傳 `bool`（`#[must_use]`），`confirm_order` 收到 false 就不送進場（fail closed）。
+- 順手 5：確認視窗加一行 "Protective orders are placed only within 24 hours of this confirmation."。
+- 順手 3：風控日誌寫入失敗不阻擋自動送單（見第 7 節）。順手 4（撤單 Unknown 文案放到按鈕旁）留給 d4。
+
+### 仍待 testnet 與後續
+- Binance algo 撤單「不存在」的 code（填進 `CANCEL_NOT_FOUND`）；同方向第二張 `closePosition` 是否被拒；`TRIGGERING`／`TRIGGERED`／`FINISHED` 的語意與觸發後市價單被拒的狀態序列；`closePosition` 在無部位時的行為。
+- 互撤狀態只在記憶體；Live 開放前要補啟動時對帳殘留自動單。
+
+## d3 複核修正（M5 與順手項）
+
+- **M5**：`AutoBook::after_reconnect` 對「沒有掛著、沒有該方向部位、也不短少」的條目不再靜默略過，也不 `drop_entry`（`resting == false` 不一定可信），改為 `give_up` 並寫 note（`NOT_FOUND_OPEN`）。已掛出的保護單留在 book、事件照常更新；條目不再算作用中，不會擋住 symbol。測試 `a_reconnect_that_finds_no_entry_and_no_position_stops_and_notes_once`、`a_reconnect_with_a_fill_seen_keeps_the_stop_and_sends_no_take_profit`。
+- **順手 1**：`done()` 只在該單為 `Live::Cancelling` 時才寫 `CancelFailed` 與 note。測試 `a_cancel_result_that_comes_after_the_event_does_not_report_a_failure`。
+- **順手 3**：止損 `Triggered` 後收到 `Canceled`，比照 Rejected／Expired（`Failed`、`closed = false`、寫 note）。測試 `a_stop_that_triggered_and_was_cancelled_is_failed_and_noted`。此序列仍待 testnet 確認是否真的會發生。
+- **N1（resync 被當成重連）**：複核發現 `after_reconnect` 在每次 resync 都跑（包含只由 algo 事件引起的），而且在被扣住的事件套用前就判斷，可能讓正常成交沒有止損。修法：
+  1. `AccountRuntime.recheck_auto` 只在 `Reconnecting`／`AuthFailed`／`Unavailable`、重建 stream、`PrivateEvent::ResyncRequired` 時設；純 algo 事件的 resync 不設。
+  2. 檢查改在 `State(Connected)` 且 `book_trusted && take(recheck_auto)` 時才做（driver 的順序是 snapshot、被扣住的事件、`State(Connected)`），不在 `Snapshot` 分支。resync 失敗或在 Connected 前又斷線，旗標保留到下一次。
+  3. `after_reconnect` 改用 `give_up_rest`：只把 `rest` 由 `Todo` 改 `Failed`、設 `attention`、寫 note；`stop` 保持 `Todo`，所以之後看到**該單自己 client id 的成交**時仍會送出止損（closePosition，連沒看到的成交也一起覆蓋；`grant.add_fill` 擋其他單，方向錯誤由 `held` 檢查擋）。沒有成交就不送任何東西，不是補送。因 `stop` 未終結，`after_reconnect` 在 `!reported` 時設 `reported = true` 並 push 到 `finished`，讓 attach 表與「等待保護」提示能清掉。`NOT_FOUND_OPEN`／`LOST_CONNECTION` 文案改為「take-profit 與 trailing 已停止；看到成交仍會掛止損；請檢查部位」，不再說 "not protected"（一併處理 R1）。
+  測試：trading 的 `a_resync_caused_by_an_algo_event_is_not_a_reconnect`、`a_reconnect_notes_and_a_later_fill_still_gets_its_stop`、`a_resync_required_event_is_treated_like_a_reconnect`，以及調整後的 `a_reconnect_*`（含 auto_flow 兩個：之後的成交仍產生 Stop 工作、不產生 Rest 工作、`take_finished` 含該條目）。
+  - 仍待 testnet：resync 期間成交時 snapshot、被扣住事件與 `State(Connected)` 的實際到達順序；Binance 是否以 -4130 拒絕重複的 closePosition 止損。
+
+### d4 待辦（本次不實作）
+- **`Filled` 但有未見成交**：記錄 `expected` 設定時間，poll 時超過 N 秒仍短少就寫 `FILLS_NOT_SEEN`，`filled == 0` 時 `give_up`；有 client id 但沒有 trade id 的成交至少 `log::info!`。
+- **永久擋住 symbol 的其他情況**（例如止損一直 `Open` 但部位已被手動平掉）：d4 的「我已處理」按鈕要涵蓋所有 `is_active` 的條目，不只 Unknown／CancelFailed。

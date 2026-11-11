@@ -14,6 +14,8 @@ default = []
 # channel grows to whatever heap the device has.  Useful for database
 # ingestion or audit trails where every tick matters.
 unbounded-channel = []
+# Helpers for the tests of dependent crates (rules fixtures). Never enabled in a normal build.
+test-support = []
 
 [dependencies]
 chrono.workspace = true

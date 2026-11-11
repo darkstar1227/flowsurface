@@ -87,6 +87,10 @@ data.workspace = true
 indicator_engine.workspace = true
 pine.workspace = true
 
+[dev-dependencies]
+# The rules fixtures for the tests of `auto_flow` (never part of a normal build).
+exchange = { workspace = true, features = ["test-support"] }
+
 [features]
 debug = ["iced/hot"]
 

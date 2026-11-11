@@ -117,7 +117,7 @@ impl BinanceRequest {
         self.exposure
     }
 
-    fn param(&self, name: &str) -> Option<&str> {
+    pub(crate) fn param(&self, name: &str) -> Option<&str> {
         self.params
             .iter()
             .find(|(n, _)| *n == name)

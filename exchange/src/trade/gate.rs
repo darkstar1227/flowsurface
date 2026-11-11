@@ -430,6 +430,8 @@ pub enum AutoPath {
 pub struct AutoIntent {
     pub(crate) path: AutoPath,
     pub(crate) intent: OrderIntent,
+    /// The entry and settings a placement is based on (the grant compares them).
+    pub(crate) basis: Option<super::grant::Basis>,
 }
 
 impl AutoIntent {
@@ -449,8 +451,19 @@ impl AutoIntent {
     fn build(path: AutoPath, intent: OrderIntent) -> Result<Self, TradeError> {
         match intent.exposure() {
             Exposure::Adds { .. } => Err(TradeError::AutoPathMustReduce),
-            Exposure::Reduces | Exposure::Neutral => Ok(AutoIntent { path, intent }),
+            Exposure::Reduces | Exposure::Neutral => Ok(AutoIntent {
+                path,
+                intent,
+                basis: None,
+            }),
         }
+    }
+
+    /// Say which entry and settings a placement is based on. The grant refuses a placement that
+    /// does not match its own.
+    pub fn with_basis(mut self, basis: super::grant::Basis) -> Self {
+        self.basis = Some(basis);
+        self
     }
 
     pub fn path(&self) -> AutoPath {

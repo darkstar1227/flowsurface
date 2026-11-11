@@ -2,6 +2,7 @@
 
 mod account_flow;
 mod audio;
+mod auto_flow;
 mod connector;
 mod layout;
 mod logger;
@@ -196,6 +197,8 @@ enum Message {
     OrderTicket(modal::order_ticket::Message),
     OrderConfirm(modal::order_confirm::Message),
     OrderSent(order_flow::SendSummary),
+    /// The result of the orders sent by the app itself after an entry filled (M5 d3).
+    AutoDone(Box<auto_flow::AutoSummary>),
     AccountPanel(modal::account_panel::Message),
     BulkConfirm(modal::bulk_confirm::Message),
     Account(account_flow::Event),
@@ -339,21 +342,14 @@ impl Flowsurface {
             })
             .and_then(order_flow::price_to_decimal);
         let mode = self.trade_session.get(meta.id).and_then(|e| e.actual_mode);
-        let held = protect_attach::Holdings {
-            stale: self.trading.lists_stale(meta.id),
-            dirs: self
-                .trading
-                .positions(meta.id)
-                .iter()
-                .filter(|p| p.symbol.eq_ignore_ascii_case(&request.symbol))
-                .map(|p| p.dir)
-                .collect(),
-        };
+        let held = self.trading.holdings(meta.id, &request.symbol);
+        let auto_active = self.trading.auto_active(meta.id, &request.symbol);
         let nonce = self.order_ticket.start_prepare();
         let input = order_flow::PrepareInput {
             meta,
             mode,
             held,
+            auto_active,
             request,
             ref_price,
             signed,
@@ -944,20 +940,98 @@ impl Flowsurface {
         };
         // What the confirmation listed, read before the intent leaves it.
         let attach = conf.attach_plan().cloned();
+        let mode = self.trade_session.get(meta.id).and_then(|e| e.actual_mode);
+        // N1: the positions may have changed since the preview. The protection was listed for a
+        // new entry; when the account now holds the other way (or cannot tell), nothing is sent
+        // and the order is reviewed again.
+        if let Some(plan) = &attach {
+            let held = self.trading.holdings(meta.id, &request.symbol);
+            if protect_attach::check_new_entry(meta.product, mode, plan.dir, &held).is_err() {
+                self.order_confirm = None;
+                self.order_ticket.set_status(
+                    "The positions of the account changed after the review, so the protection \
+                     listed no longer fits. Nothing was sent. Review the order again."
+                        .to_string(),
+                    BannerKind::Warning,
+                );
+                return Task::none();
+            }
+            // M3: one entry at a time per symbol while its automatic protection is at work.
+            if plan.kind == protect_attach::AttachKind::AfterFill
+                && self.trading.auto_active(meta.id, &request.symbol)
+            {
+                self.order_confirm = None;
+                self.order_ticket.set_status(
+                    protect_attach::AUTO_STILL_ACTIVE.to_string(),
+                    BannerKind::Warning,
+                );
+                return Task::none();
+            }
+        }
+        let Some(conf) = self.order_confirm.as_mut() else {
+            return Task::none();
+        };
         let Some((token, intent)) = conf.confirm(std::time::Instant::now()) else {
             return Task::none();
         };
         self.order_confirm = None;
         // The entry's own client id (the first one of the request), kept in memory only.
         if let (Some(plan), Some(entry_id)) = (attach, intent.client_ids().first()) {
-            self.trading.register_attach(
-                (*entry_id).to_string(),
-                protect_attach::PendingAttach {
-                    account: request.account,
-                    symbol: request.symbol.clone(),
-                    plan,
-                },
-            );
+            // Binance futures protection follows the fill: the grant is made from this very
+            // intent. If it cannot be made, the entry is not sent without its protection.
+            let auto = if plan.kind == protect_attach::AttachKind::AfterFill {
+                // The position mode decides which protective orders are valid; an account
+                // whose mode was not read is not guessed at.
+                let Some(position_mode) = mode else {
+                    self.order_ticket.set_status(
+                        "The position mode of the account is not known, so the protective orders \
+                         cannot be planned. Nothing was sent. Test the account again."
+                            .to_string(),
+                        BannerKind::Error,
+                    );
+                    return Task::none();
+                };
+                match auto_flow::mint(
+                    &intent,
+                    request.account,
+                    &request.symbol,
+                    &plan.spec,
+                    position_mode,
+                    chrono::Utc::now().timestamp_millis(),
+                ) {
+                    Ok(init) => Some(init),
+                    Err(why) => {
+                        self.order_ticket
+                            .set_status(format!("{why} Nothing was sent."), BannerKind::Error);
+                        return Task::none();
+                    }
+                }
+            } else {
+                None
+            };
+            let pending = protect_attach::PendingAttach {
+                account: request.account,
+                symbol: request.symbol.clone(),
+                plan,
+            };
+            let listed = match auto {
+                Some(init) => self
+                    .trading
+                    .register_attach((*entry_id).to_string(), pending, init),
+                None => self
+                    .trading
+                    .register_okx_attach((*entry_id).to_string(), pending),
+            };
+            // Fail closed: the confirmation said this entry would be protected.
+            if !listed {
+                self.order_ticket.set_status(
+                    "The protection could not be listed for this entry (another send for the \
+                     symbol is in flight). Nothing was sent. Review the order again."
+                        .to_string(),
+                    BannerKind::Error,
+                );
+                return Task::none();
+            }
         }
         self.trading.begin_send(request.account, &request.symbol);
         self.order_ticket
@@ -977,7 +1051,64 @@ impl Flowsurface {
         Task::perform(order_flow::send(input), Message::OrderSent)
     }
 
+    /// Start the automatic orders that are due (protective orders after a fill, the cancel of
+    /// the other one). Each job is sent once; a failure is written down, never retried.
+    fn run_auto_jobs(&mut self) -> Task<Message> {
+        let accounts = self.exchange_accounts.persisted().accounts;
+        // Read again at the moment of sending (S3), not only when the entry was confirmed.
+        let switch = |id: uuid::Uuid| {
+            accounts
+                .iter()
+                .find(|m| m.id == id)
+                .is_some_and(|m| m.protect.attaches_automatically(m.env))
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let jobs = self.trading.poll_auto(now, &switch);
+        if jobs.is_empty() {
+            return Task::none();
+        }
+        let signed = self.signed_client_for_current_proxy();
+        let mut tasks = Vec::new();
+        for job in jobs {
+            let meta = accounts.iter().find(|m| m.id == job.account).cloned();
+            let risk = self.trading.risk_for(job.account);
+            let (Some(meta), Ok(signed), Some(risk)) = (meta, signed.clone(), risk) else {
+                let summary = auto_flow::failed_summary(
+                    &job,
+                    "the account has no usable connection or trading state",
+                );
+                self.trading.auto_done(summary);
+                continue;
+            };
+            let market = order_flow::market_of(meta.venue, meta.product);
+            let ticker = exchange::Ticker::new(&job.symbol, market);
+            let ref_price = self
+                .sidebar
+                .tickers_table
+                .mark_price(&ticker)
+                .and_then(order_flow::price_to_decimal);
+            let input = auto_flow::RunInput {
+                session: self.trade_session.get(meta.id).cloned(),
+                job,
+                meta,
+                signed,
+                proxy: self.trading.proxy_reader(),
+                risk,
+                ref_price,
+            };
+            tasks.push(Task::perform(auto_flow::run(input), |s| {
+                Message::AutoDone(Box::new(s))
+            }));
+        }
+        Task::batch(tasks)
+    }
+
     fn on_order_sent(&mut self, summary: order_flow::SendSummary) -> Task<Message> {
+        let task = self.on_order_sent_inner(summary);
+        Task::batch([task, self.run_auto_jobs()])
+    }
+
+    fn on_order_sent_inner(&mut self, summary: order_flow::SendSummary) -> Task<Message> {
         // Only an unknown result keeps the symbol blocked; it is never erased by a later send.
         self.trading.finish_send(
             summary.account,
@@ -1816,7 +1947,11 @@ impl Flowsurface {
                 for id in effects.invalidate {
                     self.trade_session.invalidate(id);
                 }
-                return task.map(Message::Trading);
+                return Task::batch([task.map(Message::Trading), self.run_auto_jobs()]);
+            }
+            Message::AutoDone(summary) => {
+                self.trading.auto_done(*summary);
+                return self.run_auto_jobs();
             }
             Message::Sidebar(message) => {
                 let (task, action) = self.sidebar.update(message);
