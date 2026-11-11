@@ -8,6 +8,7 @@ mod logger;
 mod modal;
 mod notify;
 mod order_flow;
+mod protect_attach;
 mod screen;
 mod style;
 mod theme;
@@ -122,6 +123,9 @@ struct Flowsurface {
     timezone: data::UserTimezone,
     theme: ThemeState,
     notifications: Notifications,
+    /// When the app last held back a close request because a resting limit entry still owes
+    /// its protection (condition 81); a second request soon after closes.
+    close_warned_at: Option<std::time::Instant>,
     window_scale_factors: window::WindowScaleFactors,
     antialiasing: bool,
     applied_antialiasing: bool,
@@ -335,10 +339,21 @@ impl Flowsurface {
             })
             .and_then(order_flow::price_to_decimal);
         let mode = self.trade_session.get(meta.id).and_then(|e| e.actual_mode);
+        let held = protect_attach::Holdings {
+            stale: self.trading.lists_stale(meta.id),
+            dirs: self
+                .trading
+                .positions(meta.id)
+                .iter()
+                .filter(|p| p.symbol.eq_ignore_ascii_case(&request.symbol))
+                .map(|p| p.dir)
+                .collect(),
+        };
         let nonce = self.order_ticket.start_prepare();
         let input = order_flow::PrepareInput {
             meta,
             mode,
+            held,
             request,
             ref_price,
             signed,
@@ -401,7 +416,7 @@ impl Flowsurface {
             self.account_panel.reset_form();
         }
         match action {
-            Some(Action::Review(request)) => self.start_review(request),
+            Some(Action::Review(request)) => self.start_review(*request),
             Some(Action::Exit) => {
                 self.discard_order();
                 self.sidebar.set_menu(None);
@@ -821,6 +836,7 @@ impl Flowsurface {
                             r.account == summary.record.account && r.symbol == summary.record.symbol
                         })
                     });
+                    self.trading.entry_gone(&summary.record.client_id);
                     self.trading.record_released(
                         meta.id,
                         &summary.record.symbol,
@@ -844,6 +860,7 @@ impl Flowsurface {
                     && let Some(meta) = self.meta_of_key(summary.record.account)
                 {
                     // The account stays blocked until restart: only the list entry changes.
+                    self.trading.entry_gone(&summary.record.client_id);
                     self.trading
                         .record_discarded(meta.id, &summary.record.client_id);
                 }
@@ -858,6 +875,9 @@ impl Flowsurface {
             }
             E::Looked(summary) => {
                 for (record, end) in &summary.ends {
+                    if matches!(end, trading::LookupEnd::NotPlaced) {
+                        self.trading.entry_gone(&record.client_id);
+                    }
                     self.trading.lookup_finished(record, *end);
                     let (text, kind) = account_flow::describe_lookup(&record.symbol, *end);
                     self.say(text, kind);
@@ -922,10 +942,23 @@ impl Flowsurface {
         let Some(conf) = self.order_confirm.as_mut() else {
             return Task::none();
         };
+        // What the confirmation listed, read before the intent leaves it.
+        let attach = conf.attach_plan().cloned();
         let Some((token, intent)) = conf.confirm(std::time::Instant::now()) else {
             return Task::none();
         };
         self.order_confirm = None;
+        // The entry's own client id (the first one of the request), kept in memory only.
+        if let (Some(plan), Some(entry_id)) = (attach, intent.client_ids().first()) {
+            self.trading.register_attach(
+                (*entry_id).to_string(),
+                protect_attach::PendingAttach {
+                    account: request.account,
+                    symbol: request.symbol.clone(),
+                    plan,
+                },
+            );
+        }
         self.trading.begin_send(request.account, &request.symbol);
         self.order_ticket
             .set_status("Sending…".to_string(), BannerKind::Normal);
@@ -954,6 +987,9 @@ impl Flowsurface {
         if summary.journal_failed {
             self.trading.set_journal_failed();
         }
+        // The protection listed for the entry stays or goes with the result.
+        self.trading
+            .settle_attach(summary.account, &summary.symbol, &summary.result);
         // The request of this very send (account and symbol), never another one's.
         let request = self
             .order_requests
@@ -1046,6 +1082,7 @@ impl Flowsurface {
             applied_volume_size_unit: saved_state.volume_size_unit,
             theme: ThemeState::new(saved_state.theme),
             notifications: Notifications::new(),
+            close_warned_at: None,
             network_config: saved_state.network.clone(),
             proxy_unreadable: saved_state.proxy_unreadable,
             trade_session: TradeSession::default(),
@@ -1728,6 +1765,10 @@ impl Flowsurface {
                         self.trading.apply_risk_settings(id, &settings);
                         persist = true;
                     }
+                    Some(modal::exchange_accounts::Action::ProtectSaved(id, defaults)) => {
+                        self.trading.apply_protect_defaults(id, &defaults);
+                        persist = true;
+                    }
                     Some(modal::exchange_accounts::Action::Deleting(id)) => {
                         // From here the gate refuses every order of the account (L4).
                         self.trade_session.invalidate(id);
@@ -2389,6 +2430,20 @@ impl Flowsurface {
 
                     self.active_dashboard_mut().popout.remove(&window_id);
                     return window::close(window_id);
+                }
+
+                // A resting limit entry that still owes its protection could fill while the
+                // app is closed: say so once and let a second request close (condition 81).
+                let now = std::time::Instant::now();
+                if protect_attach::hold_close(
+                    self.trading.has_resting_limit_attach(),
+                    self.close_warned_at,
+                    now,
+                ) {
+                    self.close_warned_at = Some(now);
+                    self.notifications
+                        .push(Toast::warn(protect_attach::CLOSE_WARNING.to_string()));
+                    return Task::none();
                 }
 
                 let dashboard = self.active_dashboard_mut();

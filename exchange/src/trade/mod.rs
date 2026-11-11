@@ -44,12 +44,13 @@ pub use gate::{
     OrderIntent, RiskHook, RiskRefusal, RiskView, SendGate, SubmitError,
 };
 pub use journal::{JournalError, UnknownJournal};
-pub use manual::{ManualContext, ManualSpec, build_intent};
+pub use manual::{ManualContext, ManualSpec, build_intent, entry_protection};
 pub use outcome::{ItemRejection, Outcome, RejectKind};
 pub use preview::{OrderPreview, PreviewField};
 pub use protect::{
     MAX_TARGETS, Offset, PlanError, PositionProtection, ProtectPlan, ProtectRole, ProtectSpec,
-    Protection, Rounding, TargetLeg, TargetSpec, orphan_protectives, plan, protected_status,
+    Protection, Rounding, TargetLeg, TargetSpec, TrailingSpec, TriggerBasis, orphan_protectives,
+    plan, protected_status,
 };
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
 pub use risk::{

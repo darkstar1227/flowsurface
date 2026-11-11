@@ -4153,6 +4153,71 @@ async fn the_preview_equals_the_json_the_okx_server_receives() {
     assert_preview_matches(&preview, super::preview::flatten_json(&json), false);
 }
 
+/// The entry built by `build_intent` with a protection setting: the preview names the attached
+/// TP and SL, and is the JSON the server receives, attachment included (d2).
+#[tokio::test]
+async fn the_preview_of_an_okx_entry_with_attached_protection_equals_the_json_the_server_receives()
+{
+    use super::decimal::Decimal;
+    use super::manual::{ManualContext, ManualSpec, build_intent};
+    use super::protect::{Offset, ProtectSpec, TriggerBasis};
+    use super::types::MarginMode;
+    let fake = serve(gen_okx);
+    let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+    let t = okx_swap_table();
+    let fresh = t.fresh_lookup("BTC-USDT-SWAP", NOW, AGE).unwrap();
+    let spec = ProtectSpec {
+        stop: Some(Offset::Percent(Decimal::parse("2").unwrap())),
+        targets: vec![super::protect::TargetSpec {
+            offset: Offset::Distance(Decimal::parse("2000").unwrap()),
+            share_pct: 100,
+        }],
+        trigger_price: TriggerBasis::Mark,
+        ..ProtectSpec::default()
+    };
+    let intent = build_intent(
+        c.account(),
+        &fresh,
+        &ManualSpec::Market {
+            dir: Dir::Long,
+            qty: Decimal::parse("2").unwrap(),
+        },
+        ManualContext {
+            mode: Some(PositionMode::OneWay),
+            ref_price: Some(Decimal::parse("50000").unwrap()),
+            okx_margin: MarginMode::Cross,
+            protect: Some(&spec),
+        },
+    )
+    .unwrap();
+    let preview = intent.preview();
+    assert_eq!(
+        preview.field("attachAlgoOrds[0].slTriggerPx"),
+        Some("49000")
+    );
+    assert_eq!(
+        preview.field("attachAlgoOrds[0].tpTriggerPx"),
+        Some("52000")
+    );
+    assert_eq!(
+        preview.field("attachAlgoOrds[0].slTriggerPxType"),
+        Some("mark")
+    );
+    c.submit(
+        &OpenGate,
+        &NoRisk,
+        &NoJournal,
+        ConfirmToken::for_preview(&preview),
+        intent,
+    )
+    .await
+    .unwrap();
+    let raw = fake.raw();
+    assert_eq!(raw.len(), 1);
+    let json: serde_json::Value = serde_json::from_str(&raw[0].2).unwrap();
+    assert_preview_matches(&preview, super::preview::flatten_json(&json), false);
+}
+
 #[tokio::test]
 async fn a_token_for_another_quantity_is_refused_and_nothing_is_sent() {
     let fake = serve(gen_binance);

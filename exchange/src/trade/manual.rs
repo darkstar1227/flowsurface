@@ -9,12 +9,14 @@
 //! has no manual path at all. Closing and bulk actions are not here.
 
 use super::binance_futures::{self, FuturesEntry};
+use super::checks::check_qty;
 use super::client::OpenKind;
 use super::client_id::{ClientId, Role};
 use super::decimal::Decimal;
 use super::gate::OrderIntent;
-use super::okx::{self, OkxAlgoType, OkxEntry, OkxProtective, OkxTarget, TriggerPxType};
-use super::rules::{FreshRules, TradeProduct};
+use super::okx::{self, OkxAlgoType, OkxAttach, OkxEntry, OkxProtective, OkxTarget, TriggerPxType};
+use super::protect::{ProtectPlan, ProtectSpec, Rounding, TriggerBasis, plan};
+use super::rules::{FreshRules, SymbolRules, TradeProduct};
 use super::types::{
     Action, Dir, Exec, MarginMode, OrderRef, Protective, ProtectiveKind, Side, Size, TimeInForce,
     TradeError, Trailing, WorkingType,
@@ -66,7 +68,7 @@ impl ManualSpec {
 
 /// What the builders need besides the spec.
 #[derive(Debug, Clone, Copy)]
-pub struct ManualContext {
+pub struct ManualContext<'a> {
     /// The position mode the exchange reported (never the saved one); `None` refuses.
     pub mode: Option<PositionMode>,
     /// Last or mark price: needed for a market order's value, and to check a trigger against
@@ -74,6 +76,83 @@ pub struct ManualContext {
     pub ref_price: Option<Decimal>,
     /// OKX swap margin mode of the order form.
     pub okx_margin: MarginMode,
+    /// The checked protection to attach to an entry (`ProtectDefaults::spec`). Only OKX uses
+    /// it here, as `attachAlgoOrds` on the entry itself; a Binance futures entry is sent
+    /// unchanged and its protection follows the fill. An empty spec attaches nothing.
+    pub protect: Option<&'a ProtectSpec>,
+}
+
+/// The protective prices for an entry at `base` (the limit price, or the reference price of a
+/// market order), as the entry would get them if it filled there. Pure. The GUI runs it before
+/// the confirmation to refuse settings that could not be applied (a stop distance at or above
+/// the price, a share too small for the step), and OKX takes its attached triggers from it.
+pub fn entry_protection(
+    rules: &SymbolRules,
+    dir: Dir,
+    base: &Decimal,
+    qty: &Decimal,
+    spec: &ProtectSpec,
+) -> Result<ProtectPlan, TradeError> {
+    let planned = plan(
+        dir,
+        *base,
+        *qty,
+        spec,
+        &Rounding {
+            tick: *rules.tick(),
+            step: rules.lot().step,
+        },
+    )
+    .map_err(|_| TradeError::ProtectionNotPossible)?;
+    // A Binance futures protective order sized by quantity is checked against the market lot
+    // rule when it is built (`new_algo_order`); check each one now, so a leg the exchange
+    // would refuse after the fill is refused before the entry. (Minimum notional does not
+    // apply to reduce-only protective orders.) OKX attaches to the whole entry: no own size.
+    if rules.product() == TradeProduct::BinanceUsdM {
+        let sized = planned
+            .targets
+            .iter()
+            .map(|t| &t.qty)
+            .chain(spec.trailing.is_some().then_some(&planned.total_qty));
+        for q in sized {
+            check_qty(rules, q, true).map_err(|_| TradeError::ProtectionNotPossible)?;
+        }
+    }
+    Ok(planned)
+}
+
+/// The OKX attachment of an entry: one group (single TP and/or SL), from the checked spec.
+/// `None` when the spec holds nothing for OKX.
+fn okx_attach(
+    rules: &SymbolRules,
+    dir: Dir,
+    base: Option<&Decimal>,
+    qty: &Decimal,
+    spec: Option<&ProtectSpec>,
+) -> Result<Option<OkxAttach>, TradeError> {
+    let Some(spec) = spec.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    // OKX attaches one TP and one SL to the entry itself; trailing is off (decision 4) and
+    // more than one target does not fit. Refused here too, whatever the caller checked.
+    if spec.trailing.is_some() || spec.targets.len() > 1 {
+        return Err(TradeError::ProtectionNotPossible);
+    }
+    let base = base.ok_or(TradeError::MissingReferencePrice)?;
+    let planned = entry_protection(rules, dir, base, qty, spec)?;
+    Ok(Some(OkxAttach {
+        tp_trigger: planned.targets.first().map(|t| t.trigger),
+        sl_trigger: planned.stop,
+        trigger_type: match spec.trigger_price {
+            TriggerBasis::Last => TriggerPxType::Last,
+            TriggerBasis::Mark => TriggerPxType::Mark,
+        },
+        client_id: ClientId::generate(if planned.stop.is_some() {
+            Role::StopLoss
+        } else {
+            Role::TakeProfit
+        }),
+    }))
 }
 
 /// Build the intent for `spec` with the builder of the product `fresh` belongs to. A fresh
@@ -83,7 +162,7 @@ pub fn build_intent(
     account: AccountKey,
     fresh: &FreshRules<'_>,
     spec: &ManualSpec,
-    ctx: ManualContext,
+    ctx: ManualContext<'_>,
 ) -> Result<OrderIntent, TradeError> {
     let rules = fresh.rules();
     match rules.product() {
@@ -179,7 +258,7 @@ pub fn build_intent(
                     },
                     ref_price: ctx.ref_price,
                     client_id: ClientId::generate(Role::Entry),
-                    attach: None,
+                    attach: okx_attach(rules, *dir, Some(price), qty, ctx.protect)?,
                 })?,
                 ManualSpec::Market { dir, qty } => okx::place_order(OkxEntry {
                     rules,
@@ -188,7 +267,7 @@ pub fn build_intent(
                     exec: Exec::Market,
                     ref_price: ctx.ref_price,
                     client_id: ClientId::generate(Role::Entry),
-                    attach: None,
+                    attach: okx_attach(rules, *dir, ctx.ref_price.as_ref(), qty, ctx.protect)?,
                 })?,
                 ManualSpec::Stop { dir, size, trigger } if swap => {
                     okx_protective(rules, *dir, *size, Some(*trigger), None, ctx)?
@@ -226,7 +305,7 @@ fn protective(
     size: Size,
     trigger: Option<Decimal>,
     trailing: Option<Trailing>,
-    ctx: ManualContext,
+    ctx: ManualContext<'_>,
 ) -> Result<Protective, TradeError> {
     Ok(Protective {
         kind,
@@ -246,7 +325,7 @@ fn protective(
     })
 }
 
-fn okx_entry_target(swap: bool, dir: Dir, ctx: ManualContext) -> Result<OkxTarget, TradeError> {
+fn okx_entry_target(swap: bool, dir: Dir, ctx: ManualContext<'_>) -> Result<OkxTarget, TradeError> {
     if swap {
         Ok(OkxTarget::Swap {
             mode: ctx.mode,
@@ -268,7 +347,7 @@ fn okx_protective(
     size: Size,
     sl: Option<Decimal>,
     tp: Option<Decimal>,
-    ctx: ManualContext,
+    ctx: ManualContext<'_>,
 ) -> Result<super::request::OkxRequest, TradeError> {
     okx::place_algo(OkxProtective {
         rules,
@@ -293,6 +372,7 @@ fn okx_protective(
 
 #[cfg(test)]
 mod tests {
+    use super::super::protect::{Offset, TargetSpec, TrailingSpec};
     use super::super::request::Exposure;
     use super::super::rules::fixtures::*;
     use super::*;
@@ -304,11 +384,12 @@ mod tests {
         AccountKey::from_bytes([7; 16])
     }
 
-    fn ctx(mode: Option<PositionMode>, ref_price: Option<&str>) -> ManualContext {
+    fn ctx(mode: Option<PositionMode>, ref_price: Option<&str>) -> ManualContext<'static> {
         ManualContext {
             mode,
             ref_price: ref_price.map(d),
             okx_margin: MarginMode::Cross,
+            protect: None,
         }
     }
 
@@ -316,7 +397,7 @@ mod tests {
         table: &super::super::rules::RulesTable,
         sym: &str,
         spec: &ManualSpec,
-        c: ManualContext,
+        c: ManualContext<'_>,
     ) -> Result<OrderIntent, TradeError> {
         let fresh = table.fresh_lookup(sym, NOW, AGE).unwrap();
         build_intent(acct(), &fresh, spec, c)
@@ -488,6 +569,225 @@ mod tests {
         assert_eq!(
             intent(&futures(), "BTCUSDT", &bad, c).unwrap_err(),
             TradeError::OrderIdInvalid
+        );
+    }
+
+    fn spec_of(stop: Option<Offset>, targets: &[(Offset, u8)]) -> ProtectSpec {
+        ProtectSpec {
+            stop,
+            targets: targets
+                .iter()
+                .map(|&(offset, share_pct)| TargetSpec { offset, share_pct })
+                .collect(),
+            ..ProtectSpec::default()
+        }
+    }
+
+    fn pct(s: &str) -> Offset {
+        Offset::Percent(d(s))
+    }
+
+    fn with_protect<'a>(c: ManualContext<'a>, p: &'a ProtectSpec) -> ManualContext<'a> {
+        ManualContext {
+            protect: Some(p),
+            ..c
+        }
+    }
+
+    #[test]
+    fn an_okx_entry_carries_the_attached_triggers_in_its_preview() {
+        let c = ctx(Some(PositionMode::OneWay), Some("50000"));
+        let p = spec_of(Some(pct("2")), &[(pct("4"), 100)]);
+        let market = ManualSpec::Market {
+            dir: Dir::Long,
+            qty: d("1"),
+        };
+        let i = intent(
+            &okx_swap_table(),
+            "BTC-USDT-SWAP",
+            &market,
+            with_protect(c, &p),
+        )
+        .unwrap();
+        let v = i.preview();
+        assert_eq!(v.field("attachAlgoOrds[0].slTriggerPx"), Some("49000"));
+        assert_eq!(v.field("attachAlgoOrds[0].tpTriggerPx"), Some("52000"));
+        assert_eq!(v.field("attachAlgoOrds[0].slTriggerPxType"), Some("last"));
+        // A short mirrors it.
+        let short = ManualSpec::Market {
+            dir: Dir::Short,
+            qty: d("1"),
+        };
+        let v = intent(
+            &okx_swap_table(),
+            "BTC-USDT-SWAP",
+            &short,
+            with_protect(c, &p),
+        )
+        .unwrap()
+        .preview();
+        assert_eq!(v.field("attachAlgoOrds[0].slTriggerPx"), Some("51000"));
+        assert_eq!(v.field("attachAlgoOrds[0].tpTriggerPx"), Some("48000"));
+        // A limit entry measures from its own price.
+        let limit = ManualSpec::Limit {
+            dir: Dir::Long,
+            qty: d("1"),
+            price: d("49000"),
+        };
+        let only_stop = spec_of(Some(Offset::Distance(d("1000"))), &[]);
+        let v = intent(
+            &okx_swap_table(),
+            "BTC-USDT-SWAP",
+            &limit,
+            with_protect(c, &only_stop),
+        )
+        .unwrap()
+        .preview();
+        assert_eq!(v.field("attachAlgoOrds[0].slTriggerPx"), Some("48000"));
+        assert_eq!(v.field("attachAlgoOrds[0].tpTriggerPx"), None);
+        // A spot buy may carry it too.
+        assert!(
+            intent(
+                &okx_spot_table(),
+                "BTC-USDT",
+                &limit,
+                with_protect(c, &only_stop)
+            )
+            .unwrap()
+            .preview()
+            .field("attachAlgoOrds[0].slTriggerPx")
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn no_protection_or_an_empty_spec_attaches_nothing() {
+        let c = ctx(Some(PositionMode::OneWay), Some("50000"));
+        let market = ManualSpec::Market {
+            dir: Dir::Long,
+            qty: d("1"),
+        };
+        let none = intent(&okx_swap_table(), "BTC-USDT-SWAP", &market, c).unwrap();
+        let empty = ProtectSpec::default();
+        let with_empty = intent(
+            &okx_swap_table(),
+            "BTC-USDT-SWAP",
+            &market,
+            with_protect(c, &empty),
+        )
+        .unwrap();
+        for i in [none, with_empty] {
+            assert!(
+                i.preview()
+                    .fields
+                    .iter()
+                    .all(|f| !f.name.starts_with("attachAlgoOrds")),
+                "{:?}",
+                i.preview().fields
+            );
+        }
+    }
+
+    #[test]
+    fn okx_refuses_what_an_entry_cannot_carry_and_never_sends_it_bare() {
+        let c = ctx(Some(PositionMode::OneWay), Some("50000"));
+        let market = ManualSpec::Market {
+            dir: Dir::Long,
+            qty: d("1"),
+        };
+        let build = |p: &ProtectSpec| {
+            intent(
+                &okx_swap_table(),
+                "BTC-USDT-SWAP",
+                &market,
+                with_protect(c, p),
+            )
+        };
+        // Two targets, and a trailing stop, do not fit one attached group.
+        let two = spec_of(None, &[(pct("1"), 50), (pct("2"), 50)]);
+        assert_eq!(build(&two).unwrap_err(), TradeError::ProtectionNotPossible);
+        let trailing = ProtectSpec {
+            trailing: Some(TrailingSpec {
+                callback_pct: d("1"),
+                activation: None,
+            }),
+            ..ProtectSpec::default()
+        };
+        assert_eq!(
+            build(&trailing).unwrap_err(),
+            TradeError::ProtectionNotPossible
+        );
+        // A stop distance at or above the price cannot be applied.
+        let wide = spec_of(Some(Offset::Distance(d("50000"))), &[]);
+        assert_eq!(build(&wide).unwrap_err(), TradeError::ProtectionNotPossible);
+        // A market entry without a reference price cannot work out the triggers.
+        let ok = spec_of(Some(pct("1")), &[]);
+        let no_ref = ctx(Some(PositionMode::OneWay), None);
+        assert!(
+            intent(
+                &okx_swap_table(),
+                "BTC-USDT-SWAP",
+                &market,
+                with_protect(no_ref, &ok)
+            )
+            .is_err()
+        );
+        // A spot short is not an entry at all.
+        let short = ManualSpec::Limit {
+            dir: Dir::Short,
+            qty: d("1"),
+            price: d("50000"),
+        };
+        assert!(intent(&okx_spot_table(), "BTC-USDT", &short, with_protect(c, &ok)).is_err());
+    }
+
+    #[test]
+    fn a_binance_entry_is_sent_unchanged_whatever_the_protection() {
+        let c = ctx(Some(PositionMode::OneWay), Some("50000"));
+        let market = ManualSpec::Market {
+            dir: Dir::Long,
+            qty: d("0.01"),
+        };
+        let p = spec_of(Some(pct("2")), &[(pct("4"), 100)]);
+        let plain = intent(&futures(), "BTCUSDT", &market, c).unwrap().preview();
+        let with = intent(&futures(), "BTCUSDT", &market, with_protect(c, &p))
+            .unwrap()
+            .preview();
+        let names = |v: &super::super::preview::OrderPreview| {
+            v.fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&plain), names(&with));
+    }
+
+    #[test]
+    fn entry_protection_works_out_the_prices_from_the_base() {
+        let t = futures();
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let p = spec_of(Some(pct("2")), &[(pct("4"), 100)]);
+        let plan = entry_protection(fresh.rules(), Dir::Long, &d("50000"), &d("0.01"), &p).unwrap();
+        assert_eq!(plan.stop, Some(d("49000")));
+        assert_eq!(plan.targets[0].trigger, d("52000"));
+        // A leg above the market lot maximum (120) is refused now, as it would be after the
+        // fill; the same split under the maximum passes. Only Binance futures sizes legs.
+        let split = spec_of(None, &[(pct("1"), 40), (pct("2"), 60)]);
+        let at =
+            |qty: &str| entry_protection(fresh.rules(), Dir::Long, &d("50000"), &d(qty), &split);
+        assert_eq!(at("300").unwrap_err(), TradeError::ProtectionNotPossible);
+        assert!(at("200").is_ok());
+        let trailing = ProtectSpec {
+            trailing: Some(TrailingSpec {
+                callback_pct: d("1"),
+                activation: None,
+            }),
+            ..ProtectSpec::default()
+        };
+        assert!(
+            entry_protection(fresh.rules(), Dir::Long, &d("50000"), &d("130"), &trailing).is_err()
+        );
+        let wide = spec_of(Some(Offset::Distance(d("50000"))), &[]);
+        assert_eq!(
+            entry_protection(fresh.rules(), Dir::Long, &d("50000"), &d("0.01"), &wide).unwrap_err(),
+            TradeError::ProtectionNotPossible
         );
     }
 

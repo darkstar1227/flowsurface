@@ -12,7 +12,9 @@
 //! Attaching automatically needs its own switch, and a Live account needs a second one.
 
 use exchange::account::{AccountEnv, AccountVenue, PositionMode};
-use exchange::trade::{Decimal, MAX_TARGETS, Offset, ProtectSpec, TargetSpec};
+use exchange::trade::{
+    Decimal, MAX_TARGETS, Offset, ProtectSpec, TargetSpec, TrailingSpec, TriggerBasis,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -84,6 +86,9 @@ pub enum ProtectError {
     MultipleTargetsNotOnOkx,
     /// A trailing stop on a hedge or OKX account.
     TrailingNotAvailable,
+    /// Something was set but the checked spec came out empty: refused, never attached as
+    /// nothing.
+    Dropped,
 }
 
 impl std::fmt::Display for ProtectError {
@@ -102,6 +107,7 @@ impl std::fmt::Display for ProtectError {
             ProtectError::TrailingNotAvailable => {
                 f.write_str("trailing stop is not available on this account")
             }
+            ProtectError::Dropped => f.write_str("the protection settings were not kept"),
         }
     }
 }
@@ -168,21 +174,30 @@ impl ProtectDefaults {
                 return Err(ProtectError::MultipleTargetsNeedOneWay);
             }
         }
-        if let Some(t) = &self.trailing {
-            if venue == AccountVenue::Okx || mode == PositionMode::Hedge {
-                return Err(ProtectError::TrailingNotAvailable);
+        let trailing = match &self.trailing {
+            None => None,
+            Some(t) => {
+                if venue == AccountVenue::Okx || mode == PositionMode::Hedge {
+                    return Err(ProtectError::TrailingNotAvailable);
+                }
+                let cb = parse(&t.callback_pct, "trailing callback")?;
+                let lo = Decimal::parse(MIN_CALLBACK_PCT)
+                    .map_err(|_| ProtectError::BadAmount("trailing callback"))?;
+                if cb.checked_cmp(&lo) == Ok(Ordering::Less) {
+                    return Err(ProtectError::BadAmount("trailing callback"));
+                }
+                within(cb, MAX_CALLBACK_PCT, "trailing callback")?;
+                let activation = t
+                    .activation
+                    .as_ref()
+                    .map(|a| a.to_offset("trailing activation", MAX_TARGET_PCT))
+                    .transpose()?;
+                Some(TrailingSpec {
+                    callback_pct: cb,
+                    activation,
+                })
             }
-            let cb = parse(&t.callback_pct, "trailing callback")?;
-            let lo = Decimal::parse(MIN_CALLBACK_PCT)
-                .map_err(|_| ProtectError::BadAmount("trailing callback"))?;
-            if cb.checked_cmp(&lo) == Ok(Ordering::Less) {
-                return Err(ProtectError::BadAmount("trailing callback"));
-            }
-            within(cb, MAX_CALLBACK_PCT, "trailing callback")?;
-            if let Some(a) = &t.activation {
-                a.to_offset("trailing activation", MAX_TARGET_PCT)?;
-            }
-        }
+        };
         let stop = self
             .stop_loss
             .as_ref()
@@ -206,7 +221,20 @@ impl ProtectDefaults {
         if !targets.is_empty() && shares != 100 {
             return Err(ProtectError::SharesNotHundred);
         }
-        Ok(ProtectSpec { stop, targets })
+        let spec = ProtectSpec {
+            stop,
+            targets,
+            trailing,
+            trigger_price: match self.trigger_price {
+                TriggerPriceType::Last => TriggerBasis::Last,
+                TriggerPriceType::Mark => TriggerBasis::Mark,
+            },
+        };
+        // What was set must still be there: a trailing-only setting is not "nothing".
+        if self.is_empty() != spec.is_empty() {
+            return Err(ProtectError::Dropped);
+        }
+        Ok(spec)
     }
 
     /// Whether an entry fill on an account in `env` may attach the defaults by itself: the
@@ -409,5 +437,60 @@ mod tests {
         assert_eq!(spec.stop, Some(Offset::Percent(d("1.5"))));
         assert_eq!(spec.targets[0].offset, Offset::Distance(d("10")));
         assert_eq!(spec.targets[1].share_pct, 40);
+    }
+
+    #[test]
+    fn the_spec_keeps_trailing_and_the_trigger_price() {
+        let trail = |activation: Option<ProtectOffset>| ProtectDefaults {
+            trailing: Some(TrailingDefault {
+                callback_pct: " 1.5 ".into(),
+                activation,
+            }),
+            trigger_price: TriggerPriceType::Mark,
+            ..Default::default()
+        };
+        let b = AccountVenue::Binance;
+        let d = |s: &str| Decimal::parse(s).expect("decimal");
+        // Only a trailing stop: the spec is not empty, and says what it is.
+        let spec = trail(Some(pct("2"))).spec(b, ONE_WAY).expect("spec");
+        assert!(!spec.is_empty());
+        assert!(spec.stop.is_none() && spec.targets.is_empty());
+        let t = spec.trailing.expect("trailing");
+        assert_eq!(t.callback_pct, d("1.5"));
+        assert_eq!(t.activation, Some(Offset::Percent(d("2"))));
+        assert_eq!(spec.trigger_price, TriggerBasis::Mark);
+        // The trigger price alone is not something to attach.
+        let only_basis = ProtectDefaults {
+            trigger_price: TriggerPriceType::Mark,
+            ..Default::default()
+        };
+        let spec = only_basis.spec(b, ONE_WAY).expect("spec");
+        assert!(spec.is_empty() && only_basis.is_empty());
+        assert_eq!(spec.trigger_price, TriggerBasis::Mark);
+        // A bad activation is refused, not dropped.
+        assert!(trail(Some(pct("0"))).spec(b, ONE_WAY).is_err());
+    }
+
+    /// The two `is_empty` answers agree for every combination of the three parts.
+    #[test]
+    fn both_is_empty_answers_agree() {
+        let b = AccountVenue::Binance;
+        for stop in [false, true] {
+            for tp in [false, true] {
+                for trail in [false, true] {
+                    let p = ProtectDefaults {
+                        stop_loss: stop.then(|| pct("1")),
+                        take_profits: if tp { vec![leg("2", 100)] } else { vec![] },
+                        trailing: trail.then(|| TrailingDefault {
+                            callback_pct: "1".into(),
+                            activation: None,
+                        }),
+                        ..Default::default()
+                    };
+                    let spec = p.spec(b, ONE_WAY).expect("spec");
+                    assert_eq!(p.is_empty(), spec.is_empty(), "{stop} {tp} {trail}");
+                }
+            }
+        }
     }
 }
