@@ -5,17 +5,21 @@
 
 use crate::{
     style,
+    trading::{self, TradingState},
     widget::{BannerKind, banner},
 };
 use data::config::exchange_accounts::{
     AccountMeta, StoreError, check_key_not_bound, delete_credentials, load_credentials,
     save_credentials,
 };
+use data::config::risk::{AccountRiskSettings, RiskSettingsError};
 use exchange::account::{
     AccountEnv, AccountProduct, AccountVenue, ApiCredentials, CheckReport, PositionMode, Verdict,
     check_account, is_usable,
 };
 use exchange::signed_http::SignedHttp;
+use exchange::trade::stream::StreamCloser;
+use std::time::Duration;
 
 use iced::{
     Element, Task, Theme,
@@ -33,7 +37,19 @@ pub enum Action {
     Tested(Box<AccountMeta>, Option<Box<CheckReport>>),
     /// An account was deleted: its session verdict is void and the list must be persisted.
     Removed(Uuid),
+    /// Every account's test could not start (no usable signed client): all verdicts are void.
+    Voided(Vec<AccountMeta>),
+    /// The account's stream was closed for a delete that then failed at the Keychain: the
+    /// stream and the session verdict are gone, the account stays listed and must be tested
+    /// again.
+    DeleteFailed(Uuid),
+    /// New risk settings were saved for the account (already validated by `limits()`): the
+    /// tracker takes them and the list must be persisted.
+    RiskSaved(Uuid, Box<AccountRiskSettings>),
 }
+
+/// Looks up the closer of an account's running private stream.
+pub type CloserFor<'a> = &'a dyn Fn(Uuid) -> Option<StreamCloser>;
 
 /// Text typed into a secret field. Debug is masked: with the `debug` feature iced prints
 /// every `Message` with `{:?}`.
@@ -75,7 +91,12 @@ pub enum Message {
     Save,
     Saved(SaveOutcome),
     Test(Uuid),
+    TestAll,
     Tested(Uuid, TestOutcome),
+    RiskEdit(Uuid),
+    RiskInput(Uuid, RiskField, String),
+    RiskSave(Uuid),
+    RiskCancel(Uuid),
     Delete(Uuid),
     ConfirmDelete(Uuid),
     Deleted(Uuid, Result<(), String>),
@@ -131,6 +152,103 @@ struct Row {
     status: Status,
     delete_error: Option<String>,
     deleting: bool,
+    /// The risk editor, open while the user edits this account's limits.
+    risk_form: Option<RiskForm>,
+}
+
+/// One text field of the risk editor per saved setting (amounts are decimal strings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskField {
+    MaxOrder,
+    MaxSymbol,
+    DailyLoss,
+    DrawdownBps,
+    ConfirmObservations,
+    EquityAgeSecs,
+    DayOffsetMinutes,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RiskForm {
+    max_order: String,
+    max_symbol: String,
+    daily_loss: String,
+    drawdown_bps: String,
+    confirm_observations: String,
+    equity_age_secs: String,
+    day_offset_minutes: String,
+    error: Option<String>,
+}
+
+impl RiskForm {
+    fn from_settings(r: &AccountRiskSettings) -> Self {
+        Self {
+            max_order: r.max_order_notional.clone().unwrap_or_default(),
+            max_symbol: r.max_symbol_notional.clone().unwrap_or_default(),
+            daily_loss: r.daily_loss_limit.clone().unwrap_or_default(),
+            drawdown_bps: r.drawdown_bps.map(|b| b.to_string()).unwrap_or_default(),
+            confirm_observations: r.confirm_observations.to_string(),
+            equity_age_secs: r.max_equity_age_secs.to_string(),
+            day_offset_minutes: r.day_utc_offset_minutes.to_string(),
+            error: None,
+        }
+    }
+
+    fn field_mut(&mut self, f: RiskField) -> &mut String {
+        match f {
+            RiskField::MaxOrder => &mut self.max_order,
+            RiskField::MaxSymbol => &mut self.max_symbol,
+            RiskField::DailyLoss => &mut self.daily_loss,
+            RiskField::DrawdownBps => &mut self.drawdown_bps,
+            RiskField::ConfirmObservations => &mut self.confirm_observations,
+            RiskField::EquityAgeSecs => &mut self.equity_age_secs,
+            RiskField::DayOffsetMinutes => &mut self.day_offset_minutes,
+        }
+    }
+
+    /// The settings the form describes on top of `base` (which keeps what the form does not
+    /// show: the custom drawdown start and the automatic-close switch). An empty amount is "no
+    /// limit"; anything that is not a valid value is an error, never a default. The result is
+    /// checked with `limits()`, the same check the tracker is built with.
+    fn parse(&self, base: &AccountRiskSettings) -> Result<AccountRiskSettings, String> {
+        fn amount(v: &str) -> Option<String> {
+            let v = v.trim();
+            (!v.is_empty()).then(|| v.to_string())
+        }
+        fn whole<T: std::str::FromStr>(v: &str, what: &str) -> Result<T, String> {
+            v.trim()
+                .parse()
+                .map_err(|_| format!("{what} must be a whole number"))
+        }
+        let drawdown_bps = match self.drawdown_bps.trim() {
+            "" => None,
+            v => Some(whole::<u32>(v, "Drawdown (basis points)")?),
+        };
+        let settings = AccountRiskSettings {
+            max_order_notional: amount(&self.max_order),
+            max_symbol_notional: amount(&self.max_symbol),
+            daily_loss_limit: amount(&self.daily_loss),
+            drawdown_bps,
+            confirm_observations: whole(&self.confirm_observations, "Confirm readings")?,
+            max_equity_age_secs: whole(&self.equity_age_secs, "Equity max age (seconds)")?,
+            day_utc_offset_minutes: whole(&self.day_offset_minutes, "Day offset (minutes)")?,
+            ..base.clone()
+        };
+        settings.limits().map_err(describe_risk_error)?;
+        Ok(settings)
+    }
+}
+
+fn describe_risk_error(e: RiskSettingsError) -> String {
+    match e {
+        RiskSettingsError::BadAmount(name) => {
+            format!("{name} must be a positive decimal number (or empty for no limit)")
+        }
+        RiskSettingsError::BadDrawdown => "Drawdown must be 1 to 10000 basis points".into(),
+        RiskSettingsError::BadConfirmCount => "Confirm readings must be 1 to 100".into(),
+        RiskSettingsError::BadEquityAge => "Equity max age must be 10 to 3600 seconds".into(),
+        RiskSettingsError::BadDayOffset => "Day offset must be within 14 hours of UTC".into(),
+    }
 }
 
 #[derive(Debug)]
@@ -154,6 +272,7 @@ impl ExchangeAccounts {
                     status: Status::NotTested,
                     delete_error: None,
                     deleting: false,
+                    risk_form: None,
                 })
                 .collect(),
             form: Form::default(),
@@ -180,6 +299,7 @@ impl ExchangeAccounts {
         &mut self,
         message: Message,
         signed: &Result<SignedHttp, String>,
+        closer_for: CloserFor<'_>,
     ) -> (Task<Message>, Option<Action>) {
         match message {
             Message::GoBack => {
@@ -230,6 +350,7 @@ impl ExchangeAccounts {
                             status: Status::NotTested,
                             delete_error: None,
                             deleting: false,
+                            risk_form: None,
                         });
                         self.error = None;
                         return (Task::none(), Some(Action::Persist));
@@ -238,6 +359,45 @@ impl ExchangeAccounts {
                 }
             }
             Message::Test(id) => return self.start_test(id, signed),
+            Message::TestAll => return self.start_test_all(signed),
+            Message::RiskEdit(id) => {
+                if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) {
+                    row.risk_form = Some(RiskForm::from_settings(&row.meta.risk));
+                }
+            }
+            Message::RiskInput(id, field, value) => {
+                if let Some(form) = self
+                    .rows
+                    .iter_mut()
+                    .find(|r| r.meta.id == id)
+                    .and_then(|r| r.risk_form.as_mut())
+                {
+                    *form.field_mut(field) = value;
+                    form.error = None;
+                }
+            }
+            Message::RiskCancel(id) => {
+                if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) {
+                    row.risk_form = None;
+                }
+            }
+            Message::RiskSave(id) => {
+                if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id)
+                    && let Some(form) = row.risk_form.as_mut()
+                {
+                    match form.parse(&row.meta.risk) {
+                        Ok(settings) => {
+                            row.meta.risk = settings.clone();
+                            row.risk_form = None;
+                            return (
+                                Task::none(),
+                                Some(Action::RiskSaved(id, Box::new(settings))),
+                            );
+                        }
+                        Err(e) => form.error = Some(e),
+                    }
+                }
+            }
             Message::Tested(id, outcome) => {
                 if let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) {
                     let meta = Box::new(row.meta.clone());
@@ -263,7 +423,10 @@ impl ExchangeAccounts {
                     }
                     row.deleting = true;
                     row.delete_error = None;
-                    return (delete_task(row.meta.clone()), None);
+                    return (
+                        delete_task(row.meta.clone(), closer_for(id), trading::SHUTDOWN_TIMEOUT),
+                        None,
+                    );
                 }
             }
             Message::Deleted(id, outcome) => {
@@ -276,6 +439,9 @@ impl ExchangeAccounts {
                         Err(e) => {
                             self.rows[pos].deleting = false;
                             self.rows[pos].delete_error = Some(e);
+                            // The stream was closed before the Keychain was touched: it is
+                            // gone, so the account needs a new test.
+                            return (Task::none(), Some(Action::DeleteFailed(id)));
                         }
                     }
                 }
@@ -374,10 +540,42 @@ impl ExchangeAccounts {
         (task, None)
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
+    /// Test every account that is not being tested. Each one is an ordinary test (its own
+    /// Keychain read); when no signed client exists, none can run and all verdicts are void.
+    fn start_test_all(
+        &mut self,
+        signed: &Result<SignedHttp, String>,
+    ) -> (Task<Message>, Option<Action>) {
+        if let Err(e) = signed {
+            let mut voided = Vec::new();
+            for row in &mut self.rows {
+                if !matches!(row.status, Status::Testing) {
+                    row.status = Status::Failed(e.clone());
+                    voided.push(row.meta.clone());
+                }
+            }
+            return (Task::none(), Some(Action::Voided(voided)));
+        }
+        let ids: Vec<Uuid> = self.rows.iter().map(|r| r.meta.id).collect();
+        let tasks: Vec<_> = ids
+            .into_iter()
+            .map(|id| self.start_test(id, signed).0)
+            .collect();
+        (Task::batch(tasks), None)
+    }
+
+    pub fn view<'a>(&'a self, trading: &'a TradingState) -> Element<'a, Message> {
         let header = row![
             button(style::icon_text(style::Icon::Return, 11)).on_press(Message::GoBack),
             text("Exchange accounts").size(style::text_size::SECTION),
+            button(text("Test all")).on_press_maybe(
+                (!self.rows.is_empty()
+                    && !self
+                        .rows
+                        .iter()
+                        .any(|r| matches!(r.status, Status::Testing)))
+                .then_some(Message::TestAll)
+            ),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
@@ -388,7 +586,7 @@ impl ExchangeAccounts {
             content = content.push(text("No accounts yet.").size(style::text_size::SMALL));
         }
         for r in &self.rows {
-            content = content.push(self.view_row(r));
+            content = content.push(self.view_row(r, trading));
         }
         content = content.push(self.view_form());
 
@@ -403,7 +601,7 @@ impl ExchangeAccounts {
             .into()
     }
 
-    fn view_row<'a>(&'a self, r: &'a Row) -> Element<'a, Message> {
+    fn view_row<'a>(&'a self, r: &'a Row, trading: &'a TradingState) -> Element<'a, Message> {
         let meta = &r.meta;
         let venue_label = match meta.venue {
             AccountVenue::Binance => format!("{} {}", meta.venue, meta.product),
@@ -464,6 +662,16 @@ impl ExchangeAccounts {
                 }
             }
         }
+        if meta.venue == AccountVenue::Binance && meta.product == AccountProduct::Spot {
+            col = col.push(banner(
+                "Spot trading is disabled (not verified on the testnet yet).",
+                BannerKind::Warning,
+            ));
+        }
+        if let Some(line) = trading.account_line(meta.id) {
+            col = col.push(text(line).size(style::text_size::SMALL));
+        }
+        col = col.push(self.view_risk(r));
         if let Some(e) = &r.delete_error {
             col = col.push(banner(e.as_str(), BannerKind::Error));
         }
@@ -472,6 +680,93 @@ impl ExchangeAccounts {
             .padding(8)
             .style(style::modal_container)
             .into()
+    }
+
+    /// The risk limits of one account: a summary, and the editor while it is open. Automatic
+    /// close is shown, not switchable (it stays off until Live sending is opened).
+    fn view_risk<'a>(&'a self, r: &'a Row) -> Element<'a, Message> {
+        let id = r.meta.id;
+        let mut col = column![].spacing(4);
+        let limits = &r.meta.risk;
+        if limits.max_order_notional.is_none()
+            && limits.max_symbol_notional.is_none()
+            && limits.daily_loss_limit.is_none()
+            && limits.drawdown_bps.is_none()
+        {
+            col = col.push(banner("No risk limits set.", BannerKind::Warning));
+        }
+        col = col.push(
+            text(if limits.auto_close {
+                "Automatic close: on in the saved settings, but not active in this version"
+            } else {
+                "Automatic close: off"
+            })
+            .size(style::text_size::SMALL),
+        );
+        let Some(form) = &r.risk_form else {
+            return col
+                .push(button(text("Edit risk limits")).on_press(Message::RiskEdit(id)))
+                .into();
+        };
+        let input = |label: &'static str, value: &'a str, field: RiskField| {
+            row![
+                text(label).size(style::text_size::SMALL).width(150),
+                text_input("", value).on_input(move |s| Message::RiskInput(id, field, s)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+        };
+        col = col
+            .push(input(
+                "Max order value",
+                &form.max_order,
+                RiskField::MaxOrder,
+            ))
+            .push(input(
+                "Max value per symbol",
+                &form.max_symbol,
+                RiskField::MaxSymbol,
+            ))
+            .push(input(
+                "Daily loss limit",
+                &form.daily_loss,
+                RiskField::DailyLoss,
+            ))
+            .push(input(
+                "Drawdown (basis points)",
+                &form.drawdown_bps,
+                RiskField::DrawdownBps,
+            ))
+            .push(input(
+                "Confirm readings",
+                &form.confirm_observations,
+                RiskField::ConfirmObservations,
+            ))
+            .push(input(
+                "Equity max age (s)",
+                &form.equity_age_secs,
+                RiskField::EquityAgeSecs,
+            ))
+            .push(input(
+                "Day offset from UTC (min)",
+                &form.day_offset_minutes,
+                RiskField::DayOffsetMinutes,
+            ))
+            .push(
+                text("Empty amount = no limit. Limits are in the account's quote currency.")
+                    .size(style::text_size::SMALL),
+            );
+        if let Some(e) = &form.error {
+            col = col.push(banner(e.as_str(), BannerKind::Error));
+        }
+        col.push(
+            row![
+                button(text("Save limits")).on_press(Message::RiskSave(id)),
+                button(text("Cancel")).on_press(Message::RiskCancel(id)),
+            ]
+            .spacing(8),
+        )
+        .into()
     }
 
     fn view_form(&self) -> Element<'_, Message> {
@@ -571,21 +866,42 @@ fn save_task(meta: AccountMeta, creds: ApiCredentials, others: Vec<AccountMeta>)
     )
 }
 
-fn delete_task(meta: AccountMeta) -> Task<Message> {
+/// Close the account's private stream first, then delete the Keychain item (the listenKey
+/// DELETE is signed with that item). The wait for the stream is bounded; the delete goes on
+/// either way.
+fn delete_task(meta: AccountMeta, closer: Option<StreamCloser>, limit: Duration) -> Task<Message> {
     let id = meta.id;
     Task::perform(
         async move {
-            let job = tokio::task::spawn_blocking(move || {
+            let close = closer.map(|c| async move { c.shutdown().await });
+            delete_after_close(close, limit, move || {
                 delete_credentials(&meta).map_err(|e| {
                     log::warn!("Deleting exchange credentials failed: {e}");
                     format!("Delete failed: {e}")
                 })
-            });
-            job.await
-                .unwrap_or_else(|_| Err("Keychain access did not complete".to_string()))
+            })
+            .await
         },
         move |outcome| Message::Deleted(id, outcome),
     )
+}
+
+async fn delete_after_close<F>(
+    close: Option<F>,
+    limit: Duration,
+    delete: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String>
+where
+    F: std::future::Future<Output = ()>,
+{
+    if let Some(close) = close
+        && !trading::close_within(limit, close).await
+    {
+        log::warn!("Private stream did not close in time; deleting the credentials anyway");
+    }
+    tokio::task::spawn_blocking(delete)
+        .await
+        .unwrap_or_else(|_| Err("Keychain access did not complete".to_string()))
 }
 
 fn describe_store_error(e: &StoreError) -> String {
@@ -644,6 +960,10 @@ mod tests {
     const FAKE_SECRET: &str = "fake-secret-BBBB2222";
     const FAKE_PASS: &str = "fake-pass-CCCC3333";
 
+    fn no_closer(_: Uuid) -> Option<StreamCloser> {
+        None
+    }
+
     #[test]
     fn debug_output_hides_secret_input() {
         let msgs = [
@@ -673,7 +993,7 @@ mod tests {
         modal.form.key = FAKE_KEY.into();
         modal.form.secret = FAKE_SECRET.into();
         modal.form.passphrase = FAKE_PASS.into();
-        let (_, action) = modal.update(Message::Save, &Err("unused".into()));
+        let (_, action) = modal.update(Message::Save, &Err("unused".into()), &no_closer);
         assert!(action.is_none());
         assert!(modal.error.is_some());
         assert!(modal.form.key.is_empty());
@@ -695,8 +1015,16 @@ mod tests {
     fn key_input_replaces_previous_text() {
         let mut modal = ExchangeAccounts::new(&data::ExchangeAccounts::default());
         let unused = Err("unused".to_string());
-        let _ = modal.update(Message::SecretChanged(Redacted("ab".into())), &unused);
-        let _ = modal.update(Message::SecretChanged(Redacted("abc".into())), &unused);
+        let _ = modal.update(
+            Message::SecretChanged(Redacted("ab".into())),
+            &unused,
+            &no_closer,
+        );
+        let _ = modal.update(
+            Message::SecretChanged(Redacted("abc".into())),
+            &unused,
+            &no_closer,
+        );
         assert_eq!(modal.form.secret, "abc");
     }
 
@@ -735,6 +1063,7 @@ mod tests {
         let (_, action) = modal.update(
             Message::Tested(meta.id, Ok(Box::new(report.clone()))),
             &unused,
+            &no_closer,
         );
         match action {
             Some(Action::Tested(m, Some(r))) => {
@@ -744,7 +1073,11 @@ mod tests {
             _ => panic!("expected a recorded verdict"),
         }
         // A failed test voids the verdict.
-        let (_, action) = modal.update(Message::Tested(meta.id, Err("x".into())), &unused);
+        let (_, action) = modal.update(
+            Message::Tested(meta.id, Err("x".into())),
+            &unused,
+            &no_closer,
+        );
         assert!(matches!(action, Some(Action::Tested(_, None))));
     }
 
@@ -752,14 +1085,18 @@ mod tests {
     fn a_test_that_cannot_start_voids_the_verdict() {
         let (mut modal, meta) = modal_with_account();
         // No usable signed client (for example the proxy changed): nothing was tested.
-        let (_, action) = modal.update(Message::Test(meta.id), &Err("proxy".into()));
+        let (_, action) = modal.update(Message::Test(meta.id), &Err("proxy".into()), &no_closer);
         assert!(matches!(action, Some(Action::Tested(_, None))));
     }
 
     #[test]
     fn deleting_an_account_reports_its_id_so_the_session_can_drop_it() {
         let (mut modal, meta) = modal_with_account();
-        let (_, action) = modal.update(Message::Deleted(meta.id, Ok(())), &Err("x".into()));
+        let (_, action) = modal.update(
+            Message::Deleted(meta.id, Ok(())),
+            &Err("x".into()),
+            &no_closer,
+        );
         assert!(matches!(action, Some(Action::Removed(id)) if id == meta.id));
         assert!(modal.rows.is_empty());
     }
@@ -778,5 +1115,169 @@ mod tests {
         modal.form.passphrase = "p".into();
         let (meta, _) = modal.prepare_save().unwrap();
         assert_eq!(meta.product, AccountProduct::default());
+    }
+
+    #[test]
+    fn a_failed_delete_after_the_stream_was_closed_voids_the_account() {
+        let (mut modal, meta) = modal_with_account();
+        modal.rows[0].deleting = true;
+        let (_, action) = modal.update(
+            Message::Deleted(meta.id, Err("keychain".into())),
+            &Err("x".into()),
+            &no_closer,
+        );
+        assert!(matches!(action, Some(Action::DeleteFailed(id)) if id == meta.id));
+        // The account stays listed, with the error, and can be deleted again.
+        assert_eq!(modal.rows.len(), 1);
+        assert!(!modal.rows[0].deleting);
+        assert!(modal.rows[0].delete_error.is_some());
+    }
+
+    #[test]
+    fn test_all_with_no_usable_client_voids_every_account() {
+        let (mut modal, meta) = modal_with_account();
+        let (_, action) = modal.update(Message::TestAll, &Err("proxy".into()), &no_closer);
+        match action {
+            Some(Action::Voided(metas)) => {
+                assert_eq!(metas.len(), 1);
+                assert_eq!(metas[0].id, meta.id);
+            }
+            _ => panic!("expected every verdict to be void"),
+        }
+        assert!(matches!(modal.rows[0].status, Status::Failed(_)));
+    }
+
+    #[test]
+    fn test_all_with_a_client_starts_one_test_per_account_and_no_action() {
+        let (mut modal, _) = modal_with_account();
+        let signed =
+            SignedHttp::build(exchange::account::ProxyState::Direct).map_err(|e| e.to_string());
+        let (_, action) = modal.update(Message::TestAll, &signed, &no_closer);
+        assert!(action.is_none());
+        assert!(matches!(modal.rows[0].status, Status::Testing));
+    }
+
+    fn edit(modal: &mut ExchangeAccounts, id: Uuid, field: RiskField, value: &str) {
+        let _ = modal.update(
+            Message::RiskInput(id, field, value.into()),
+            &Err("x".into()),
+            &no_closer,
+        );
+    }
+
+    #[test]
+    fn valid_risk_limits_are_saved_on_top_of_what_the_form_does_not_show() {
+        let (mut modal, meta) = modal_with_account();
+        modal.rows[0].meta.risk.auto_close = true;
+        modal.rows[0].meta.risk.drawdown_start_ms = Some(5);
+        let _ = modal.update(Message::RiskEdit(meta.id), &Err("x".into()), &no_closer);
+        edit(&mut modal, meta.id, RiskField::MaxOrder, " 1000 ");
+        edit(&mut modal, meta.id, RiskField::DrawdownBps, "500");
+        let (_, action) = modal.update(Message::RiskSave(meta.id), &Err("x".into()), &no_closer);
+        let Some(Action::RiskSaved(id, settings)) = action else {
+            panic!("expected the settings to be saved");
+        };
+        assert_eq!(id, meta.id);
+        assert_eq!(settings.max_order_notional.as_deref(), Some("1000"));
+        assert_eq!(settings.drawdown_bps, Some(500));
+        assert!(settings.max_symbol_notional.is_none());
+        // Not shown in the form, so kept as saved.
+        assert!(settings.auto_close);
+        assert_eq!(settings.drawdown_start_ms, Some(5));
+        assert!(settings.limits().is_ok());
+        assert_eq!(modal.rows[0].meta.risk, *settings);
+        assert!(modal.rows[0].risk_form.is_none());
+    }
+
+    #[test]
+    fn invalid_risk_input_shows_an_error_and_saves_nothing() {
+        let bad: [(RiskField, &str); 7] = [
+            (RiskField::MaxOrder, "-5"),
+            (RiskField::MaxSymbol, "abc"),
+            (RiskField::DailyLoss, "0"),
+            (RiskField::DrawdownBps, "10001"),
+            (RiskField::ConfirmObservations, "0"),
+            (RiskField::EquityAgeSecs, "5"),
+            (RiskField::DayOffsetMinutes, "900"),
+        ];
+        for (field, value) in bad {
+            let (mut modal, meta) = modal_with_account();
+            let before = modal.rows[0].meta.risk.clone();
+            let _ = modal.update(Message::RiskEdit(meta.id), &Err("x".into()), &no_closer);
+            edit(&mut modal, meta.id, field, value);
+            let (_, action) =
+                modal.update(Message::RiskSave(meta.id), &Err("x".into()), &no_closer);
+            assert!(action.is_none(), "{field:?}={value} was accepted");
+            let form = modal.rows[0].risk_form.as_ref().expect("editor stays open");
+            assert!(form.error.is_some(), "{field:?}={value} gave no error");
+            assert_eq!(modal.rows[0].meta.risk, before);
+        }
+        // Not a number at all.
+        let (mut modal, meta) = modal_with_account();
+        let _ = modal.update(Message::RiskEdit(meta.id), &Err("x".into()), &no_closer);
+        edit(&mut modal, meta.id, RiskField::DrawdownBps, "ten");
+        let (_, action) = modal.update(Message::RiskSave(meta.id), &Err("x".into()), &no_closer);
+        assert!(action.is_none());
+        assert!(modal.rows[0].risk_form.as_ref().unwrap().error.is_some());
+    }
+
+    #[test]
+    fn the_risk_editor_starts_from_the_saved_values_and_cancel_discards_edits() {
+        let (mut modal, meta) = modal_with_account();
+        modal.rows[0].meta.risk.daily_loss_limit = Some("250".into());
+        let _ = modal.update(Message::RiskEdit(meta.id), &Err("x".into()), &no_closer);
+        assert_eq!(modal.rows[0].risk_form.as_ref().unwrap().daily_loss, "250");
+        edit(&mut modal, meta.id, RiskField::DailyLoss, "999");
+        let _ = modal.update(Message::RiskCancel(meta.id), &Err("x".into()), &no_closer);
+        assert!(modal.rows[0].risk_form.is_none());
+        assert_eq!(
+            modal.rows[0].meta.risk.daily_loss_limit.as_deref(),
+            Some("250")
+        );
+    }
+
+    #[test]
+    fn an_account_is_deleted_from_the_keychain_only_after_its_stream_was_closed() {
+        use std::sync::{Arc, Mutex};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        // A close that finishes: it is recorded before the delete.
+        let o = order.clone();
+        let o2 = order.clone();
+        let result = rt.block_on(delete_after_close(
+            Some(async move { o.lock().unwrap().push("closed") }),
+            Duration::from_secs(60),
+            move || {
+                o2.lock().unwrap().push("deleted");
+                Ok(())
+            },
+        ));
+        assert_eq!(result, Ok(()));
+        assert_eq!(*order.lock().unwrap(), ["closed", "deleted"]);
+
+        // A close that never finishes: the wait ends and the delete still runs.
+        order.lock().unwrap().clear();
+        let o3 = order.clone();
+        let result = rt.block_on(delete_after_close(
+            Some(std::future::pending::<()>()),
+            Duration::ZERO,
+            move || {
+                o3.lock().unwrap().push("deleted");
+                Ok(())
+            },
+        ));
+        assert_eq!(result, Ok(()));
+        assert_eq!(*order.lock().unwrap(), ["deleted"]);
+
+        // No stream: only the delete, and its error is passed on.
+        let result = rt.block_on(delete_after_close(
+            None::<std::future::Ready<()>>,
+            Duration::ZERO,
+            || Err("keychain".to_string()),
+        ));
+        assert_eq!(result, Err("keychain".to_string()));
     }
 }
