@@ -283,7 +283,15 @@ impl Machine {
         }
         match event {
             E::ListenKeyExpired | E::StreamTerminated => self.leg_down(0, DownCause::Expired),
-            E::ResyncRequired(_) => {
+            // A conditional (algo) order changed: the open-order list read earlier no longer
+            // matches, and protection is judged from it. Plain order events are left as they
+            // were (they would read the lists again for every fill). `start_resync` spaces
+            // reads and folds one that is already running into a repeat.
+            E::ResyncRequired(_)
+            | E::Order(super::events::OrderUpdate {
+                category: super::events::OrderCategory::Algo,
+                ..
+            }) => {
                 if self.legs.contains(&Leg::Down) {
                     // Everything is read again when the connections are back.
                     self.synced = false;
@@ -676,6 +684,40 @@ mod tests {
         );
         assert!(m.resync_done(true).is_empty());
         assert_eq!(m.state(), StreamState::Connected);
+    }
+
+    #[test]
+    fn an_algo_order_event_reads_the_lists_again_and_a_plain_one_does_not() {
+        use super::super::events::{OrderCategory, OrderStatus, OrderUpdate};
+        let update = |category| {
+            PrivateEvent::Order(OrderUpdate {
+                symbol: "BTCUSDT".into(),
+                client_id: None,
+                order_id: None,
+                category,
+                side: None,
+                status: OrderStatus::Finished,
+                price: None,
+                qty: None,
+                filled_qty: None,
+                reduce_only: None,
+                position_side: None,
+                time_ms: None,
+            })
+        };
+        let mut m = connected(1, false);
+        m.observe(T0 + Duration::from_secs(10));
+        assert!(m.on_event(&update(OrderCategory::Plain)).is_empty());
+        assert_eq!(m.state(), StreamState::Connected);
+        assert_eq!(
+            m.on_event(&update(OrderCategory::Algo)),
+            vec![Command::Resync {
+                after: Duration::ZERO
+            }]
+        );
+        assert_eq!(m.state(), StreamState::Resyncing);
+        // More algo events while the read runs are merged into one repeat.
+        assert!(m.on_event(&update(OrderCategory::Algo)).is_empty());
     }
 
     #[test]

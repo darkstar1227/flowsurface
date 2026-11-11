@@ -31,6 +31,20 @@ pub struct AccountMeta {
     /// Local risk limits and the automatic-close switch (off by default). Settings only; the
     /// equity peak and lock state are never saved.
     pub risk: super::risk::AccountRiskSettings,
+    /// Default protective orders, one set per account (off by default). Settings only; nothing
+    /// is sent from here.
+    /// A damaged or hand-edited value falls back to the defaults (everything off) instead of
+    /// failing the whole state, which would drop the account list.
+    #[serde(deserialize_with = "lenient_protect")]
+    pub protect: super::protect::ProtectDefaults,
+}
+
+fn lenient_protect<'de, D>(d: D) -> Result<super::protect::ProtectDefaults, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
 impl AccountMeta {
@@ -54,6 +68,7 @@ impl AccountMeta {
             },
             position_mode,
             risk: Default::default(),
+            protect: Default::default(),
         }
     }
 
@@ -348,6 +363,50 @@ mod tests {
         // The new field is settings only: no secret-looking content in the JSON.
         let json = serde_json::to_string(&m).expect("json");
         assert!(json.contains("\"auto_close\":false"));
+    }
+
+    #[test]
+    fn damaged_protect_settings_fall_back_to_off_and_keep_the_account() {
+        for bad in [
+            r#"{"share_pct":300}"#,
+            r#"{"take_profits":[{"offset":{"kind":"nope"},"share_pct":300}]}"#,
+            r#"{"stop_loss":7}"#,
+            r#""text""#,
+            "null",
+        ] {
+            let raw = format!(r#"{{"alias":"keep","protect":{bad}}}"#);
+            let m: AccountMeta = serde_json::from_str(&raw).expect("account still loads");
+            assert_eq!(m.alias, "keep");
+            assert_eq!(
+                m.protect,
+                crate::config::protect::ProtectDefaults::default()
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_saved_before_protect_defaults_loads_with_protection_off() {
+        let old = r#"{"id":"00000000-0000-0000-0000-00000000000a","alias":"a","venue":"Binance","env":"Testnet"}"#;
+        let m: AccountMeta = serde_json::from_str(old).expect("old account loads");
+        assert_eq!(
+            m.protect,
+            crate::config::protect::ProtectDefaults::default()
+        );
+        assert!(!m.protect.auto_attach && !m.protect.auto_attach_live);
+        // Settings survive a round trip inside the account.
+        let mut m = m;
+        m.protect.stop_loss = Some(crate::config::protect::ProtectOffset::Percent("2".into()));
+        m.protect.auto_attach = true;
+        let back: AccountMeta =
+            serde_json::from_str(&serde_json::to_string(&m).expect("json")).expect("back");
+        assert_eq!(back, m);
+        // `{}` for the field restores the defaults.
+        let empty = r#"{"id":"00000000-0000-0000-0000-00000000000a","alias":"a","protect":{}}"#;
+        let m: AccountMeta = serde_json::from_str(empty).expect("empty protect");
+        assert_eq!(
+            m.protect,
+            crate::config::protect::ProtectDefaults::default()
+        );
     }
 
     use super::*;
