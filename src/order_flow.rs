@@ -1134,26 +1134,39 @@ mod tests {
     /// after the user confirms (new client id, new token), never from the retry itself, and it
     /// makes no automatic order (so no grant).
     #[test]
-    fn the_retry_only_opens_the_review_and_sends_nothing_itself() {
+    fn the_stop_and_cancel_offers_only_open_the_review_and_send_nothing_themselves() {
         let main = include_str!("main.rs");
-        let start = main
-            .find("fn start_protection_retry(")
-            .expect("the retry function exists");
-        let rest = &main[start..];
-        // The body ends at the next method of the impl.
-        let end = rest.find("\n    /// ").expect("a doc comment follows");
-        let body = &rest[..end];
-        assert!(body.contains("self.start_review("), "{body}");
-        for banned in [
-            "order_flow::send(",
-            "confirm_order",
-            ".submit(",
-            "submit_auto(",
-            "AutoIntent::new(",
-            "auto_flow::mint(",
-            "AutoGrant",
+        // Each offer ends at the next method of the impl. Together they either open the review
+        // themselves or hand over to the one function that does.
+        for (name, opens) in [
+            ("fn start_protection_retry(", "self.open_stop_review("),
+            ("fn start_add_stop(", "self.open_stop_review("),
+            ("fn open_stop_review(", "self.start_review("),
+            ("fn start_stray_cancel(", "self.start_review("),
         ] {
-            assert!(!body.contains(banned), "the retry must not use {banned}");
+            let start = main.find(name).unwrap_or_else(|| panic!("{name} exists"));
+            let rest = &main[start..];
+            let end = rest.find("\n    /// ").expect("a doc comment follows");
+            let body = &rest[..end];
+            assert!(body.contains(opens), "{name} must use {opens}: {body}");
+            if name == "fn open_stop_review(" {
+                // The exchange's symbol is checked before it reaches `Ticker::new` (B2).
+                let check = body.find("valid_symbol(").expect("the symbol is checked");
+                assert!(check < body.find("self.quote_of(").expect("a quote is read"));
+            }
+            for banned in [
+                "order_flow::send(",
+                "confirm_order",
+                ".submit(",
+                "submit_auto(",
+                "AutoIntent::new(",
+                "auto_flow::mint(",
+                "AutoGrant",
+                "for_bulk(",
+                "BulkAction::CancelAll",
+            ] {
+                assert!(!body.contains(banned), "{name} must not use {banned}");
+            }
         }
     }
 }

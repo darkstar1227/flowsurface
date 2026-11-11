@@ -18,6 +18,8 @@ pub enum Notice {
     /// An entry's protection failed (a protective order was not placed, or an order could not
     /// be cancelled).
     ProtectionFailed,
+    /// A position has no stop-loss (found from the order and position lists, not from a failure).
+    BarePosition,
 }
 
 impl Notice {
@@ -26,6 +28,9 @@ impl Notice {
         match self {
             Notice::ProtectionFailed => {
                 "protection failed. Open the account panel in Flowsurface to see what to do."
+            }
+            Notice::BarePosition => {
+                "a position has no stop-loss. Open the account panel in Flowsurface to see what to do."
             }
         }
     }
@@ -209,14 +214,23 @@ mod tests {
 
     #[test]
     fn every_notice_has_a_fixed_text_without_a_placeholder() {
-        // One kind today; an exhaustive match makes a new kind add its row here.
+        // An exhaustive match makes a new kind add its row here.
         let all = |n: Notice| match n {
-            Notice::ProtectionFailed => n,
+            Notice::ProtectionFailed | Notice::BarePosition => n,
         };
-        let text = all(Notice::ProtectionFailed).text();
-        assert!(!text.is_empty());
-        assert!(text.is_ascii());
-        assert!(!text.contains('{') && !text.contains('%'));
+        for notice in [Notice::ProtectionFailed, Notice::BarePosition] {
+            let text = all(notice).text();
+            assert!(!text.is_empty());
+            assert!(text.is_ascii());
+            assert!(!text.contains('{') && !text.contains('%'));
+        }
+        // The bare-position text names no symbol, quantity or price: the alias is all that varies.
+        let args = osascript_args(Notice::BarePosition, "main");
+        assert_eq!(
+            args[6],
+            "Account main: a position has no stop-loss. Open the account panel in Flowsurface to \
+             see what to do."
+        );
     }
 
     #[test]

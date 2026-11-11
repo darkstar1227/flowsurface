@@ -206,6 +206,8 @@ enum Message {
     OrderSent(order_flow::SendSummary),
     /// The result of the orders sent by the app itself after an entry filled (M5 d3).
     AutoDone(Box<auto_flow::AutoSummary>),
+    /// A slow timer so the bare-position grace time runs out on a quiet account too.
+    AutoPoll,
     AccountPanel(modal::account_panel::Message),
     BulkConfirm(modal::bulk_confirm::Message),
     Account(account_flow::Event),
@@ -249,6 +251,7 @@ impl Flowsurface {
     /// Drops the pending preview and the confirmation (the ticket was left, or Escape).
     fn discard_order(&mut self) {
         self.order_confirm = None;
+        self.trading.clear_stray_marks();
         self.bulk_confirm = None;
         self.account_panel.reset_form();
         self.account_panel.finish_bulk_prepare();
@@ -309,6 +312,21 @@ impl Flowsurface {
             );
             return Task::none();
         };
+        // OKX: this build sends orders in cross margin. When the account holds the symbol in
+        // isolated margin the orders would not match the position: nothing is sent. A cancel has
+        // no margin mode and is never refused for this.
+        if !matches!(request.spec, exchange::trade::ManualSpec::Cancel { .. })
+            && self.trading.margin_conflict(meta.id, &request.symbol)
+        {
+            self.order_ticket.set_status(
+                "This position is held in isolated margin, but this app sends OKX orders in \
+                 cross margin, so the order would not match it. Nothing was sent. Change the \
+                 position on the exchange or use its own screen."
+                    .to_string(),
+                BannerKind::Error,
+            );
+            return Task::none();
+        }
         // `Ticker::new` asserts on odd text: never let typed text reach it unchecked.
         if !ticket::valid_symbol(&request.symbol) {
             self.order_ticket.set_status(
@@ -435,6 +453,7 @@ impl Flowsurface {
             C::DelayElapsed => Task::none(),
             C::Cancel => {
                 self.order_confirm = None;
+                self.trading.clear_stray_marks();
                 Task::none()
             }
             C::Confirm => self.confirm_order(),
@@ -464,7 +483,12 @@ impl Flowsurface {
             Action::BeginRelease(r) | Action::Release(_, r) | Action::Discard(_, r) => {
                 Some(r.account)
             }
-            Action::Bulk(_) | Action::AckTrip | Action::Retry(_) | Action::Handled(_) => None,
+            Action::Bulk(_)
+            | Action::AckTrip
+            | Action::Retry(_)
+            | Action::Handled(_)
+            | Action::AddStop(..)
+            | Action::CancelStray(_) => None,
         };
         if record_account
             .and_then(|key| self.meta_of_key(key))
@@ -481,6 +505,8 @@ impl Flowsurface {
             Action::Bulk(kind) => self.start_bulk(kind),
             Action::AckTrip => self.start_ack_trip(),
             Action::Retry(key) => self.start_protection_retry(&key),
+            Action::AddStop(symbol, dir) => self.start_add_stop(&symbol, dir),
+            Action::CancelStray(id) => self.start_stray_cancel(&id),
             Action::Handled(key) => {
                 self.handle_protection_failure(&key);
                 Task::none()
@@ -571,16 +597,70 @@ impl Flowsurface {
             );
             return Task::none();
         };
+        self.open_stop_review(&meta, failure.symbol, failure.dir)
+    }
+
+    /// "Add a stop-loss" on a bare position the lists show (d5): the same offer as the retry, for
+    /// a position found by the watch rather than named by a failed entry. The position is looked
+    /// up again here by value (symbol and direction), and the stop is built from the current
+    /// lists and price; nothing is sent before the confirmation.
+    fn start_add_stop(&mut self, symbol: &str, dir: exchange::trade::Dir) -> Task<Message> {
+        let Some(meta) = self.panel_account() else {
+            self.account_panel
+                .set_status("Pick an account.".to_string(), BannerKind::Error);
+            return Task::none();
+        };
+        if self.confirm_open() || self.order_ticket.is_preparing() {
+            self.account_panel.set_status(
+                "Another order is open or being prepared. Finish it first.".to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
+        if !self
+            .trading
+            .bare_rows(meta.id)
+            .iter()
+            .any(|r| r.symbol == symbol && r.dir == dir)
+        {
+            self.account_panel.set_status(
+                "That position no longer shows as unprotected. Nothing was changed.".to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
+        self.open_stop_review(&meta, symbol.to_string(), dir)
+    }
+
+    /// The shared part of the two stop offers: build a whole-position stop from the current
+    /// lists and price and open its review (a new preview, client id and confirmation token).
+    fn open_stop_review(
+        &mut self,
+        meta: &data::config::exchange_accounts::AccountMeta,
+        symbol: String,
+        dir: exchange::trade::Dir,
+    ) -> Task<Message> {
+        // The symbol comes from the exchange's position list: checked before it reaches
+        // `Ticker::new`, which panics on a long one.
+        if !modal::order_ticket::valid_symbol(&symbol) {
+            self.account_panel.set_status(
+                "The symbol of that position cannot be used for an order here. Nothing was \
+                 changed."
+                    .to_string(),
+                BannerKind::Error,
+            );
+            return Task::none();
+        }
         let mode = self.trade_session.get(meta.id).and_then(|e| e.actual_mode);
-        let held = self.trading.holdings(meta.id, &failure.symbol);
-        let quote = self.quote_of(&meta, &failure.symbol);
-        match protect_attach::retry_stop(&meta, mode, failure.dir, &held, quote) {
+        let held = self.trading.holdings(meta.id, &symbol);
+        let quote = self.quote_of(meta, &symbol);
+        match protect_attach::retry_stop(meta, mode, dir, &held, quote) {
             Ok(spec) => {
                 // `start_review` may refuse (it says why on the ticket): only claim a preview
                 // when one is really being prepared.
                 let task = self.start_review(order_flow::PrepareRequest {
                     account: meta.id,
-                    symbol: failure.symbol,
+                    symbol,
                     spec,
                     protect: None,
                 });
@@ -603,6 +683,63 @@ impl Flowsurface {
                 Task::none()
             }
         }
+    }
+
+    /// "Cancel" on an order with no position, or one that looks left over (d5): the cancel of
+    /// that one order goes through the ordinary review and confirmation (it is never the stop-loss
+    /// of a position still held: such an order is only shown, see `stray_orders`), never through "Cancel all", which would also cancel the stops of other
+    /// positions. The order is checked on fresh lists now and again when the user confirms.
+    fn start_stray_cancel(&mut self, order_id: &str) -> Task<Message> {
+        let Some(meta) = self.panel_account() else {
+            self.account_panel
+                .set_status("Pick an account.".to_string(), BannerKind::Error);
+            return Task::none();
+        };
+        if self.confirm_open() || self.order_ticket.is_preparing() {
+            self.account_panel.set_status(
+                "Another order is open or being prepared. Finish it first.".to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
+        let found = self
+            .trading
+            .open_orders(meta.id)
+            .iter()
+            .find(|o| o.id == order_id)
+            .map(|o| (o.symbol.clone(), o.kind.clone()));
+        let (Some((symbol, kind)), true) = (found, self.trading.is_stray(meta.id, order_id)) else {
+            self.account_panel.set_status(
+                "That order is no longer one to cancel, or the lists may be out of date. \
+                 Nothing was changed."
+                    .to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        };
+        let task = self.start_review(order_flow::PrepareRequest {
+            account: meta.id,
+            symbol,
+            spec: exchange::trade::ManualSpec::Cancel {
+                id: order_id.to_string(),
+                kind,
+            },
+            protect: None,
+        });
+        if self.order_ticket.is_preparing() {
+            self.trading.mark_stray_cancel(meta.id, order_id);
+            self.account_panel.set_status(
+                "Preparing the cancel. Check it in the confirmation window.".to_string(),
+                BannerKind::Normal,
+            );
+        } else {
+            self.account_panel.set_status(
+                "The cancel could not be prepared. See the order ticket for the reason."
+                    .to_string(),
+                BannerKind::Error,
+            );
+        }
+        task
     }
 
     /// "I've handled it", after its second click: the entry leaves the book, its symbol is no
@@ -658,6 +795,20 @@ impl Flowsurface {
                 .map(|m| m.alias.clone())
                 .unwrap_or_default();
             notify_os::send(notify_os::Notice::ProtectionFailed, &alias);
+        }
+    }
+
+    /// One system notification per account with a bare position that was confirmed on fresh
+    /// lists and not told about yet (macOS only, fixed text with the alias).
+    fn notify_bare(&mut self) {
+        let accounts = self.exchange_accounts.persisted().accounts;
+        for id in notify_os::unique_accounts(self.trading.take_bare_notices()) {
+            let alias = accounts
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.alias.clone())
+                .unwrap_or_default();
+            notify_os::send(notify_os::Notice::BarePosition, &alias);
         }
     }
 
@@ -1076,6 +1227,22 @@ impl Flowsurface {
             self.order_ticket.set_status(why, BannerKind::Error);
             return Task::none();
         };
+        // A cancel opened from a stray-order button is judged again now: the lists must be fresh
+        // and the order still one that is offered for cancelling.
+        if let exchange::trade::ManualSpec::Cancel { id, .. } = &request.spec
+            && self.trading.has_stray_mark(meta.id, id)
+            && !self.trading.is_stray(meta.id, id)
+        {
+            self.trading.take_stray_mark(meta.id, id);
+            self.order_confirm = None;
+            self.order_ticket.set_status(
+                "That order is no longer one to cancel, or the lists may be out of date. Nothing \
+                 was sent. Review the account panel again."
+                    .to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
         let Some(conf) = self.order_confirm.as_mut() else {
             return Task::none();
         };
@@ -1116,6 +1283,12 @@ impl Flowsurface {
             return Task::none();
         };
         self.order_confirm = None;
+        if let exchange::trade::ManualSpec::Cancel { id, .. } = &request.spec {
+            self.trading.take_stray_mark(meta.id, id);
+        }
+        // Remembered for this session only: an order of the app's shape with an id that is not
+        // in this list may be left over from an earlier one (d5).
+        self.trading.note_sent_ids(&intent.client_ids());
         // The entry's own client id (the first one of the request), kept in memory only.
         if let (Some(plan), Some(entry_id)) = (attach, intent.client_ids().first()) {
             // Binance futures protection follows the fill: the grant is made from this very
@@ -1200,6 +1373,9 @@ impl Flowsurface {
         meta: &data::config::exchange_accounts::AccountMeta,
         symbol: &str,
     ) -> Option<(exchange::trade::Decimal, std::time::Duration)> {
+        if !modal::order_ticket::valid_symbol(symbol) {
+            return None;
+        }
         let market = order_flow::market_of(meta.venue, meta.product);
         let ticker = exchange::Ticker::new(symbol, market);
         let price = self
@@ -1217,6 +1393,7 @@ impl Flowsurface {
         let task = self.start_auto_jobs();
         // Failures found while polling (or recorded by the last result) are told once.
         self.notify_failures();
+        self.notify_bare();
         task
     }
 
@@ -1597,6 +1774,7 @@ impl Flowsurface {
                 if self.confirm_open() {
                     self.order_confirm = None;
                     self.bulk_confirm = None;
+                    self.trading.clear_stray_marks();
                     return Task::none();
                 }
 
@@ -2149,6 +2327,7 @@ impl Flowsurface {
                 }
                 return Task::batch([task.map(Message::Trading), self.run_auto_jobs()]);
             }
+            Message::AutoPoll => return self.run_auto_jobs(),
             Message::AutoDone(summary) => {
                 // An automatic order may have left an unknown result: read the list again so the
                 // panel offers the same release flow as for a manual one.
@@ -2550,8 +2729,12 @@ impl Flowsurface {
             Subscription::none()
         };
 
+        let auto_poll =
+            iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::AutoPoll);
+
         Subscription::batch(vec![
             confirm_delay,
+            auto_poll,
             tab_drag,
             exchange_streams,
             trading,

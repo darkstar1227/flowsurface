@@ -108,6 +108,23 @@ fn protects(pos: &Position, o: &OpenOrder) -> bool {
     o.symbol == pos.symbol && target_of(o) == Some((pos.dir, pos.hedge_side))
 }
 
+/// The held position a protective order with a stop (stop-loss, or stop and target in one) is
+/// protecting, if any. Cancelling such an order changes that position's protection.
+pub fn stop_guarded_position<'a>(positions: &'a [Position], o: &OpenOrder) -> Option<&'a Position> {
+    if !o.role.is_some_and(ProtectRole::has_stop) {
+        return None;
+    }
+    positions
+        .iter()
+        .find(|p| !p.qty.is_zero() && protects(p, o))
+}
+
+/// The open orders that protect `pos` (any protective row aimed at its leg), for display. The
+/// caller must not show them when the lists may be stale.
+pub fn protecting_orders<'a>(pos: &Position, orders: &'a [OpenOrder]) -> Vec<&'a OpenOrder> {
+    orders.iter().filter(|o| protects(pos, o)).collect()
+}
+
 /// The protection of every held position. `lists_stale` (the stream is not synchronised, or an
 /// algo-order event arrived after the snapshot) makes every answer `Undetermined`.
 pub fn protected_status(
@@ -185,8 +202,115 @@ pub fn orphan_protectives<'a>(
             .iter()
             .filter(|o| target_of(o).is_some())
             .filter(|o| !positions.iter().any(|p| !p.qty.is_zero() && protects(p, o)))
+            // A row with no readable leg (read as one-way) on a symbol where a hedge leg is held
+            // may be that leg's stop: it cannot be called an orphan.
+            .filter(|o| {
+                !(o.position_side.is_none()
+                    && positions
+                        .iter()
+                        .any(|p| !p.qty.is_zero() && p.hedge_side && p.symbol == o.symbol))
+            })
             .collect(),
     )
+}
+
+/// Positions with no whole stop, as [`protected_status`] judged them: no stop at all, a stop
+/// that does not cover the position, a trailing stop only, or take-profit orders only. A stale
+/// verdict (`Undetermined`), a stop, and protection that is not in force yet (`EntryPending`)
+/// are not in this list.
+pub fn bare_positions(statuses: &[PositionProtection]) -> Vec<&PositionProtection> {
+    statuses
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.protection,
+                Protection::Unprotected
+                    | Protection::PartialStop
+                    | Protection::TrailingOnly
+                    | Protection::TargetOnly
+            )
+        })
+        .collect()
+}
+
+/// Algo orders that carry an id shaped like one of this app's but that `known` does not own (no
+/// entry of the book, no order it placed): they may be left over from an earlier session.
+/// `None` when the lists may be stale. Rows with no readable client id are never listed.
+pub fn residual_auto_orders<'a>(
+    orders: &'a [OpenOrder],
+    lists_stale: bool,
+    known: &dyn Fn(&str) -> bool,
+) -> Option<Vec<&'a OpenOrder>> {
+    if lists_stale {
+        return None;
+    }
+    Some(
+        orders
+            .iter()
+            .filter(|o| matches!(o.kind, super::client::OpenKind::Algo(_)))
+            .filter(|o| {
+                o.client_id
+                    .as_deref()
+                    .is_some_and(|id| super::client_id::looks_like_app_id(id) && !known(id))
+            })
+            .collect(),
+    )
+}
+
+/// Can the order be cancelled by its id with the builders this build has? OKX algo orders need
+/// their type, which a row may lack; a Binance order list is not cancelled here.
+pub fn cancellable_by_id(o: &OpenOrder, okx: bool) -> bool {
+    use super::client::OpenKind;
+    match &o.kind {
+        OpenKind::Plain => true,
+        OpenKind::Algo(t) => !okx || t.is_some(),
+        OpenKind::List => false,
+    }
+}
+
+/// One line about a protective order for the account panel: what it is, where it triggers and
+/// how much it covers. A field the row did not carry is said to be unreadable, never guessed.
+/// `None` for an order that is not a protective one.
+pub fn describe_protective(o: &OpenOrder) -> Option<String> {
+    let role = o.role?;
+    let size = if o.close_position {
+        "whole position".to_string()
+    } else {
+        o.qty
+            .map_or("size unreadable".to_string(), |q| format!("qty {q}"))
+    };
+    let trigger = o
+        .trigger_price
+        .map_or("trigger unreadable".to_string(), |t| {
+            format!("triggers at {t}")
+        });
+    let after = if o.limit {
+        match o.limit_price {
+            Some(p) => format!(", then a limit order at {p} (it may not fill)"),
+            None => ", then a limit order (it may not fill; price unreadable)".to_string(),
+        }
+    } else {
+        String::new()
+    };
+    Some(match role {
+        ProtectRole::Stop => format!("Stop-loss: {trigger}{after}, {size}"),
+        ProtectRole::Target => format!("Take-profit: {trigger}{after}, {size}"),
+        ProtectRole::StopAndTarget => {
+            format!("Stop-loss and take-profit in one order: {trigger}{after}, {size}")
+        }
+        ProtectRole::Trailing => {
+            let callback = o
+                .callback_rate
+                .map_or("callback unreadable".to_string(), |c| {
+                    format!("callback {c}%")
+                });
+            let active = o.activation_price.map_or(
+                "no activation price read, so it may not be active".to_string(),
+                |a| format!("activates at {a}"),
+            );
+            format!("Trailing stop (not counted as a stop-loss): {callback}, {active}, {size}")
+        }
+    })
 }
 
 // ── Trigger prices and quantities from a fill ───────────────────────────
@@ -493,6 +617,11 @@ mod tests {
             reduce_only: false,
             role: Some(role),
             attached: None,
+            client_id: None,
+            limit: false,
+            limit_price: None,
+            activation_price: None,
+            callback_rate: None,
         })
     }
 
@@ -823,5 +952,223 @@ mod tests {
             ),
             Err(PlanError::QtyTooSmall)
         );
+    }
+
+    // ── d5: bare positions, residual auto orders, labels ──────────────────
+
+    fn plain(symbol: &str, id: &str) -> OpenOrder {
+        let mut o = order("X", ProtectRole::Stop, Side::Sell).0;
+        o.symbol = symbol.into();
+        o.kind = OpenKind::Plain;
+        o.role = None;
+        o.client_id = Some(id.into());
+        o
+    }
+
+    fn algo_with_id(id: Option<&str>) -> OpenOrder {
+        let mut o = order("BTCUSDT", ProtectRole::Stop, Side::Sell).close().0;
+        o.client_id = id.map(str::to_string);
+        o
+    }
+
+    #[test]
+    fn bare_positions_are_the_ones_without_a_whole_stop() {
+        let positions = [
+            pos("AAAUSDT", Dir::Long, false, "1"),
+            pos("BBBUSDT", Dir::Long, false, "1"),
+            pos("CCCUSDT", Dir::Long, false, "2"),
+            pos("DDDUSDT", Dir::Long, false, "1"),
+        ];
+        let mut stop = order("BBBUSDT", ProtectRole::Stop, Side::Sell).close().0;
+        stop.trigger_price = Some(d("1"));
+        let mut part = order("CCCUSDT", ProtectRole::Stop, Side::Sell)
+            .reduce()
+            .qty("1")
+            .0;
+        part.trigger_price = Some(d("1"));
+        let mut tp = order("DDDUSDT", ProtectRole::Target, Side::Sell).close().0;
+        tp.trigger_price = Some(d("1"));
+        let orders = [stop, part, tp];
+        let all = protected_status(&positions, &orders, false);
+        let bare: Vec<(&str, Protection)> = bare_positions(&all)
+            .into_iter()
+            .map(|b| (b.symbol.as_str(), b.protection))
+            .collect();
+        assert_eq!(
+            bare,
+            vec![
+                ("AAAUSDT", Protection::Unprotected),
+                ("CCCUSDT", Protection::PartialStop),
+                ("DDDUSDT", Protection::TargetOnly),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stale_list_has_no_bare_positions_and_no_orphans() {
+        let positions = [pos("BTCUSDT", Dir::Long, false, "1")];
+        let all = protected_status(&positions, &[], true);
+        assert!(bare_positions(&all).is_empty(), "cannot tell is not bare");
+        let stray = algo_with_id(Some("sAAAAAAAAAAAAAAAAAAAA"));
+        assert!(orphan_protectives(&[], std::slice::from_ref(&stray), true).is_none());
+        assert!(residual_auto_orders(std::slice::from_ref(&stray), true, &|_| false).is_none());
+    }
+
+    #[test]
+    fn hedge_legs_are_judged_one_by_one() {
+        let positions = [
+            pos("BTCUSDT", Dir::Long, true, "1"),
+            pos("BTCUSDT", Dir::Short, true, "1"),
+        ];
+        let mut long_stop = order("BTCUSDT", ProtectRole::Stop, Side::Sell)
+            .leg(Dir::Long)
+            .close()
+            .0;
+        long_stop.trigger_price = Some(d("1"));
+        let all = protected_status(&positions, std::slice::from_ref(&long_stop), false);
+        let bare = bare_positions(&all);
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].dir, Dir::Short);
+        // The short leg closes, the long stop is still there: that stop has a position.
+        let only_long = [pos("BTCUSDT", Dir::Long, true, "1")];
+        assert!(
+            orphan_protectives(&only_long, std::slice::from_ref(&long_stop), false)
+                .unwrap()
+                .is_empty()
+        );
+        let only_short = [pos("BTCUSDT", Dir::Short, true, "1")];
+        assert_eq!(
+            orphan_protectives(&only_short, std::slice::from_ref(&long_stop), false)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unreadable_position_side_neither_protects_a_hedge_leg_nor_is_an_orphan() {
+        // A hedge account whose order row has no readable `positionSide` is read as one-way
+        // (no leg): it does not protect a hedge leg, and it must not be called an orphan either.
+        let hedge = [pos("BTCUSDT", Dir::Long, true, "1")];
+        let mut unreadable = order("BTCUSDT", ProtectRole::Stop, Side::Sell).close().0;
+        unreadable.trigger_price = Some(d("1"));
+        unreadable.position_side = None;
+        let all = protected_status(&hedge, std::slice::from_ref(&unreadable), false);
+        assert_eq!(all[0].protection, Protection::Unprotected);
+        // It may still be that leg's stop: it is not offered for cancelling.
+        let orphans = orphan_protectives(&hedge, std::slice::from_ref(&unreadable), false).unwrap();
+        assert!(orphans.is_empty());
+        // With no hedge leg held it is an orphan as before.
+        let none = orphan_protectives(&[], std::slice::from_ref(&unreadable), false).unwrap();
+        assert_eq!(none.len(), 1);
+    }
+
+    #[test]
+    fn residual_auto_orders_need_an_app_shaped_id_that_nothing_owns() {
+        let mine = "sAAAAAAAAAAAAAAAAAAAA";
+        let other = "tBBBBBBBBBBBBBBBBBBBB";
+        let orders = vec![
+            algo_with_id(Some(mine)),
+            algo_with_id(Some(other)),
+            algo_with_id(Some("web_stop_1")),
+            algo_with_id(None),
+            plain("BTCUSDT", "sCCCCCCCCCCCCCCCCCCCC"),
+        ];
+        let got = residual_auto_orders(&orders, false, &|id| id == mine).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].client_id.as_deref(), Some(other));
+    }
+
+    #[test]
+    fn the_app_id_shape_is_a_role_letter_and_twenty_base62_characters() {
+        assert!(crate::trade::looks_like_app_id("eAAAAAAAAAAAAAAAAAAAA"));
+        assert!(crate::trade::looks_like_app_id("r0123456789abcdefghij"));
+        assert!(!crate::trade::looks_like_app_id("xAAAAAAAAAAAAAAAAAAAA"));
+        assert!(!crate::trade::looks_like_app_id("eAAAA"));
+        assert!(!crate::trade::looks_like_app_id("e-AAAAAAAAAAAAAAAAAAA"));
+        assert!(!crate::trade::looks_like_app_id(""));
+    }
+
+    #[test]
+    fn a_debug_print_of_an_open_order_hides_the_client_id() {
+        let o = algo_with_id(Some("sSECRETSECRETSECRETSE"));
+        assert!(!format!("{o:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn what_can_be_cancelled_by_id() {
+        let algo_none = algo_with_id(None);
+        assert!(cancellable_by_id(&algo_none, false));
+        assert!(
+            !cancellable_by_id(&algo_none, true),
+            "an OKX algo needs its type"
+        );
+        let mut typed = algo_none.clone();
+        typed.kind = OpenKind::Algo(Some(crate::trade::okx::OkxAlgoType::Conditional));
+        assert!(cancellable_by_id(&typed, true));
+        let mut list = algo_none;
+        list.kind = OpenKind::List;
+        assert!(!cancellable_by_id(&list, false));
+    }
+
+    #[test]
+    fn every_protective_role_has_a_line_and_unreadable_fields_are_said() {
+        let mut stop = order("BTCUSDT", ProtectRole::Stop, Side::Sell).close().0;
+        stop.trigger_price = Some(d("59000"));
+        assert_eq!(
+            describe_protective(&stop).unwrap(),
+            "Stop-loss: triggers at 59000, whole position"
+        );
+        stop.close_position = false;
+        assert!(
+            describe_protective(&stop)
+                .unwrap()
+                .ends_with("size unreadable")
+        );
+        stop.limit = true;
+        assert!(
+            describe_protective(&stop)
+                .unwrap()
+                .contains("limit order (it may not fill; price unreadable)")
+        );
+        stop.limit_price = Some(d("58900"));
+        assert!(
+            describe_protective(&stop)
+                .unwrap()
+                .contains("limit order at 58900 (it may not fill)")
+        );
+        let mut tp = order("BTCUSDT", ProtectRole::Target, Side::Sell)
+            .reduce()
+            .qty("0.5")
+            .0;
+        tp.trigger_price = Some(d("61000"));
+        assert_eq!(
+            describe_protective(&tp).unwrap(),
+            "Take-profit: triggers at 61000, qty 0.5"
+        );
+        let mut both = order("BTCUSDT", ProtectRole::StopAndTarget, Side::Sell)
+            .close()
+            .0;
+        both.trigger_price = Some(d("59000"));
+        assert!(
+            describe_protective(&both)
+                .unwrap()
+                .starts_with("Stop-loss and take-profit")
+        );
+        let mut trail = order("BTCUSDT", ProtectRole::Trailing, Side::Sell)
+            .reduce()
+            .qty("1")
+            .0;
+        let line = describe_protective(&trail).unwrap();
+        assert!(line.contains("not counted as a stop-loss"));
+        assert!(line.contains("callback unreadable"));
+        assert!(line.contains("may not be active"));
+        trail.callback_rate = Some(d("1.5"));
+        trail.activation_price = Some(d("60000"));
+        let line = describe_protective(&trail).unwrap();
+        assert!(line.contains("callback 1.5%") && line.contains("activates at 60000"));
+        let mut not_protective = stop.clone();
+        not_protective.role = None;
+        assert!(describe_protective(&not_protective).is_none());
     }
 }

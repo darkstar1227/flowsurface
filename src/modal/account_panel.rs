@@ -10,11 +10,12 @@ use crate::{
     auto_flow::FailureView,
     modal::order_ticket::{Gate, blocked_reason},
     style,
-    trading::{RecordStatus, TradingState, account_key, display_name},
+    trading::{BareRow, RecordStatus, StrayOrder, TradingState, account_key, display_name},
     widget::{BannerKind, banner},
 };
 use data::config::exchange_accounts::AccountMeta;
 use exchange::account::{AccountProduct, AccountVenue};
+use exchange::trade::Dir;
 use exchange::trade::{
     BulkAction, DiscardChallenge, DiscardToken, ManualReleaseToken, ReleaseChallenge, UnknownRecord,
 };
@@ -32,6 +33,12 @@ pub enum Action {
     Retry(String),
     /// The user confirmed "I've handled it" for the entry with this client id.
     Handled(String),
+    /// Offer a whole-position stop for the position of this symbol and direction (a bare
+    /// position found in the lists). Opens the confirmation; nothing is sent by the click.
+    AddStop(String, Dir),
+    /// Offer to cancel the order with this exchange id (an order with no position, or one left
+    /// over). Opens the ordinary confirmation of a cancel.
+    CancelStray(String),
     AckTrip,
     BeginRelease(Box<UnknownRecord>),
     Release(ManualReleaseToken, Box<UnknownRecord>),
@@ -49,6 +56,8 @@ pub enum Message {
     Handled(String),
     ConfirmHandled,
     CancelHandled,
+    AddStop(String, Dir),
+    CancelStray(String),
     /// The client id of the record, looked up by value in the records the panel holds (a list
     /// that was replaced between the view and the click never points at another record).
     Release(String),
@@ -67,6 +76,8 @@ impl fmt::Debug for Message {
             Message::AckTrip => "AckTrip",
             Message::Retry(_) => "Retry(..)",
             Message::Handled(_) => "Handled(..)",
+            Message::AddStop(..) => "AddStop(..)",
+            Message::CancelStray(_) => "CancelStray(..)",
             Message::ConfirmHandled => "ConfirmHandled",
             Message::CancelHandled => "CancelHandled",
             Message::Release(_) => "Release(..)",
@@ -223,6 +234,24 @@ impl AccountPanel {
                 }
                 self.status = None;
                 return Some(Action::Retry(key));
+            }
+            Message::AddStop(symbol, dir) => {
+                self.handling = None;
+                if deleting {
+                    self.status = Some((DELETING.to_string(), BannerKind::Error));
+                    return None;
+                }
+                self.status = None;
+                return Some(Action::AddStop(symbol, dir));
+            }
+            Message::CancelStray(id) => {
+                self.handling = None;
+                if deleting {
+                    self.status = Some((DELETING.to_string(), BannerKind::Error));
+                    return None;
+                }
+                self.status = None;
+                return Some(Action::CancelStray(id));
             }
             Message::Handled(key) => {
                 // One more click: the entry is not removed by a single press.
@@ -423,6 +452,10 @@ impl AccountPanel {
             {
                 col = col.push(text(format!("    {}", status.protection.label())).size(small));
             }
+            // The protective orders that stand for it (only when the lists are fresh).
+            for line in trading.protective_lines(meta.id, &p.symbol, p.dir) {
+                col = col.push(text(format!("    {line}")).size(small));
+            }
         }
 
         // An entry with protection listed but no position yet (a resting limit order).
@@ -449,6 +482,21 @@ impl AccountPanel {
         // new confirmation), closing all positions (the same confirmation as "Close all"), and
         // removing the warning after a second click.
         let alias = display_name(saved, meta);
+        let idle = bulk_blocked.is_none();
+        // Positions with no stop-loss, found from the lists (d5): shown until they have one or
+        // are gone. A position the failure banner below already speaks for is not repeated.
+        for row in trading.bare_rows(meta.id) {
+            col = col.push(bare_view(
+                row,
+                &alias,
+                idle,
+                flatten_offered(meta.venue, meta.product),
+            ));
+        }
+        // Orders with no position to protect, and orders that look left over.
+        for stray in trading.stray_orders(meta.id).unwrap_or_default() {
+            col = col.push(stray_view(&stray, idle));
+        }
         for f in trading.auto_failures(meta.id) {
             col = col.push(failure_view(
                 f,
@@ -551,14 +599,7 @@ fn failure_view<'a>(
         col = col.push(banner(lines, BannerKind::Error));
     }
     if handling == Some(f.key.as_str()) {
-        col = col.push(
-            text(
-                "Remove this warning? Do it only after you checked the position and the open \
-                 orders on the exchange. The app stops watching this entry and a new entry on the \
-                 symbol is allowed. An order with an unknown result is not cleared by this.",
-            )
-            .size(small),
-        );
+        col = col.push(text(handled_warning(&f)).size(small));
         col = col.push(
             row![
                 button(text("Yes, I've handled it").size(small)).on_press(Message::ConfirmHandled),
@@ -585,6 +626,78 @@ fn failure_view<'a>(
         button(text("I've handled it").size(small)).on_press(Message::Handled(f.key.clone())),
     );
     col.push(buttons).into()
+}
+
+/// The banner of one position that has no whole stop-loss, with its two buttons. "Add a stop-loss"
+/// only opens the confirmation window; "Flatten" is the same confirmation as "Close all".
+fn bare_view<'a>(row: &BareRow, alias: &str, idle: bool, flatten: bool) -> Element<'a, Message> {
+    let small = style::text_size::SMALL;
+    let kind = if row.lower_severity() {
+        BannerKind::Warning
+    } else {
+        BannerKind::Error
+    };
+    let mut buttons = row![
+        button(text("Add a stop-loss").size(small))
+            .on_press_maybe(idle.then(|| Message::AddStop(row.symbol.clone(), row.dir)))
+    ]
+    .spacing(8);
+    if flatten {
+        buttons = buttons.push(
+            button(text("Flatten (close all positions)").size(small))
+                .on_press_maybe(idle.then_some(Message::CloseAll)),
+        );
+    }
+    column![banner(row.text(alias), kind), buttons]
+        .spacing(4)
+        .into()
+}
+
+/// An order with no position (or one that looks left over) with its cancel button. The button
+/// opens the confirmation window of a cancel; nothing is cancelled by the click.
+fn stray_view<'a>(stray: &StrayOrder, idle: bool) -> Element<'a, Message> {
+    let small = style::text_size::SMALL;
+    let mut col = column![banner(stray.text.clone(), BannerKind::Warning)].spacing(4);
+    if stray.guards_position {
+        // Only told: the order stands for a position that is still held.
+    } else if stray.can_cancel {
+        col = col.push(
+            button(text("Cancel").size(small))
+                .on_press_maybe(idle.then(|| Message::CancelStray(stray.id.clone()))),
+        );
+    } else {
+        col = col.push(
+            text("This order cannot be cancelled from here. Cancel it on the exchange.")
+                .size(small),
+        );
+    }
+    col.into()
+}
+
+/// The text of the second step of "I've handled it": what stays behind once the entry is removed
+/// from the book, said for this entry (T0: nothing may be left out of sight).
+pub fn handled_warning(f: &FailureView) -> String {
+    let mut text = String::from(
+        "Remove this warning? Do it only after you checked the position and the open orders on \
+         the exchange. The app stops watching this entry and a new entry on the symbol is \
+         allowed. An order with an unknown result is not cleared by this.",
+    );
+    if f.entry_open {
+        text.push_str("\nThe entry order is still open: a later fill will NOT get a stop-loss.");
+    }
+    if f.entry_unresolved {
+        text.push_str("\nThe entry order may still be open: its result was never found out.");
+    }
+    if f.standing > 0 {
+        text.push_str(&format!(
+            "\n{} protective order{} of this entry may still stand on the exchange: cancel \
+             {} first.",
+            f.standing,
+            if f.standing == 1 { "" } else { "s" },
+            if f.standing == 1 { "it" } else { "them" }
+        ));
+    }
+    text
 }
 
 const DELETING: &str = "The account is being deleted.";
@@ -670,6 +783,71 @@ mod tests {
             AccountProduct::UsdM,
             PositionMode::OneWay,
         )
+    }
+
+    fn failure(entry_open: bool, standing: usize) -> FailureView {
+        FailureView {
+            key: "k".into(),
+            account: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".into(),
+            reasons: Vec::new(),
+            dir: Dir::Long,
+            may_retry: false,
+            active: true,
+            entry_open,
+            entry_unresolved: false,
+            standing,
+        }
+    }
+
+    #[test]
+    fn the_handled_warning_says_what_stays_behind() {
+        let plain = handled_warning(&failure(false, 0));
+        assert!(plain.starts_with("Remove this warning?"));
+        assert!(!plain.contains("still open") && !plain.contains("protective order"));
+        let open = handled_warning(&failure(true, 0));
+        assert!(
+            open.contains("The entry order is still open: a later fill will NOT get a stop-loss.")
+        );
+        let one = handled_warning(&failure(false, 1));
+        assert!(one.contains(
+            "1 protective order of this entry may still stand on the exchange: cancel it first."
+        ));
+        let many = handled_warning(&failure(true, 3));
+        assert!(many.contains(
+            "3 protective orders of this entry may still stand on the exchange: cancel them first."
+        ));
+        assert!(many.contains("still open"));
+    }
+
+    #[test]
+    fn a_stop_or_cancel_click_only_asks_main_to_open_a_review() {
+        let m = meta();
+        let trading = TradingState::new(ProxyState::Direct);
+        let mut p = AccountPanel::default();
+        match p.update(
+            Message::AddStop("BTCUSDT".into(), Dir::Long),
+            &trading,
+            Some(&m),
+            false,
+        ) {
+            Some(Action::AddStop(s, d)) => assert_eq!((s.as_str(), d), ("BTCUSDT", Dir::Long)),
+            _ => panic!("an AddStop action was expected"),
+        }
+        assert!(matches!(
+            p.update(Message::CancelStray("7".into()), &trading, Some(&m), false),
+            Some(Action::CancelStray(id)) if id == "7"
+        ));
+        // Nothing is asked of an account that is being deleted.
+        assert!(
+            p.update(
+                Message::AddStop("BTCUSDT".into(), Dir::Long),
+                &trading,
+                Some(&m),
+                true
+            )
+            .is_none()
+        );
     }
 
     const INVALID_ID: &str = "not-a-valid-client-id";

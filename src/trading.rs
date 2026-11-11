@@ -38,7 +38,7 @@ use exchange::trade::{
 };
 use iced::futures::{Stream, StreamExt, stream};
 use iced::{Element, Subscription, Task};
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -299,6 +299,9 @@ pub struct HeldPosition {
     pub dir: Dir,
     /// Absolute size.
     pub qty: Decimal,
+    /// The margin mode the snapshot read for the position. `None` is unknown (a position made
+    /// by a stream event carries none): never a mismatch.
+    pub margin: Option<exchange::trade::MarginMode>,
 }
 
 struct AccountRuntime {
@@ -440,6 +443,7 @@ impl AccountRuntime {
                 },
                 dir: p.dir,
                 qty: p.qty,
+                margin: p.margin,
             })
             .collect();
     }
@@ -468,6 +472,12 @@ impl AccountRuntime {
     /// A position event: the only thing besides a snapshot that changes the held positions (a
     /// fill never adds to them).
     fn apply_position_event(&mut self, symbol: &str, side: PositionSide, qty: Decimal) {
+        // The margin mode is read from snapshots only: an event keeps what the snapshot said.
+        let margin = self
+            .positions
+            .iter()
+            .find(|p| p.symbol == symbol && p.side == side)
+            .and_then(|p| p.margin);
         self.positions
             .retain(|p| !(p.symbol == symbol && p.side == side));
         if qty.is_zero() {
@@ -487,6 +497,7 @@ impl AccountRuntime {
             side,
             dir,
             qty: abs,
+            margin,
         });
     }
 
@@ -499,7 +510,7 @@ impl AccountRuntime {
                 dir: p.dir,
                 qty: p.qty,
                 hedge_side: p.side != PositionSide::Both,
-                margin: None,
+                margin: p.margin,
                 leverage: None,
             })
             .collect()
@@ -586,6 +597,163 @@ pub struct TradingState {
     attach: PendingAttachTable,
     /// What is sent after an entry fills, and the state of it (d3).
     auto: AutoBook,
+    /// Positions with no stop-loss, as the watch has confirmed them (d5).
+    watch: BareWatch,
+    /// Client ids of the requests this session confirmed (memory only, capped): an algo order
+    /// with an id of the app's shape that is in neither this list nor the book may be left over
+    /// from an earlier session.
+    sent_ids: VecDeque<String>,
+    /// Cancels opened from a stray-order button: checked again when the user confirms.
+    stray_cancels: HashSet<(Uuid, String)>,
+}
+
+/// How long a position has to stay without a stop on fresh lists before it is called bare. The
+/// stop of a normal automatic entry is sent right after the fill and shows in the order list a
+/// moment later: that gap is not a bare position.
+pub const BARE_GRACE_MS: i64 = 15_000;
+
+const MAX_SENT_IDS: usize = 512;
+
+/// One position without a whole stop, as the banner shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BareRow {
+    pub symbol: String,
+    pub dir: Dir,
+    pub protection: exchange::trade::Protection,
+}
+
+impl BareRow {
+    /// The lower severity: only take-profit orders stand (user decision).
+    pub fn lower_severity(&self) -> bool {
+        self.protection == exchange::trade::Protection::TargetOnly
+    }
+
+    /// The banner text. Said plainly, never as "protected".
+    pub fn text(&self, alias: &str) -> String {
+        let side = match self.dir {
+            Dir::Long => "long",
+            Dir::Short => "short",
+        };
+        let what = match self.protection {
+            exchange::trade::Protection::TargetOnly => "has take-profit orders but no stop-loss",
+            exchange::trade::Protection::PartialStop => {
+                "has a stop-loss that may not cover the whole position"
+            }
+            exchange::trade::Protection::TrailingOnly => {
+                "has only a trailing stop, which may not be active yet"
+            }
+            _ => "has no stop-loss",
+        };
+        format!("{alias}: the {side} position on {} {what}.", self.symbol)
+    }
+}
+
+/// What the watch for bare positions remembers. Memory only.
+#[derive(Default)]
+struct BareWatch {
+    /// Since when (monotonic ms) a position has been bare on fresh lists without a break.
+    first_seen: HashMap<(Uuid, String, Dir), i64>,
+    /// Positions past the grace time, per account.
+    confirmed: HashMap<Uuid, Vec<BareRow>>,
+    /// Positions a system notification went out for. Cleared only by a fresh verdict that the
+    /// position is gone or has a stop; going stale does not clear it.
+    told: HashSet<(Uuid, String, Dir)>,
+    /// Accounts to notify (a bare position was confirmed that nobody was told about).
+    to_notify: Vec<Uuid>,
+}
+
+/// An order the panel offers to cancel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrayOrder {
+    /// The exchange's id of the order (algo id), used to name it in a click.
+    pub id: String,
+    pub symbol: String,
+    pub text: String,
+    /// Looks like an order of this app that nothing in this session owns (as opposed to a
+    /// protective order with no position).
+    pub residual: bool,
+    pub can_cancel: bool,
+    /// The order is the stop-loss of a position that is still held: the panel only tells, and
+    /// offers no cancel (cancelling it would leave the position without a stop-loss).
+    pub guards_position: bool,
+}
+
+/// What the account's lists say about orders without a position (d5): `None` when the lists may
+/// be stale (nothing is concluded then).
+pub fn stray_orders(
+    positions: &[Position],
+    orders: &[OpenOrder],
+    lists_stale: bool,
+    okx: bool,
+    owns: &dyn Fn(&str) -> bool,
+) -> Option<Vec<StrayOrder>> {
+    use exchange::trade::{cancellable_by_id, describe_protective};
+    let orphans = exchange::trade::orphan_protectives(positions, orders, lists_stale)?;
+    let mut out: Vec<StrayOrder> = orphans
+        .into_iter()
+        .map(|o| StrayOrder {
+            id: o.id.clone(),
+            symbol: o.symbol.clone(),
+            text: format!(
+                "{}: no position to protect. {}",
+                o.symbol,
+                describe_protective(o).unwrap_or_else(|| "Protective order".to_string())
+            ),
+            residual: false,
+            can_cancel: cancellable_by_id(o, okx),
+            guards_position: false,
+        })
+        .collect();
+    // Orders of the app's shape that nothing owns. On OKX the algo orders an entry attached
+    // carry ids of the same shape and are not tracked here: not judged.
+    if !okx {
+        for o in exchange::trade::residual_auto_orders(orders, lists_stale, owns)? {
+            if out.iter().any(|s| s.id == o.id) {
+                continue;
+            }
+            let line = describe_protective(o).unwrap_or_else(|| "Conditional order".to_string());
+            // A stop that stands for a position still held is not offered for cancelling: after
+            // a restart the app cannot tell it from one it still owns.
+            let guarded = exchange::trade::stop_guarded_position(positions, o);
+            let held_symbol = positions
+                .iter()
+                .any(|p| p.symbol == o.symbol && !p.qty.is_zero());
+            let text = if let Some(p) = guarded {
+                let side = match p.dir {
+                    Dir::Long => "long",
+                    Dir::Short => "short",
+                };
+                format!(
+                    "This order looks like it was placed by this app in an earlier session. It is \
+                     the stop-loss of your {side} {} position; keep it unless you replace it. {line}",
+                    o.symbol
+                )
+            } else {
+                let mut t = format!(
+                    "{}: this looks like an automatic order of this app that nothing in this \
+                     session owns (left over from an earlier session, or its entry was \
+                     removed). {line}",
+                    o.symbol
+                );
+                if held_symbol {
+                    t.push_str(&format!(
+                        " Cancelling it changes the protection of the {} position.",
+                        o.symbol
+                    ));
+                }
+                t
+            };
+            out.push(StrayOrder {
+                id: o.id.clone(),
+                symbol: o.symbol.clone(),
+                text,
+                residual: true,
+                can_cancel: guarded.is_none() && cancellable_by_id(o, okx),
+                guards_position: guarded.is_some(),
+            });
+        }
+    }
+    Some(out)
 }
 
 /// What blocks the buttons of one (account, symbol) (condition 61).
@@ -614,6 +782,9 @@ impl TradingState {
             bulk_running: BTreeSet::new(),
             attach: PendingAttachTable::default(),
             auto: AutoBook::default(),
+            watch: BareWatch::default(),
+            sent_ids: VecDeque::new(),
+            stray_cancels: HashSet::new(),
         }
     }
 
@@ -706,14 +877,7 @@ impl TradingState {
     /// after it. When the lists may be stale every answer is `Undetermined`, which reads
     /// "cannot tell", never "protected".
     pub fn protection(&self, id: Uuid) -> Vec<PositionProtection> {
-        let Some(rt) = self.accounts.get(&id) else {
-            return Vec::new();
-        };
-        let mut all = exchange::trade::protected_status(
-            &rt.exchange_positions(),
-            &rt.orders,
-            self.lists_stale(id),
-        );
+        let mut all = self.protection_listed(id);
         // Protection that was listed for an entry and is not in force yet: said so, and never
         // "protected", whatever the lists show.
         for p in &mut all {
@@ -722,6 +886,170 @@ impl TradingState {
             }
         }
         all
+    }
+
+    /// What the lists alone say, before the pending-entry overlay: the bare judgment uses this,
+    /// so a pending entry never hides a position that has no stop.
+    fn protection_listed(&self, id: Uuid) -> Vec<PositionProtection> {
+        let Some(rt) = self.accounts.get(&id) else {
+            return Vec::new();
+        };
+        exchange::trade::protected_status(
+            &rt.exchange_positions(),
+            &rt.orders,
+            self.lists_stale(id),
+        )
+    }
+
+    /// Look again at every account's positions (d5). Called on the poll tick with a monotonic
+    /// clock. Only fresh lists give a verdict: while they may be stale nothing is concluded, the
+    /// banner is empty ("cannot tell" is the panel's stale line). The grace clock of a
+    /// position and the record of who was told are kept: going stale gives no new grace time.
+    pub fn watch_bare(&mut self, mono_ms: i64) {
+        let ids: Vec<Uuid> = self.accounts.keys().copied().collect();
+        for id in ids {
+            if self.lists_stale(id) {
+                // Nothing is shown or concluded, but the clock of a position keeps running: going
+                // stale must not give a bare position a new grace time.
+                self.watch.confirmed.remove(&id);
+                continue;
+            }
+            let all = self.protection_listed(id);
+            let bare: Vec<BareRow> = exchange::trade::bare_positions(&all)
+                .into_iter()
+                // A failure the d4 banner already shows for this very position is not repeated.
+                .filter(|b| !self.auto.covers_part(id, &b.symbol, b.dir))
+                .map(|b| BareRow {
+                    symbol: b.symbol.clone(),
+                    dir: b.dir,
+                    protection: b.protection,
+                })
+                .collect();
+            let key = |r: &BareRow| (id, r.symbol.clone(), r.dir);
+            self.watch
+                .first_seen
+                .retain(|k, _| k.0 != id || bare.iter().any(|r| key(r) == *k));
+            let mut confirmed = Vec::new();
+            for row in bare {
+                let first = *self.watch.first_seen.entry(key(&row)).or_insert(mono_ms);
+                if mono_ms.saturating_sub(first) < BARE_GRACE_MS {
+                    continue;
+                }
+                // A take-profit-only position is the lower severity: shown, never notified.
+                if !row.lower_severity() && self.watch.told.insert(key(&row)) {
+                    self.watch.to_notify.push(id);
+                }
+                confirmed.push(row);
+            }
+            self.watch.confirmed.insert(id, confirmed);
+            // Told again only after the position was seen gone or with a stop on fresh lists.
+            let resolved = |k: &(Uuid, String, Dir)| {
+                k.0 == id
+                    && !all.iter().any(|p| {
+                        p.symbol == k.1
+                            && p.dir == k.2
+                            && p.protection != exchange::trade::Protection::Stop
+                    })
+            };
+            self.watch.told.retain(|k| !resolved(k));
+        }
+    }
+
+    /// The positions of the account that have no whole stop-loss, once confirmed on fresh lists.
+    pub fn bare_rows(&self, id: Uuid) -> &[BareRow] {
+        self.watch.confirmed.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    /// The accounts with a bare position that nobody was told about yet.
+    pub fn take_bare_notices(&mut self) -> Vec<Uuid> {
+        std::mem::take(&mut self.watch.to_notify)
+    }
+
+    /// The protective orders that stand for each held position, as lines for the panel. Empty
+    /// while the lists may be stale: what stands cannot be said then.
+    pub fn protective_lines(&self, id: Uuid, symbol: &str, dir: Dir) -> Vec<String> {
+        let Some(rt) = self.accounts.get(&id) else {
+            return Vec::new();
+        };
+        if self.lists_stale(id) {
+            return Vec::new();
+        }
+        rt.exchange_positions()
+            .iter()
+            .filter(|p| p.symbol == symbol && p.dir == dir)
+            .flat_map(|p| exchange::trade::protecting_orders(p, &rt.orders))
+            .filter_map(exchange::trade::describe_protective)
+            .collect()
+    }
+
+    /// Protective orders with no position, and orders that look left over from an earlier
+    /// session. `None` when the lists may be stale.
+    pub fn stray_orders(&self, id: Uuid) -> Option<Vec<StrayOrder>> {
+        let rt = self.accounts.get(&id)?;
+        let okx = rt.meta.venue == exchange::account::AccountVenue::Okx;
+        let owns = |client: &str| {
+            self.auto.knows_client_id(client) || self.sent_ids.iter().any(|s| s == client)
+        };
+        stray_orders(
+            &rt.exchange_positions(),
+            &rt.orders,
+            self.lists_stale(id),
+            okx,
+            &owns,
+        )
+    }
+
+    /// The order with this exchange id is, on fresh lists, still one the panel offers to cancel
+    /// (an order with no position, or one that looks left over and is not the stop-loss of a
+    /// position still held) and can be cancelled by id.
+    pub fn is_stray(&self, id: Uuid, order_id: &str) -> bool {
+        self.stray_orders(id)
+            .is_some_and(|v| v.iter().any(|s| s.id == order_id && s.can_cancel))
+    }
+
+    /// A cancel was opened from a stray-order button: it is judged again at the confirmation.
+    pub fn mark_stray_cancel(&mut self, id: Uuid, order_id: &str) {
+        self.stray_cancels.insert((id, order_id.to_string()));
+    }
+
+    /// Was this cancel opened from a stray-order button?
+    pub fn has_stray_mark(&self, id: Uuid, order_id: &str) -> bool {
+        self.stray_cancels.contains(&(id, order_id.to_string()))
+    }
+
+    /// Drops every mark: the confirmation window was closed without confirming, so a later
+    /// cancel of the same order from elsewhere is not judged as a stray one.
+    pub fn clear_stray_marks(&mut self) {
+        self.stray_cancels.clear();
+    }
+
+    /// Takes the mark away (the cancel was confirmed, or it was refused).
+    pub fn take_stray_mark(&mut self, id: Uuid, order_id: &str) -> bool {
+        self.stray_cancels.remove(&(id, order_id.to_string()))
+    }
+
+    /// The client ids of a request the user confirmed this session, kept in memory only.
+    pub fn note_sent_ids(&mut self, ids: &[&str]) {
+        for id in ids {
+            if !self.sent_ids.iter().any(|s| s == id) {
+                self.sent_ids.push_back((*id).to_string());
+            }
+        }
+        while self.sent_ids.len() > MAX_SENT_IDS {
+            self.sent_ids.pop_front();
+        }
+    }
+
+    /// OKX: a position of the symbol is held in a margin mode other than the cross mode this
+    /// build sends orders in. Only a known mode counts; an unknown one is not a mismatch.
+    pub fn margin_conflict(&self, id: Uuid, symbol: &str) -> bool {
+        self.accounts.get(&id).is_some_and(|rt| {
+            rt.meta.venue == exchange::account::AccountVenue::Okx
+                && rt.positions.iter().any(|p| {
+                    p.symbol.eq_ignore_ascii_case(symbol)
+                        && p.margin == Some(exchange::trade::MarginMode::Isolated)
+                })
+        })
     }
 
     /// The reason of the account's risk lock, when one is on.
@@ -1011,6 +1339,7 @@ impl TradingState {
         let jobs = auto.poll(now_ms, &env);
         self.auto = auto;
         self.forget_finished();
+        self.watch_bare(mono_ms);
         jobs
     }
 
@@ -1305,12 +1634,15 @@ impl TradingState {
     /// The stream is connected again and the snapshot and held-back events are applied: entries that were open when the
     /// connection dropped may have filled without any event reaching the app (M4-4).
     fn check_after_reconnect(rt: &AccountRuntime, auto: &mut AutoBook, id: Uuid) {
-        let resting = |symbol: &str, dir: Dir| {
+        let resting = |symbol: &str, dir: Dir, client: &str| {
             rt.orders.iter().any(|o| {
                 o.symbol.eq_ignore_ascii_case(symbol)
                     && matches!(o.kind, exchange::trade::OpenKind::Plain)
                     && !o.reduce_only
                     && o.side == Some(dir.opening_side())
+                    // Matched by client id when the row has one (d5); a row without one keeps
+                    // the symbol and side match.
+                    && o.client_id.as_deref().is_none_or(|c| c == client)
             })
         };
         let held = |symbol: &str| {
@@ -2861,6 +3193,11 @@ mod tests {
             reduce_only: false,
             role: Some(ProtectRole::Stop),
             attached: None,
+            client_id: None,
+            limit: false,
+            limit_price: None,
+            activation_price: None,
+            callback_rate: None,
         }
     }
 
@@ -3353,5 +3690,460 @@ mod tests {
         assert_eq!(notes, 1);
         assert!(stop);
         assert!(!active);
+    }
+
+    // ── d5: bare positions, strays, labels ──────────────────────────────
+
+    fn connect_lists(
+        t: &mut TradingState,
+        m: &AccountMeta,
+        key: StreamKey,
+        orders: &[OpenOrder],
+        positions: &[Position],
+    ) {
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::State(StreamState::Connected)),
+            0,
+        );
+        t.accounts
+            .get_mut(&m.id)
+            .unwrap()
+            .apply_snapshot(orders, positions, |r, n| r.set_positions(0, n));
+    }
+
+    fn algo_row(id: &str, role: exchange::trade::ProtectRole, client: Option<&str>) -> OpenOrder {
+        let mut o = long_stop();
+        o.id = id.into();
+        o.role = Some(role);
+        o.trigger_price = Some(Decimal::from_int(59000));
+        o.client_id = client.map(str::to_string);
+        o
+    }
+
+    const APP_ID: &str = "sAAAAAAAAAAAAAAAAAAAA";
+
+    #[test]
+    fn a_bare_position_is_confirmed_after_the_grace_time_and_told_once() {
+        let (mut t, m, key) = running();
+        connect_lists(&mut t, &m, key, &[], &[held("BTCUSDT", 2)]);
+        t.watch_bare(0);
+        assert!(t.bare_rows(m.id).is_empty(), "inside the grace time");
+        assert!(t.take_bare_notices().is_empty());
+        t.watch_bare(BARE_GRACE_MS);
+        assert_eq!(t.bare_rows(m.id).len(), 1);
+        assert_eq!(t.bare_rows(m.id)[0].symbol, "BTCUSDT");
+        assert_eq!(t.take_bare_notices(), vec![m.id]);
+        t.watch_bare(BARE_GRACE_MS * 2);
+        assert_eq!(t.bare_rows(m.id).len(), 1, "the banner stays");
+        assert!(t.take_bare_notices().is_empty(), "told once");
+    }
+
+    #[test]
+    fn going_stale_says_nothing_and_does_not_forget_who_was_told() {
+        let (mut t, m, key) = running();
+        connect_lists(&mut t, &m, key, &[], &[held("BTCUSDT", 2)]);
+        t.watch_bare(0);
+        t.watch_bare(BARE_GRACE_MS);
+        assert_eq!(t.take_bare_notices(), vec![m.id]);
+        // An algo-order event makes the lists stale: no verdict, no banner, no notice.
+        t.accounts.get_mut(&m.id).unwrap().orders_dirty = true;
+        assert!(t.lists_stale(m.id));
+        t.watch_bare(BARE_GRACE_MS * 2);
+        assert!(t.bare_rows(m.id).is_empty());
+        assert!(t.take_bare_notices().is_empty());
+        // Fresh again with no stop: going stale did not restart the clock, the row is back at
+        // once and nobody is told twice.
+        connect_lists(&mut t, &m, key, &[], &[held("BTCUSDT", 2)]);
+        t.watch_bare(BARE_GRACE_MS * 3);
+        assert_eq!(t.bare_rows(m.id).len(), 1);
+        assert!(t.take_bare_notices().is_empty());
+        // A fresh verdict with a stop resets it; bare again later is told again.
+        connect_lists(
+            &mut t,
+            &m,
+            key,
+            &[algo_row("7", exchange::trade::ProtectRole::Stop, None)],
+            &[held("BTCUSDT", 2)],
+        );
+        t.watch_bare(BARE_GRACE_MS * 5);
+        assert!(t.bare_rows(m.id).is_empty());
+        connect_lists(&mut t, &m, key, &[], &[held("BTCUSDT", 2)]);
+        t.watch_bare(BARE_GRACE_MS * 6);
+        t.watch_bare(BARE_GRACE_MS * 7);
+        assert_eq!(t.take_bare_notices(), vec![m.id]);
+    }
+
+    #[test]
+    fn a_position_that_is_gone_resets_the_notice() {
+        let (mut t, m, key) = running();
+        connect_lists(&mut t, &m, key, &[], &[held("BTCUSDT", 2)]);
+        t.watch_bare(0);
+        t.watch_bare(BARE_GRACE_MS);
+        assert_eq!(t.take_bare_notices().len(), 1);
+        connect_lists(&mut t, &m, key, &[], &[]);
+        t.watch_bare(BARE_GRACE_MS * 2);
+        assert!(t.bare_rows(m.id).is_empty());
+        connect_lists(&mut t, &m, key, &[], &[held("BTCUSDT", 1)]);
+        t.watch_bare(BARE_GRACE_MS * 3);
+        t.watch_bare(BARE_GRACE_MS * 4);
+        assert_eq!(t.take_bare_notices().len(), 1);
+    }
+
+    #[test]
+    fn a_take_profit_only_position_is_shown_with_lower_severity_and_not_notified() {
+        let (mut t, m, key) = running();
+        connect_lists(
+            &mut t,
+            &m,
+            key,
+            &[algo_row("8", exchange::trade::ProtectRole::Target, None)],
+            &[held("BTCUSDT", 2)],
+        );
+        t.watch_bare(0);
+        t.watch_bare(BARE_GRACE_MS);
+        assert_eq!(t.bare_rows(m.id).len(), 1);
+        assert!(t.bare_rows(m.id)[0].lower_severity());
+        assert!(t.take_bare_notices().is_empty());
+        assert!(
+            t.bare_rows(m.id)[0]
+                .text("main")
+                .contains("take-profit orders but no stop-loss")
+        );
+    }
+
+    #[test]
+    fn a_pending_entry_does_not_hide_a_position_that_has_no_stop() {
+        use crate::auto_flow::tests::{entry_for, spec};
+        let (mut t, m, key) = running();
+        connect_lists(&mut t, &m, key, &[], &[held("BTCUSDT", 2)]);
+        let (entry_id, init) = entry_for(m.id, spec(1, false));
+        assert!(t.register_attach(
+            entry_id,
+            PendingAttach {
+                account: m.id,
+                symbol: "BTCUSDT".into(),
+                plan: crate::protect_attach::AttachPlan {
+                    kind: crate::protect_attach::AttachKind::AfterFill,
+                    dir: Dir::Long,
+                    limit: false,
+                    spec: spec(1, false),
+                    lines: Vec::new(),
+                },
+            },
+            init,
+        ));
+        t.settle_attach(m.id, "BTCUSDT", &SendResult::Accepted { order_id: None });
+        // The overlay says "not active yet" on the position row, but the verdict comes from the
+        // lists: after the grace time the position is bare and the user is told once.
+        assert_eq!(
+            t.protection(m.id)[0].protection,
+            exchange::trade::Protection::EntryPending
+        );
+        t.watch_bare(0);
+        assert!(t.bare_rows(m.id).is_empty(), "inside the grace time");
+        t.watch_bare(BARE_GRACE_MS);
+        assert_eq!(t.bare_rows(m.id).len(), 1);
+        assert_eq!(t.take_bare_notices(), vec![m.id]);
+    }
+
+    #[test]
+    fn a_stale_account_has_no_bare_rows_and_no_strays() {
+        let (mut t, m, _key) = running();
+        t.watch_bare(0);
+        t.watch_bare(BARE_GRACE_MS * 10);
+        assert!(t.lists_stale(m.id));
+        assert!(t.bare_rows(m.id).is_empty());
+        assert!(
+            t.stray_orders(m.id).is_none(),
+            "cannot tell is not none-found"
+        );
+        assert!(t.protective_lines(m.id, "BTCUSDT", Dir::Long).is_empty());
+    }
+
+    fn stray_table(orders: &[OpenOrder], positions: &[Position], okx: bool) -> Vec<StrayOrder> {
+        stray_orders(positions, orders, false, okx, &|c| {
+            c == "tOWNEDOWNEDOWNEDOWNE"
+        })
+        .expect("fresh lists")
+    }
+
+    #[test]
+    fn strays_are_orphans_and_unowned_orders_of_the_apps_shape() {
+        use exchange::trade::ProtectRole::{Stop, Target};
+        let long = [held("BTCUSDT", 2)];
+        // One-way: a stop with a position is no stray; a take-profit for a symbol that is not
+        // held is an orphan.
+        let mut other = algo_row("9", Target, None);
+        other.symbol = "ETHUSDT".into();
+        let got = stray_table(&[algo_row("7", Stop, None), other], &long, false);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "9");
+        assert!(!got[0].residual && got[0].can_cancel);
+        assert!(got[0].text.contains("no position to protect"));
+        // Unowned, app-shaped, and the whole-position stop of a position still held: it is only
+        // told about (no cancel), as it may be the very stop that protects the position.
+        let got = stray_table(
+            &[
+                algo_row("1", Stop, Some(APP_ID)),
+                algo_row("2", Stop, Some("tOWNEDOWNEDOWNEDOWNE")),
+                algo_row("3", Stop, Some("web_1")),
+            ],
+            &long,
+            false,
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "1");
+        assert!(got[0].residual && got[0].guards_position);
+        assert!(
+            !got[0].can_cancel,
+            "the stop of a held position is not offered for cancel"
+        );
+        assert!(
+            got[0]
+                .text
+                .contains("stop-loss of your long BTCUSDT position")
+        );
+        assert!(got[0].text.contains("keep it unless you replace it"));
+        // Unowned, app-shaped take-profit on a held symbol: still cancellable, with the warning.
+        let got = stray_table(&[algo_row("4", Target, Some(APP_ID))], &long, false);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].residual && got[0].can_cancel && !got[0].guards_position);
+        assert!(
+            got[0]
+                .text
+                .starts_with("BTCUSDT: this looks like an automatic order")
+        );
+        assert!(
+            got[0]
+                .text
+                .ends_with("Cancelling it changes the protection of the BTCUSDT position.")
+        );
+        // The same order with no position on the symbol has no such warning.
+        let mut eth = algo_row("5", Target, Some(APP_ID));
+        eth.symbol = "ETHUSDT".into();
+        let got = stray_table(&[eth], &long, false);
+        assert!(!got[0].text.contains("changes the protection"));
+        // Real text has no run of blanks (a continued string literal once left 20 of them).
+        assert!(!got[0].text.contains("  "));
+        // An order that is both an orphan and app-shaped is listed once, as an orphan.
+        let got = stray_table(&[algo_row("1", Stop, Some(APP_ID))], &[], false);
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].residual);
+        // OKX attached orders have the app's ids too and are not judged.
+        assert!(stray_table(&[algo_row("1", Stop, Some(APP_ID))], &long, true).is_empty());
+        // An OKX orphan whose algo type is unknown cannot be cancelled from here.
+        let got = stray_table(&[algo_row("1", Stop, None)], &[], true);
+        assert!(!got[0].can_cancel);
+        // Stale: nothing is concluded.
+        assert!(
+            stray_orders(
+                &long,
+                &[algo_row("1", Stop, Some(APP_ID))],
+                true,
+                false,
+                &|_| false
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_stop_that_guards_a_held_position_is_not_a_stray_to_cancel() {
+        use exchange::trade::ProtectRole::Stop;
+        let (mut t, m, key) = running();
+        connect_lists(
+            &mut t,
+            &m,
+            key,
+            &[algo_row("1", Stop, Some(APP_ID))],
+            &[held("BTCUSDT", 2)],
+        );
+        let list = t.stray_orders(m.id).expect("fresh lists");
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].can_cancel && !list[0].text.contains("  "));
+        assert!(!t.is_stray(m.id, "1"), "judged again at click and confirm");
+    }
+
+    #[test]
+    fn hedge_strays_follow_the_leg() {
+        use exchange::trade::ProtectRole::Stop;
+        let mut short_held = held("BTCUSDT", 1);
+        short_held.dir = Dir::Short;
+        short_held.hedge_side = true;
+        let mut long_stop_hedge = algo_row("7", Stop, None);
+        long_stop_hedge.position_side = Some(Dir::Long);
+        // Only the short leg is held: the long leg's stop is an orphan.
+        let got = stray_table(&[long_stop_hedge.clone()], &[short_held.clone()], false);
+        assert_eq!(got.len(), 1);
+        // Both legs held: not an orphan.
+        let mut long_held = held("BTCUSDT", 1);
+        long_held.hedge_side = true;
+        assert!(stray_table(&[long_stop_hedge], &[long_held, short_held], false).is_empty());
+    }
+
+    #[test]
+    fn an_app_shaped_order_the_session_sent_is_not_a_stray() {
+        let (mut t, m, key) = running();
+        let orders = [algo_row(
+            "1",
+            exchange::trade::ProtectRole::Target,
+            Some(APP_ID),
+        )];
+        connect_lists(&mut t, &m, key, &orders, &[held("BTCUSDT", 2)]);
+        assert_eq!(t.stray_orders(m.id).unwrap().len(), 1);
+        assert!(t.is_stray(m.id, "1"));
+        t.note_sent_ids(&[APP_ID]);
+        assert!(t.stray_orders(m.id).unwrap().is_empty());
+        assert!(!t.is_stray(m.id, "1"));
+    }
+
+    #[test]
+    fn a_stray_cancel_is_judged_again_from_its_mark() {
+        let (mut t, m, key) = running();
+        assert!(!t.has_stray_mark(m.id, "1"));
+        t.mark_stray_cancel(m.id, "1");
+        assert!(t.has_stray_mark(m.id, "1"));
+        let _ = key;
+        assert!(t.take_stray_mark(m.id, "1"));
+        assert!(!t.has_stray_mark(m.id, "1"));
+        // A closed confirmation leaves no mark behind (S5).
+        t.mark_stray_cancel(m.id, "1");
+        t.clear_stray_marks();
+        assert!(!t.has_stray_mark(m.id, "1"));
+    }
+
+    #[test]
+    fn protective_orders_are_listed_per_position_only_on_fresh_lists() {
+        use exchange::trade::ProtectRole::{Stop, Target, Trailing};
+        let (mut t, m, key) = running();
+        let mut trailing = algo_row("3", Trailing, None);
+        trailing.trigger_price = None;
+        trailing.close_position = false;
+        trailing.reduce_only = true;
+        trailing.qty = Some(Decimal::from_int(1));
+        connect_lists(
+            &mut t,
+            &m,
+            key,
+            &[
+                algo_row("1", Stop, None),
+                algo_row("2", Target, None),
+                trailing,
+            ],
+            &[held("BTCUSDT", 2)],
+        );
+        let lines = t.protective_lines(m.id, "BTCUSDT", Dir::Long);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].starts_with("Stop-loss: triggers at 59000"));
+        assert!(lines[1].starts_with("Take-profit: triggers at 59000"));
+        assert!(lines[2].contains("not counted as a stop-loss"));
+        assert!(t.protective_lines(m.id, "BTCUSDT", Dir::Short).is_empty());
+        t.accounts.get_mut(&m.id).unwrap().orders_dirty = true;
+        assert!(t.protective_lines(m.id, "BTCUSDT", Dir::Long).is_empty());
+    }
+
+    #[test]
+    fn the_bare_banner_names_the_account_symbol_and_side() {
+        use exchange::trade::Protection::{PartialStop, TrailingOnly, Unprotected};
+        let row = |protection| BareRow {
+            symbol: "BTCUSDT".into(),
+            dir: Dir::Short,
+            protection,
+        };
+        assert_eq!(
+            row(Unprotected).text("main"),
+            "main: the short position on BTCUSDT has no stop-loss."
+        );
+        assert!(
+            row(PartialStop)
+                .text("a")
+                .contains("may not cover the whole position")
+        );
+        assert!(
+            row(TrailingOnly)
+                .text("a")
+                .contains("may not be active yet")
+        );
+        assert!(!row(Unprotected).lower_severity());
+    }
+
+    #[test]
+    fn okx_isolated_margin_is_a_mismatch_but_an_unknown_mode_is_not() {
+        use exchange::trade::MarginMode;
+        let mut t = booted();
+        let m = meta("okx", AccountVenue::Okx, AccountProduct::UsdM);
+        let _ = t.on_tested(&m, true, signed());
+        let key = t.accounts[&m.id].current_key().expect("a running stream");
+        let mut pos = held("BTC-USDT-SWAP", 2);
+        connect_lists(&mut t, &m, key, &[], std::slice::from_ref(&pos));
+        assert!(
+            !t.margin_conflict(m.id, "BTC-USDT-SWAP"),
+            "unknown is not a mismatch"
+        );
+        pos.margin = Some(MarginMode::Cross);
+        connect_lists(&mut t, &m, key, &[], std::slice::from_ref(&pos));
+        assert!(!t.margin_conflict(m.id, "BTC-USDT-SWAP"));
+        pos.margin = Some(MarginMode::Isolated);
+        connect_lists(&mut t, &m, key, &[], std::slice::from_ref(&pos));
+        assert!(t.margin_conflict(m.id, "BTC-USDT-SWAP"));
+        assert!(!t.margin_conflict(m.id, "ETH-USDT-SWAP"));
+        // A position event keeps the margin mode the snapshot read.
+        t.accounts.get_mut(&m.id).unwrap().apply_position_event(
+            "BTC-USDT-SWAP",
+            PositionSide::Both,
+            Decimal::from_int(3),
+        );
+        assert!(t.margin_conflict(m.id, "BTC-USDT-SWAP"));
+    }
+
+    #[test]
+    fn a_reconnect_matches_the_open_entry_by_client_id_when_the_row_has_one() {
+        use crate::auto_flow::tests::{entry_for, spec};
+        use exchange::trade::{OpenKind, Side};
+        let build = |client: Option<&str>| {
+            let (mut t, m, key) = running();
+            let (entry_id, init) = entry_for(m.id, spec(1, false));
+            assert!(t.register_attach(
+                entry_id.clone(),
+                PendingAttach {
+                    account: m.id,
+                    symbol: "BTCUSDT".into(),
+                    plan: crate::protect_attach::AttachPlan {
+                        kind: crate::protect_attach::AttachKind::AfterFill,
+                        dir: Dir::Long,
+                        limit: true,
+                        spec: spec(1, false),
+                        lines: Vec::new(),
+                    },
+                },
+                init,
+            ));
+            t.settle_attach(m.id, "BTCUSDT", &SendResult::Accepted { order_id: None });
+            let mut open = long_stop();
+            open.kind = OpenKind::Plain;
+            open.role = None;
+            open.close_position = false;
+            open.side = Some(Side::Buy);
+            open.client_id = match client {
+                Some("same") => Some(entry_id),
+                Some(other) => Some(other.to_string()),
+                None => None,
+            };
+            connect_lists(&mut t, &m, key, &[open], &[]);
+            let mut auto = std::mem::take(&mut t.auto);
+            TradingState::check_after_reconnect(&t.accounts[&m.id], &mut auto, m.id);
+            let told = !auto.notes_for(m.id).is_empty();
+            t.auto = auto;
+            told
+        };
+        assert!(!build(Some("same")), "the entry is still open");
+        assert!(
+            !build(None),
+            "a row with no client id keeps the symbol and side match"
+        );
+        assert!(
+            build(Some("eOTHEROTHEROTHEROTHE")),
+            "another order is not this entry"
+        );
     }
 }

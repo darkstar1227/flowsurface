@@ -838,6 +838,14 @@ impl OrderTicket {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_symbol_over_the_ticker_limit_is_not_valid() {
+        // The signing layer allows 32 characters; `Ticker::new` panics above 28.
+        assert!(!valid_symbol(&"A".repeat(29)));
+        assert!(!valid_symbol(&"A".repeat(32)));
+        assert!(valid_symbol(&"A".repeat(28)));
+    }
+
     fn ok_gate() -> Gate {
         Gate {
             boot_done: true,
