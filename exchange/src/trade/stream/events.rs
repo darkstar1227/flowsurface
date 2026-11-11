@@ -60,7 +60,7 @@ pub enum PositionSide {
     Short,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OrderUpdate {
     pub symbol: String,
     pub client_id: Option<String>,
@@ -76,7 +76,7 @@ pub struct OrderUpdate {
     pub time_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Fill {
     pub symbol: String,
     pub client_id: Option<String>,
@@ -91,6 +91,49 @@ pub struct Fill {
     pub fee_asset: Option<String>,
     pub realized_pnl: Option<Decimal>,
     pub time_ms: Option<i64>,
+}
+
+/// The client id ties an order to this app and to an Unknown lock: it is not written to logs, so
+/// `Debug` shows only whether there is one. (`PrivateEvent` derives `Debug` from these.)
+fn redacted(id: &Option<String>) -> &'static str {
+    if id.is_some() { "<redacted>" } else { "None" }
+}
+
+impl std::fmt::Debug for OrderUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrderUpdate")
+            .field("symbol", &self.symbol)
+            .field("client_id", &format_args!("{}", redacted(&self.client_id)))
+            .field("order_id", &self.order_id)
+            .field("category", &self.category)
+            .field("side", &self.side)
+            .field("status", &self.status)
+            .field("price", &self.price)
+            .field("qty", &self.qty)
+            .field("filled_qty", &self.filled_qty)
+            .field("reduce_only", &self.reduce_only)
+            .field("position_side", &self.position_side)
+            .field("time_ms", &self.time_ms)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Fill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fill")
+            .field("symbol", &self.symbol)
+            .field("client_id", &format_args!("{}", redacted(&self.client_id)))
+            .field("order_id", &self.order_id)
+            .field("trade_id", &self.trade_id)
+            .field("side", &self.side)
+            .field("qty", &self.qty)
+            .field("price", &self.price)
+            .field("fee", &self.fee)
+            .field("fee_asset", &self.fee_asset)
+            .field("realized_pnl", &self.realized_pnl)
+            .field("time_ms", &self.time_ms)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,4 +315,66 @@ pub(crate) fn clean_code(raw: &str) -> String {
         && raw.len() <= 16
         && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     if ok { raw.to_string() } else { "?".to_string() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "eAbCdEfGhIjKlMnOpQrStUvW";
+
+    fn order() -> OrderUpdate {
+        OrderUpdate {
+            symbol: "BTCUSDT".into(),
+            client_id: Some(ID.into()),
+            order_id: Some("42".into()),
+            category: OrderCategory::Plain,
+            side: None,
+            status: OrderStatus::New,
+            price: None,
+            qty: None,
+            filled_qty: None,
+            reduce_only: None,
+            position_side: None,
+            time_ms: None,
+        }
+    }
+
+    fn fill() -> Fill {
+        Fill {
+            symbol: "BTCUSDT".into(),
+            client_id: Some(ID.into()),
+            order_id: None,
+            trade_id: Some("7".into()),
+            side: None,
+            qty: Decimal::parse("1").unwrap(),
+            price: Decimal::parse("2").unwrap(),
+            fee: None,
+            fee_asset: None,
+            realized_pnl: None,
+            time_ms: None,
+        }
+    }
+
+    #[test]
+    fn debug_output_hides_the_client_id_everywhere_an_event_can_be_printed() {
+        let texts = [
+            format!("{:?}", order()),
+            format!("{:#?}", order()),
+            format!("{:?}", fill()),
+            format!("{:?}", PrivateEvent::Order(order())),
+            format!("{:?}", PrivateEvent::Fill(fill())),
+            format!("{:#?}", Some(PrivateEvent::Fill(fill()))),
+        ];
+        for t in texts {
+            assert!(!t.contains(ID), "{t}");
+            assert!(t.contains("<redacted>"), "{t}");
+        }
+        // The rest is still there for diagnosis.
+        assert!(format!("{:?}", order()).contains("BTCUSDT"));
+        // No id at all reads as `None`, not as redacted.
+        let mut none = order();
+        none.client_id = None;
+        assert!(format!("{none:?}").contains("client_id: None"));
+    }
 }

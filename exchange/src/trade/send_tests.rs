@@ -22,6 +22,7 @@ use crate::account::{
     AccountEnv, AccountKey, AccountProduct, AccountVenue, ApiCredentials, PositionMode, ProxyState,
 };
 use crate::rate_limit::apply_exchange_info_limits;
+use crate::signed_http::SignedHttp;
 use serde_json::json;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -153,7 +154,7 @@ fn client_with(
 ) -> TradeClient {
     let host = format!("t{}.test", HOSTS.fetch_add(1, Ordering::Relaxed));
     let mut c = TradeClient::new(
-        reqwest::Client::new(),
+        SignedHttp::for_test(reqwest::Client::new(), ProxyState::Direct),
         venue,
         AccountEnv::Live,
         product,
@@ -164,7 +165,6 @@ fn client_with(
             "test-secret".into(),
             (venue == AccountVenue::Okx).then(|| "test-pass".to_string()),
         ),
-        ProxyState::Direct,
         Arc::new(|| ProxyState::Direct),
     );
     c.test_now_ms = Some(NOW);
@@ -1296,13 +1296,12 @@ async fn a_changed_proxy_stops_every_request() {
     let fake = serve(gen_binance);
     let host = format!("t{}.test", HOSTS.fetch_add(1, Ordering::Relaxed));
     let mut c = TradeClient::new(
-        reqwest::Client::new(),
+        SignedHttp::for_test(reqwest::Client::new(), ProxyState::Direct),
         AccountVenue::Binance,
         AccountEnv::Live,
         AccountProduct::UsdM,
         AccountKey::from_bytes([1; 16]),
         ApiCredentials::new("k".into(), "s".into(), None),
-        ProxyState::Direct,
         Arc::new(|| ProxyState::Broken),
     );
     c.test_now_ms = Some(NOW);
@@ -2956,14 +2955,127 @@ async fn stream_gate_refuses_entries_unless_connected_but_lets_closes_through() 
             ),
             "{st:?}"
         );
-        assert!(
-            submit_futures(&c, Action::Close(Dir::Long)).await.is_ok(),
-            "close must pass in {st:?}"
-        );
+        let close = submit_futures(&c, Action::Close(Dir::Long)).await;
+        if st == StreamState::AuthFailed {
+            // The credentials are void: nothing is sent, closes included (condition 57).
+            assert!(
+                matches!(
+                    close,
+                    Err(SubmitError::StreamNotReady(StreamState::AuthFailed))
+                ),
+                "a close must be refused after a failed login"
+            );
+        } else {
+            assert!(close.is_ok(), "close must pass in {st:?}");
+        }
     }
-    assert_eq!(fake.count("POST /fapi/v1/order"), 4);
+    assert_eq!(fake.count("POST /fapi/v1/order"), 3);
     set_stream(&c, StreamState::Connected);
     assert!(submit_futures(&c, Action::Open(Dir::Long)).await.is_ok());
+}
+
+#[tokio::test]
+async fn after_a_failed_login_every_kind_of_order_is_refused_and_nothing_is_sent() {
+    use super::stream::StreamState;
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    set_stream(&c, StreamState::AuthFailed);
+    for action in [
+        Action::Open(Dir::Long),
+        Action::Close(Dir::Long),
+        Action::Close(Dir::Short),
+    ] {
+        let r = submit_futures(&c, action).await;
+        assert!(
+            matches!(r, Err(SubmitError::StreamNotReady(StreamState::AuthFailed))),
+            "{r:?}"
+        );
+    }
+    assert_eq!(fake.count("POST"), 0);
+}
+
+#[tokio::test]
+async fn an_entry_waits_for_the_snapshot_the_tracker_has_not_applied_yet() {
+    use super::stream::{StreamState, status, sync_epoch};
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let account = c.account();
+    // A real registration, as `run` does it.
+    status::retire(account, 0);
+    let token = status::register(account);
+    let mut tracker = EquityTracker::new(
+        account,
+        EquityBasis::BinanceTotalMarginBalance,
+        RiskLimits::default(),
+    );
+    let t = futures();
+    let r = t.lookup("BTCUSDT").unwrap();
+    let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+    let send = async |tracker: &EquityTracker, action: Action, cid: &str| {
+        let intent =
+            OrderIntent::binance(account, futures_limit(r, &id(cid), action), &fresh).unwrap();
+        c.submit(
+            &OpenGate,
+            &c.risk_snapshot(tracker),
+            &NoJournal,
+            ConfirmToken::user_confirmed(),
+            intent,
+        )
+        .await
+    };
+
+    // The first snapshot is sent and the state is `Connected`, but the tracker has not
+    // applied it yet.
+    let epoch = status::begin_sync(account, token);
+    status::publish(account, token, StreamState::Connected);
+    assert_eq!(sync_epoch(account), epoch);
+    let err = send(&tracker, Action::Open(Dir::Long), "eAAAA")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SubmitError::Risk(RiskRefusal::SnapshotNotApplied)),
+        "{err:?}"
+    );
+    // A close is not an entry.
+    assert!(
+        send(&tracker, Action::Close(Dir::Long), "eAAAB")
+            .await
+            .is_ok()
+    );
+    // Applying the snapshot lets the entry through.
+    tracker.snapshot_applied(epoch);
+    assert!(
+        send(&tracker, Action::Open(Dir::Long), "eAAAC")
+            .await
+            .is_ok()
+    );
+
+    // The stream drops and comes back with a new snapshot: back to Connected, not applied.
+    status::publish(account, token, StreamState::Reconnecting);
+    let again = status::begin_sync(account, token);
+    assert_ne!(again, epoch);
+    status::publish(account, token, StreamState::Connected);
+    let err = send(&tracker, Action::Open(Dir::Long), "eAAAD")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SubmitError::Risk(RiskRefusal::SnapshotNotApplied)),
+        "{err:?}"
+    );
+    // Applying the old epoch again does not help; the new one does.
+    tracker.snapshot_applied(epoch);
+    assert!(
+        send(&tracker, Action::Open(Dir::Long), "eAAAE")
+            .await
+            .is_err()
+    );
+    tracker.snapshot_applied(again);
+    assert!(
+        send(&tracker, Action::Open(Dir::Long), "eAAAF")
+            .await
+            .is_ok()
+    );
+    status::retire(account, token);
 }
 
 #[tokio::test]
@@ -2973,13 +3085,12 @@ async fn stream_gate_starts_closed_for_an_unwired_client() {
     let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
     // A fresh client (before any stream output) is not connected.
     let fresh = TradeClient::new(
-        reqwest::Client::new(),
+        SignedHttp::for_test(reqwest::Client::new(), ProxyState::Direct),
         AccountVenue::Binance,
         AccountEnv::Live,
         AccountProduct::UsdM,
         unique_account(),
         ApiCredentials::new("k".into(), "s".into(), None),
-        ProxyState::Direct,
         Arc::new(|| ProxyState::Direct),
     );
     assert_eq!(
@@ -2987,13 +3098,12 @@ async fn stream_gate_starts_closed_for_an_unwired_client() {
         StreamState::Reconnecting
     );
     let spot = TradeClient::new(
-        reqwest::Client::new(),
+        SignedHttp::for_test(reqwest::Client::new(), ProxyState::Direct),
         AccountVenue::Binance,
         AccountEnv::Live,
         AccountProduct::Spot,
         unique_account(),
         ApiCredentials::new("k".into(), "s".into(), None),
-        ProxyState::Direct,
         Arc::new(|| ProxyState::Direct),
     );
     // Binance spot has no private stream: spot trading is off (user decision 3).
@@ -3256,13 +3366,12 @@ async fn two_clients_of_one_account_share_the_registry_and_a_retired_stream_refu
     let account = a.account();
     // A second client built later for the same account (the app builds one per send).
     let mut b = TradeClient::new(
-        reqwest::Client::new(),
+        SignedHttp::for_test(reqwest::Client::new(), ProxyState::Direct),
         AccountVenue::Okx,
         AccountEnv::Live,
         AccountProduct::UsdM,
         account,
         ApiCredentials::new("k".into(), "s".into(), Some("p".into())),
-        ProxyState::Direct,
         Arc::new(|| ProxyState::Direct),
     );
     b.test_now_ms = Some(NOW);
@@ -3460,8 +3569,20 @@ async fn a_failing_journal_does_not_stop_a_binance_reduce_only_close() {
             intent,
         )
         .await;
-    assert!(out.is_ok(), "{:?}", out.err());
+    assert!(out.is_ok(), "{:?}", out.as_ref().err());
+    assert!(
+        out.unwrap().journal_failed,
+        "the caller is told the write-ahead record is missing"
+    );
     assert_eq!(fake.count("POST /fapi/v1/order"), 1);
+}
+
+#[tokio::test]
+async fn a_working_journal_reports_no_failure() {
+    let fake = serve(gen_binance);
+    let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+    let out = submit_futures(&c, Action::Close(Dir::Long)).await.unwrap();
+    assert!(!out.journal_failed);
 }
 
 #[tokio::test]
@@ -3479,7 +3600,12 @@ async fn a_failing_journal_does_not_stop_okx_close_position_or_a_protective_algo
         ClientId::generate(Role::Entry),
     )
     .unwrap();
-    assert!(okx_submit_with(&c, &journal, close).await.is_ok());
+    assert!(
+        okx_submit_with(&c, &journal, close)
+            .await
+            .unwrap()
+            .journal_failed
+    );
     assert_eq!(fake.count("POST /api/v5/trade/close-position"), 1);
     let algo = okx::place_algo(OkxProtective {
         rules: sr,
@@ -3497,7 +3623,12 @@ async fn a_failing_journal_does_not_stop_okx_close_position_or_a_protective_algo
         client_id: ClientId::generate(Role::Entry),
     })
     .unwrap();
-    assert!(okx_submit_with(&c, &journal, algo).await.is_ok());
+    assert!(
+        okx_submit_with(&c, &journal, algo)
+            .await
+            .unwrap()
+            .journal_failed
+    );
     assert_eq!(fake.count("POST /api/v5/trade/order-algo"), 1);
 }
 
@@ -3533,6 +3664,7 @@ async fn a_failing_journal_does_not_stop_flatten_or_auto_close() {
         .await
         .unwrap();
     assert_eq!((rep.sent, rep.failed), (1, 0), "{rep:?}");
+    assert!(rep.journal_failed, "the report carries the journal failure");
     assert_eq!(fake.count("POST /api/v5/trade/close-position"), 1);
     let mut tracker = tripped_tracker(c.account(), EquityBasis::OkxTotalEq);
     let super::risk::AutoCloseDecision::Run(grant) = c.begin_auto_close(&mut tracker, true) else {
@@ -3596,7 +3728,7 @@ async fn a_record_locks_before_any_client_exists() {
     c.release_unknown_manually(challenge.confirm(&phrase).unwrap())
         .unwrap();
     assert!(!c.is_locked("BTC-USDT-SWAP"));
-    super::unknown::lock_from_record(account, &record).unwrap();
+    super::unknown::lock_from_record(&record).unwrap();
     // A client built afterwards (as the send path does every time) finds the lock.
     let fake2 = serve(gen_okx);
     let mut c2 = client(AccountVenue::Okx, AccountProduct::UsdM, &fake2);
@@ -3614,6 +3746,81 @@ async fn a_record_locks_before_any_client_exists() {
         .unwrap_err();
     assert!(matches!(err, SubmitError::Locked), "{err:?}");
     assert_eq!(fake2.count("POST"), 0);
+}
+
+#[tokio::test]
+async fn only_a_record_with_an_invalid_id_can_be_discarded_and_only_by_the_typed_phrase() {
+    use super::unknown::DiscardError;
+    let fake = okx_unknown_server(|_| okx_no_such_order());
+    let (c, pending) = okx_unknown(&fake).await;
+    let good = c.unknown_record(&pending);
+    // A live unresolved send is never discarded: it is looked up or released.
+    assert_eq!(good.begin_discard().unwrap_err(), DiscardError::StillValid);
+    let mut bad = good.clone();
+    bad.client_id = "not-an-id-123".into();
+    assert!(!bad.has_valid_client_id());
+    let challenge = bad.begin_discard().unwrap();
+    let phrase = challenge.phrase().to_string();
+    assert!(phrase.starts_with("discard BTC-USDT-SWAP "), "{phrase}");
+    // A wrong phrase gives the challenge back.
+    let challenge = challenge.confirm("yes").unwrap_err();
+    let token = challenge.confirm(&phrase).unwrap();
+    assert_eq!(token.client_id(), "not-an-id-123");
+    assert_eq!(token.account(), bad.account);
+    // Nothing printed shows the id or the phrase.
+    let shown = format!("{token:?} {:?}", bad.begin_discard().unwrap());
+    assert!(
+        !shown.contains("not-an-id-123") && !shown.contains(&phrase),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn the_free_function_locks_the_account_the_record_names() {
+    let fake = okx_unknown_server(|_| okx_no_such_order());
+    let (c, pending) = okx_unknown(&fake).await;
+    let record = c.unknown_record(&pending);
+    let challenge = pending.begin_manual_release();
+    let phrase = challenge.phrase().to_string();
+    c.release_unknown_manually(challenge.confirm(&phrase).unwrap())
+        .unwrap();
+    assert!(!c.is_locked("BTC-USDT-SWAP"));
+    // There is no account argument to get wrong: the record's own account is locked.
+    super::unknown::lock_from_record(&record).unwrap();
+    assert!(c.is_locked("BTC-USDT-SWAP"));
+    // The same free function on a record of a stranger locks the stranger's account only.
+    let mut stranger = record;
+    stranger.account = unique_account();
+    super::unknown::lock_from_record(&stranger).unwrap();
+    assert!(c.is_locked("BTC-USDT-SWAP"));
+    assert!(super::locks::is_locked(stranger.account, "BTC-USDT-SWAP"));
+}
+
+#[tokio::test]
+async fn locking_twice_from_the_same_record_needs_one_release() {
+    let fake = okx_unknown_server(|_| okx_no_such_order());
+    let (c, pending) = okx_unknown(&fake).await;
+    let record = c.unknown_record(&pending);
+    let t = okx_swap_table();
+    let sr = t.lookup("BTC-USDT-SWAP").unwrap();
+    // The free function (startup, before any client) and `restore_unknown` (which locks again)
+    // describe the same order: one lock, not two.
+    super::unknown::lock_from_record(&record).unwrap();
+    super::unknown::lock_from_record(&record).unwrap();
+    let restored = c.restore_unknown(&record, sr).unwrap();
+    // One manual release unlocks completely.
+    let challenge = restored.begin_manual_release();
+    let phrase = challenge.phrase().to_string();
+    c.release_unknown_manually(challenge.confirm(&phrase).unwrap())
+        .unwrap();
+    assert!(!c.is_locked("BTC-USDT-SWAP"));
+
+    // Same through the resolver: lock twice, restore, and one answer unlocks it.
+    super::unknown::lock_from_record(&record).unwrap();
+    let restored = c.restore_unknown(&record, sr).unwrap();
+    let res = c.resolve_unknown(restored, &NoJournal).await;
+    assert!(matches!(res, Resolution::NotPlacedPresumed), "{res:?}");
+    assert!(!c.is_locked("BTC-USDT-SWAP"));
 }
 
 #[tokio::test]

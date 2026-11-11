@@ -34,7 +34,7 @@
 16. Base URL 一律寫死為 `https://` 常數，依 (venue, env) 對應；不得來自 `saved-state.json`、使用者輸入或 `server_url`。簽名前檢查 scheme 為 `https`，並確認 host 在白名單內。不符合時回傳錯誤，不得送出。
 17. 簽名請求的 reqwest client 需沿用 timeout 與 proxy 設定，並加上 `.redirect(reqwest::redirect::Policy::none())` 與 `.https_only(true)`。
     - 理由：reqwest 0.12 跨 host 轉址時只會移除 `Authorization`、`Cookie`、`Proxy-Authorization` 等標準標頭，不會移除 `X-MBX-APIKEY`、`OK-ACCESS-KEY`、`OK-ACCESS-SIGN`、`OK-ACCESS-PASSPHRASE`。既有的 `exchange_http` 使用預設轉址策略（最多 10 次）。
-    - M4 的實作方式：以 `src/connector/client.rs` 的 `signed_client` 建立，未經 `http_client(...)`。原因是 `http_client` 建立失敗會 panic，套用 proxy 失敗時會改為直連，兩者都與條件 21 衝突。此替代做法已審查通過，且達成條件 17 與 21 的目的。
+    - M4 的實作方式：以 `exchange/src/signed_http.rs` 的 `SignedHttp::build` 建立（單一建構函式，欄位私有，`TradeClient::new` 與 `StreamContext` 只收 `SignedHttp`），未經 `http_client(...)`。原因是 `http_client` 建立失敗會 panic，套用 proxy 失敗時會改為直連，兩者都與條件 21 衝突。此替代做法已審查通過，且達成條件 17 與 21 的目的。
 18. 簽名請求絕不可經過 `server_http`，因為它對 `danger_accept_invalid_certs(true)`。簽名用 client 不得呼叫 `danger_accept_invalid_certs`、`danger_accept_invalid_hostnames`，也不得加入自訂 root CA。新檔案中不得出現 `danger_`。
 19. 不得直接使用 `HttpHub::http_*_with_limiter` 送簽名請求，原因有二：`send_request_client` 無法加 header；URL 會原封不動寫進 log 與錯誤字串，包括 query 中的 `signature`。
     - 簽名請求改用專屬函式，可與既有程式共用 limiter 實例，但需符合：
@@ -99,7 +99,7 @@
 - `data/src/config/exchange_accounts.rs`：Keychain 存取（`KEYCHAIN_SERVICE = "flowsurface.exchange"`）、帳戶中繼資料、`sanitized()`。
 - `src/modal/exchange_accounts.rs`：設定頁 modal、表單、Test、Save 與 Delete。
 - `exchange/src/adapter/proxy.rs` 的 `apply_proxy_strict`：簽名用 client 的 proxy fail closed。
-- `src/connector/client.rs` 的 `signed_client`：簽名用 client（`redirect(none)`、`https_only(true)`、嚴格 proxy）。
+- `exchange/src/signed_http.rs` 的 `SignedHttp`：簽名用 client（`redirect(none)`、`https_only(true)`、嚴格 proxy，proxy 壞掉時不建立）。GUI 在 `src/connector/client.rs` 只負責呼叫 `SignedHttp::build`。
 
 ## M5 交易
 
@@ -146,7 +146,7 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
   - 驗證：Testnet 合約帳戶對現貨 host 呼叫 `https_endpoint` 會被拒；Keychain 與存檔的產品不一致時拒絕載入。
 - **42（a、b）**：F10 延伸。每次簽名請求、每次私有 WS 連線與重連之前，都比對目前的 `network_config.proxy` 與建立連線時的 proxy 快照，不一致就拒絕並提示重啟。私有 WS 的 proxy 與簽名 client 取自同一份快照，不得沿用 `spawn_venues` 的 proxy。proxy 設了但無法載入時，要用明確狀態（例如 `ProxyState::Broken`），不得變成 `None`（直連）。實作前先核對 R4 的載入路徑。
   - 驗證：proxy 快照比較函式與 Broken 拒絕連線的單元測試。手動（F9 一併驗）：設定無效 proxy 後下單與開私有流，都應被拒，並用 `lsof -i` 或防火牆紀錄確認沒有直連交易所。
-- **43（a、b）**：不新增任何 `danger_`、自訂 root CA、憑證 pinning 例外；私有 WS 沿用 `TLS_CONNECTOR`（webpki roots）。簽名 REST 只用 `signed_client`，不得用 `exchange_http`、`server_http`、`HttpHub`。
+- **43（a、b）**：不新增任何 `danger_`、自訂 root CA、憑證 pinning 例外；私有 WS 沿用 `TLS_CONNECTOR`（webpki roots）。簽名 REST 只用 `SignedHttp`，不得用 `exchange_http`、`server_http`、`HttpHub`。
   - 驗證：`git diff main -- . | grep -n 'danger_'` 結果必須為空；code review 確認呼叫點。
 - **44（a）**：送出的位元組必須等於被簽名的字串。Binance 以固定順序做 form-urlencode，簽名後原樣送出；OKX body 先用 serde 序列化成字串，簽這個字串，再送出同一字串。symbol／instId 必須存在於交易規則清單，字元限制為 `[A-Z0-9-]`，不得直接放入使用者自由輸入的文字。
   - 依據：不一致會造成 `-1022`；也可能被參數注入（例如 symbol 中塞 `&quantity=`）。
@@ -196,6 +196,7 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 - **57（a、c）**：下單前有兩層判定，兩層都通過才送出。
   1. **F2 閘門**（純函式，`data::config::trade_gate`）：`can_send(session_verdict, keychain_meta, saved_meta, proxy_ok, order)`，由 `SessionGate` 以唯一的 `SendGate` 實作提供。私有流狀態不是它的參數：data 不再保存第二份串流狀態（`StreamState`、`SessionGate.stream` 已移除），避免 UI 與送單讀到不同的值。
   2. **exchange 的 `approve`**：從以帳戶為 key 的串流狀態 registry 讀取私有流狀態（由私有流的 driver 寫入，送單端與 GUI 都不能寫）。非 `Connected` 拒絕新進場與拖曳，沒有登記等於 `Reconnecting`，現貨 `Unavailable` 等於現貨交易停用；本機風控 `RiskHook`（唯一來源是 `EquityTracker` → `RiskSnapshot`，設定無效等於鎖定新進場）；規則有效期；未解決 Unknown 的 (帳戶, symbol) 鎖。
+     - c2a 補強：registry 為 `AuthFailed` 時 `approve` 拒絕**所有**單，含平倉與減倉（條件 57：登入失敗代表 session 作廢、憑證不可用，舊的 `can_send` 也是全拒）。每次重新同步的 Snapshot 帶一個 `sync_epoch`；`EquityTracker` 必須對該 epoch 呼叫 `snapshot_applied`，否則新進場以 `SnapshotNotApplied` 被拒（串流回到 Connected 但快照尚未套用的空窗）。driver 的 drop guard 只把 Connected／Resyncing 降為 Reconnecting，不覆寫 `AuthFailed`／`Unavailable`。
 
   本機風控不是 `can_send` 的參數，UI 的鎖定顯示也讀同一個 `EquityTracker`。平倉、減倉、撤單不受私有流與風控鎖定限制（條件 60）。
   - `session_verdict` 存在 `Flowsurface` 層的記憶體 session，不是 modal 的 `Status`。
@@ -408,7 +409,7 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 
 - **F1（中）**：Binance 簽名請求（`exchange/src/account.rs` 的 `send_get`）沒有與公開 `/fapi` 請求共用 limiter。M5 下單與查倉會持續送出簽名請求，必須共用同一個 limiter 實例，並在每次送出前取得配額。
 - **F2（中）**：判定結果目前只存在 modal 的 `Status`。M5 下單前必須讀取記憶體中的判定，確認 `is_usable(env, verdict)`。不得從 `saved-state.json` 讀取，也不得以「沒有測試過」當成預設可用。下單時要重新呼叫 `load_credentials`（會比對 venue 與 env），不要留存 Test 時取得的 `ApiCredentials` 重複使用。
-- **F10 延伸**：M4 只在 Test 前檢查 proxy 是否變更（`signed_client_for_current_proxy`），變更後要求重啟。M5 必須把同一檢查延伸到每個簽名請求與私有 WebSocket。
+- **F10 延伸**：M4 只在 Test 前檢查 proxy 是否變更（`signed_client_for_current_proxy`，現回傳 `SignedHttp`），變更後要求重啟。M5 必須把同一檢查延伸到每個簽名請求與私有 WebSocket。
 
 ## 其他後續項目
 
@@ -446,3 +447,15 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 - `ServerClient` 與 `Network` 使用 `derive(Debug)`（低到中），會把 `auth_token` 或 `server_auth_token` 以明文輸出。目前未找到會輸出它們的 log，但屬潛在風險。
 - `src/connector/client.rs` 的 `text()`、`bytes()`（低到中）：伺服器回應沒有大小限制，非 2xx 時還會把整個回應寫進 log。
 - `src/main.rs` 的 `Message`，以及 `src/modal/network_editor.rs` 的 `ProxyMsg::PasswordChanged`、`FetchMsg::ServerAuthTokenChanged`，使用 `derive(Debug)`（低）。以 `debug` feature 建置時，會把 Message 的前 49 個字元送到 comet beacon，含明文輸入時會洩漏部分 secret。
+
+
+## c2a 補充：Unknown 紀錄、握手與重複 key
+
+- **journal 寫入順序**：進場單先寫入（write-ahead）journal 再送出，已知結果後才清除；寫入失敗的新進場被拒。
+- **B5 分支**：非進場單（平倉、取消、保護單）journal 寫入失敗時仍送出，並以 `Submitted.journal_failed`／`BulkReport.journal_failed` 回報，GUI 應顯示常駐警告。
+- **`block_all_entries` 語意**：載入 Unknown store 失敗時，所有帳戶的新進場封鎖到重啟為止；平倉、取消與保護單不受影響。現貨部位只能靠保護單退出。
+- **丟棄無效紀錄**：只有 client id 無效的紀錄可丟棄。流程為 `begin_discard` → 使用者輸入確認句 → `DiscardToken` → `UnknownStore::discard_invalid`，並寫入風控日誌 `unknown_discarded_invalid_record`。丟棄後帳戶仍維持封鎖到重啟。
+- **L-4 握手**：私有 WS 握手整體期限 15 秒、單次讀取 10 秒；握手期間緩衝的事件上限 512，超過視為網路錯誤。未被要求的 channel 確認不計入。
+- **重複 API key**：`ApiCredentials::same_key_as` 只比對 key；GUI 儲存前以 `check_key_not_bound` 檢查同 venue／env／product 的其他帳戶，Keychain 讀取失敗視為無法驗證而拒絕。driver 以程序內 `key_claims`（SHA-256 摘要為 key）防止兩個帳戶共用同一把 key 的 listenKey。
+- **Unknown store I/O**：拒絕 symlink 與非一般檔案（FIFO），rename 後 fsync 目錄；GUI 使用 `*_async`（`spawn_blocking`）包裝。殘餘風險：檢查後才被換成 FIFO 仍可能卡住（未用 `O_NONBLOCK`）。
+- **冪等**：同一紀錄重複 `lock_from_record` 只需一次釋放。

@@ -8,6 +8,7 @@ use super::binance::{
     spot_subscribe_frame, spot_ws_api_url,
 };
 use super::events::{MAX_FRAME_BYTES, ParseError, PrivateEvent, ResyncReason};
+use super::key_claims;
 use super::machine::{Command, DownCause, InvalidReason, Machine, StreamState};
 use super::okx::{
     OkxLeg, OkxMessage, is_clock_error, leg_channels, login_frame, okx_ws_timestamp, parse_okx,
@@ -21,6 +22,7 @@ use crate::account::{
 };
 use crate::adapter::ws::{HeartbeatPolicy, WsTransport};
 use crate::rate_limit::{Denied, Priority, WindowBucket};
+use crate::signed_http::SignedHttp;
 use crate::trade::client::{Balance, OpenOrder, Position, TradeClient};
 use crate::trade::locks;
 use fastwebsockets::{Frame, Payload};
@@ -49,8 +51,8 @@ pub type CredentialLoader =
 #[derive(Clone)]
 pub struct StreamContext {
     pub key: StreamKey,
-    pub http: reqwest::Client,
-    pub proxy_snapshot: ProxyState,
+    /// The signed client and the proxy it was built with; REST and the WebSocket both follow it.
+    pub signed: SignedHttp,
     pub current_proxy: Arc<dyn Fn() -> ProxyState + Send + Sync>,
     pub load_credentials: CredentialLoader,
 }
@@ -69,6 +71,16 @@ pub struct Snapshot {
     pub orders: Vec<OpenOrder>,
     pub positions: Vec<Position>,
     pub balances: Vec<Balance>,
+    /// Which snapshot of the stream this is. The consumer passes it to
+    /// [`EquityTracker::snapshot_applied`](crate::trade::EquityTracker::snapshot_applied)
+    /// when it has applied the snapshot; until then the account's entries are refused.
+    pub(crate) epoch: u64,
+}
+
+impl Snapshot {
+    pub fn sync_epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +174,9 @@ struct Shared {
     /// The token that lets this stream write its state to the status table; `None` when the
     /// stream is not registered (tests of the pieces).
     status_token: Option<u64>,
+    /// This stream's claim on its API key (futures only), held until the stream ends so that no
+    /// other app account can open a stream on the same exchange account.
+    key_claim: Mutex<Option<key_claims::KeyClaim>>,
 }
 
 impl Shared {
@@ -172,6 +187,7 @@ impl Shared {
             clock_offset_ms: AtomicI64::new(0),
             pending_legs: AtomicUsize::new(0),
             status_token: None,
+            key_claim: Mutex::new(None),
         }
     }
 }
@@ -292,8 +308,10 @@ struct ReconnectingOnExit {
 
 impl Drop for ReconnectingOnExit {
     fn drop(&mut self) {
+        // Not `publish`: an `AuthFailed` or `Unavailable` stream ended on purpose, and that
+        // reason must stay readable (review N6).
         if let Some(token) = self.token {
-            status::publish(self.account, token, StreamState::Reconnecting);
+            status::demote(self.account, token);
         }
     }
 }
@@ -451,9 +469,16 @@ impl Supervisor {
                 self.reading = false;
                 let held = std::mem::take(&mut self.held);
                 let cmds = match result {
-                    Ok(snapshot) => {
+                    Ok(mut snapshot) => {
                         let cmds = self.machine.resync_done(true);
                         if self.machine.state() == StreamState::Connected {
+                            // The state turns `Connected` with (or before) this send, but the
+                            // consumer applies the snapshot later: the epoch makes entries wait
+                            // for that (review N1).
+                            if let Some(token) = self.shared.status_token {
+                                snapshot.epoch =
+                                    status::begin_sync(self.shared.ctx.key.account, token);
+                            }
                             // The snapshot first, then what arrived while it was read.
                             self.send(StreamOutput::Snapshot(Box::new(snapshot)));
                         }
@@ -585,17 +610,16 @@ async fn load_credentials(ctx: &StreamContext) -> Result<ApiCredentials, DownCau
 
 /// A fresh client with credentials loaded for this call only.
 async fn make_client(ctx: &StreamContext, clock_offset_ms: i64) -> Result<TradeClient, DownCause> {
-    check_proxy_snapshot(&ctx.proxy_snapshot, &(ctx.current_proxy)())
+    check_proxy_snapshot(ctx.signed.proxy_state(), &(ctx.current_proxy)())
         .map_err(|_| DownCause::Proxy)?;
     let creds = load_credentials(ctx).await?;
     let client = TradeClient::new(
-        ctx.http.clone(),
+        ctx.signed.clone(),
         ctx.key.venue,
         ctx.key.env,
         ctx.key.product,
         ctx.key.account,
         creds,
-        ctx.proxy_snapshot.clone(),
         ctx.current_proxy.clone(),
     );
     client.set_clock_offset_ms(clock_offset_ms);
@@ -634,6 +658,7 @@ async fn read_snapshot(shared: &Shared) -> Result<Snapshot, DownCause> {
         orders,
         positions,
         balances,
+        epoch: 0,
     })
 }
 
@@ -699,6 +724,28 @@ pub(crate) fn login_step(frame: &[u8]) -> LoginStep {
     }
 }
 
+/// The whole handshake of one connection (OKX login plus subscribe, Binance spot subscribe)
+/// must finish within this, however many frames the server sends meanwhile.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(15);
+/// One handshake read waits at most this long.
+const HANDSHAKE_READ: Duration = Duration::from_secs(10);
+/// Events a server may push before the last subscription is confirmed. They are kept (a
+/// dropped event would leave the state after the snapshot incomplete), so the count is bounded.
+const MAX_EARLY_EVENTS: usize = 512;
+
+/// How long one handshake read may wait, or `None` once the deadline has passed.
+pub(crate) fn remaining(deadline: Instant, now: Instant) -> Option<Duration> {
+    let left = deadline.checked_duration_since(now)?;
+    (!left.is_zero()).then(|| left.min(HANDSHAKE_READ))
+}
+
+/// One handshake frame, read within what is left of the deadline. A passed deadline is a
+/// network failure (reconnect with backoff), never an authentication failure.
+async fn read_handshake(t: &mut WsTransport, deadline: Instant) -> Result<Vec<u8>, DownCause> {
+    let wait = remaining(deadline, Instant::now()).ok_or(DownCause::Network)?;
+    t.read_text(wait).await.map_err(|_| DownCause::Network)
+}
+
 /// How far an OKX leg's subscriptions have got. The leg is up only when every channel it asked
 /// for is confirmed: an unconfirmed channel would leave the stream looking healthy and blind.
 pub(crate) struct SubscribeProgress {
@@ -728,7 +775,10 @@ impl SubscribeProgress {
     pub(crate) fn feed(&mut self, frame: &[u8]) -> Option<DownCause> {
         match parse_okx(frame) {
             Ok(OkxMessage::Subscribed { channel }) => {
-                self.confirmed.insert(channel);
+                // A name we did not ask for confirms nothing.
+                if self.expected.contains(&channel.as_str()) {
+                    self.confirmed.insert(channel);
+                }
                 None
             }
             Ok(OkxMessage::Error { code }) => {
@@ -741,6 +791,9 @@ impl SubscribeProgress {
             }
             Ok(OkxMessage::Notice) => Some(DownCause::Expired),
             Ok(OkxMessage::Events(events)) => {
+                if self.early.len().saturating_add(events.len()) > MAX_EARLY_EVENTS {
+                    return Some(DownCause::Network);
+                }
                 self.early.extend(events);
                 None
             }
@@ -765,10 +818,10 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
     if spot && !SPOT_PRIVATE_STREAM_VERIFIED {
         return DownCause::Unavailable;
     }
-    if let Err(_e) = check_proxy_snapshot(&ctx.proxy_snapshot, &(ctx.current_proxy)()) {
+    if let Err(_e) = check_proxy_snapshot(ctx.signed.proxy_state(), &(ctx.current_proxy)()) {
         return DownCause::Proxy;
     }
-    let proxy = match &ctx.proxy_snapshot {
+    let proxy = match ctx.signed.proxy_state() {
         ProxyState::Direct => None,
         ProxyState::Proxied(p) => Some(p.clone()),
         ProxyState::Broken => return DownCause::Proxy,
@@ -785,8 +838,28 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
         AccountVenue::Okx => ws_url(key.env, key.product, okx_leg),
         AccountVenue::Binance if spot => spot_ws_api_url(key.env),
         AccountVenue::Binance => {
+            // One stream per exchange account: the same key under another app account would
+            // share this listenKey and split the locks and limits.
+            {
+                let mut held = shared.key_claim.lock().unwrap_or_else(|p| p.into_inner());
+                // Release a claim on an old key first (the Keychain item was replaced).
+                *held = None;
+                match key_claims::claim(
+                    key.account,
+                    shared.status_token.unwrap_or(0),
+                    creds.key().expose_secret(),
+                ) {
+                    Some(c) => *held = Some(c),
+                    None => {
+                        log::warn!(
+                            "private stream: this API key is already in use by another account"
+                        );
+                        return DownCause::Unavailable;
+                    }
+                }
+            }
             let client = TradeClient::new(
-                ctx.http.clone(),
+                ctx.signed.clone(),
                 key.venue,
                 key.env,
                 key.product,
@@ -796,7 +869,6 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
                     creds.secret().expose_secret().to_string(),
                     None,
                 ),
-                ctx.proxy_snapshot.clone(),
                 ctx.current_proxy.clone(),
             );
             client.set_clock_offset_ms(offset);
@@ -824,6 +896,7 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
         }
     };
     transport.limit_frame_size(MAX_FRAME_BYTES);
+    let deadline = Instant::now() + HANDSHAKE_DEADLINE;
 
     let now_ms = chrono::Utc::now().timestamp_millis() + offset;
     let mut early: Vec<PrivateEvent> = Vec::new();
@@ -838,13 +911,13 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
                 return DownCause::Network;
             }
             loop {
-                match transport.read_text(Duration::from_secs(10)).await {
+                match read_handshake(&mut transport, deadline).await {
                     Ok(bytes) => match login_step(&bytes) {
                         LoginStep::Wait => {}
                         LoginStep::Done => break,
                         LoginStep::Fail(c) => return c,
                     },
-                    Err(_) => return DownCause::Network,
+                    Err(c) => return c,
                 }
             }
             if write_text(&mut transport, subscribe_frame(okx_leg, key.product))
@@ -855,13 +928,13 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
             }
             let mut progress = SubscribeProgress::new(okx_leg, key.product);
             while !progress.complete() {
-                match transport.read_text(Duration::from_secs(10)).await {
+                match read_handshake(&mut transport, deadline).await {
                     Ok(bytes) => {
                         if let Some(cause) = progress.feed(&bytes) {
                             return cause;
                         }
                     }
-                    Err(_) => return DownCause::Network,
+                    Err(c) => return c,
                 }
             }
             early = progress.early;
@@ -883,7 +956,7 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
                 return DownCause::Network;
             }
             loop {
-                match transport.read_text(Duration::from_secs(10)).await {
+                match read_handshake(&mut transport, deadline).await {
                     Ok(bytes) => match parse_spot(&bytes) {
                         Ok(SpotMessage::Subscribed) => break,
                         Ok(m @ SpotMessage::Refused { .. }) => {
@@ -899,7 +972,7 @@ async fn run_leg(shared: &Shared, leg: usize, epoch: u64, tx: &UnboundedSender<M
                         Ok(SpotMessage::Events(_)) => {}
                         Err(_) => return DownCause::Network,
                     },
-                    Err(_) => return DownCause::Network,
+                    Err(c) => return c,
                 }
             }
             HeartbeatPolicy::server_driven(Duration::from_secs(90))
@@ -1007,8 +1080,7 @@ mod tests {
     fn context(venue: AccountVenue, product: AccountProduct) -> StreamContext {
         StreamContext {
             key: key(venue, product),
-            http: reqwest::Client::new(),
-            proxy_snapshot: ProxyState::Direct,
+            signed: SignedHttp::for_test(reqwest::Client::new(), ProxyState::Direct),
             current_proxy: Arc::new(|| ProxyState::Direct),
             load_credentials: Arc::new(|| Err(CredentialsUnavailable)),
         }
@@ -1271,6 +1343,7 @@ mod tests {
             orders: Vec::new(),
             positions: Vec::new(),
             balances: Vec::new(),
+            epoch: 0,
         }
     }
 
@@ -1443,6 +1516,25 @@ mod tests {
     }
 
     #[test]
+    fn exiting_after_a_failed_login_keeps_auth_failed_in_the_registry() {
+        let account = AccountKey::from_bytes([0xB4; 16]);
+        let token = status::register(account);
+        status::publish(account, token, StreamState::AuthFailed);
+        drop(ReconnectingOnExit {
+            account,
+            token: Some(token),
+        });
+        assert_eq!(status::stream_state(account), StreamState::AuthFailed);
+        status::publish(account, token, StreamState::Unavailable);
+        drop(ReconnectingOnExit {
+            account,
+            token: Some(token),
+        });
+        assert_eq!(status::stream_state(account), StreamState::Unavailable);
+        status::retire(account, token);
+    }
+
+    #[test]
     fn the_state_survives_a_client_rebuilt_for_every_send() {
         runtime().block_on(async {
             let ctx = unique_ctx(0xB2);
@@ -1509,9 +1601,8 @@ mod tests {
     fn the_stream_handle_shuts_down_through_the_supervisor() {
         let loads = Arc::new(AtomicUsize::new(0));
         runtime().block_on(async {
-            let mut ctx = counting(&loads, Duration::ZERO);
+            let ctx = counting(&loads, Duration::ZERO);
             // The connection task cannot connect (no credentials) and only retries.
-            ctx.proxy_snapshot = ProxyState::Direct;
             let stream = run(ctx);
             tokio::time::timeout(Duration::from_secs(10), stream.shutdown())
                 .await
@@ -1596,5 +1687,56 @@ mod tests {
         // The machine does not reconnect after `Unavailable`.
         let mut m = Machine::start(2, false).0;
         assert_eq!(m.leg_down(0, DownCause::Unavailable), vec![Command::Stop]);
+    }
+
+    fn position_push(n: usize) -> String {
+        let item =
+            r#"{"instId":"BTC-USDT-SWAP","posSide":"net","pos":"1","avgPx":"1","mgnMode":"cross"}"#;
+        let items = vec![item; n].join(",");
+        format!(r#"{{"arg":{{"channel":"positions"}},"data":[{items}]}}"#)
+    }
+
+    #[test]
+    fn early_events_are_bounded_and_the_limit_itself_is_allowed() {
+        let mut p = SubscribeProgress::new(OkxLeg::Private, AccountProduct::UsdM);
+        assert_eq!(p.feed(position_push(MAX_EARLY_EVENTS).as_bytes()), None);
+        assert_eq!(p.early.len(), MAX_EARLY_EVENTS);
+        // One more event is over the limit; nothing is truncated or added.
+        assert_eq!(
+            p.feed(position_push(1).as_bytes()),
+            Some(DownCause::Network)
+        );
+        assert_eq!(p.early.len(), MAX_EARLY_EVENTS);
+        // One frame that alone exceeds the limit ends the leg too.
+        let mut q = SubscribeProgress::new(OkxLeg::Private, AccountProduct::UsdM);
+        assert_eq!(
+            q.feed(position_push(MAX_EARLY_EVENTS + 1).as_bytes()),
+            Some(DownCause::Network)
+        );
+        assert!(q.early.is_empty());
+    }
+
+    #[test]
+    fn a_channel_we_did_not_ask_for_confirms_nothing() {
+        let sub = |c: &str| format!(r#"{{"event":"subscribe","arg":{{"channel":"{c}"}}}}"#);
+        let mut p = SubscribeProgress::new(OkxLeg::Private, AccountProduct::UsdM);
+        for c in ["tickers", "books", "orders-algo", "x"] {
+            assert_eq!(p.feed(sub(c).as_bytes()), None);
+        }
+        assert!(p.confirmed.is_empty());
+        assert!(!p.complete());
+    }
+
+    #[test]
+    fn a_handshake_read_never_waits_past_the_deadline() {
+        let t0 = Instant::now();
+        let deadline = t0 + HANDSHAKE_DEADLINE;
+        assert_eq!(remaining(deadline, t0), Some(HANDSHAKE_READ));
+        assert_eq!(
+            remaining(deadline, t0 + Duration::from_secs(12)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(remaining(deadline, deadline), None);
+        assert_eq!(remaining(deadline, deadline + Duration::from_secs(1)), None);
     }
 }

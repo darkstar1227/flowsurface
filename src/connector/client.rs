@@ -6,20 +6,20 @@ use exchange::{TickerInfo, Trade, UnixMs};
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch};
 use arrow_ipc::reader::StreamReader;
 
-use exchange::account::{AccountError, ProxyState};
+use exchange::account::ProxyState;
 use exchange::adapter::{AdapterHandles, Venue};
 use exchange::proxy::Proxy;
+use exchange::signed_http::SignedHttp;
 
 #[derive(Clone)]
 pub struct DataSources {
     pub catalog_http: reqwest::Client,
     pub exchange: AdapterHandles,
     pub server: Option<ServerClient>,
-    /// Client for signed (credential-bearing) exchange requests, or why it is unavailable.
-    pub signed: Result<reqwest::Client, String>,
-    /// Proxy the `signed` client was built with, to detect later changes.
-    /// `Broken` when the user's proxy setting could not be read.
-    pub signed_proxy: ProxyState,
+    /// Client for signed (credential-bearing) exchange requests together with the proxy it was
+    /// built with (`Broken` when the user's proxy setting could not be read), or why it is
+    /// unavailable. The two cannot be separated, see [`SignedHttp`].
+    pub signed: Result<SignedHttp, String>,
 }
 
 impl DataSources {
@@ -42,14 +42,12 @@ impl DataSources {
                 .redirect(reqwest::redirect::Policy::none())
         });
 
-        let (signed, signed_proxy) = if proxy_unreadable {
-            (
-                Err(AccountError::ProxyBroken.to_string()),
-                ProxyState::Broken,
-            )
+        let signed = SignedHttp::build(if proxy_unreadable {
+            ProxyState::Broken
         } else {
-            (signed_client(proxy), ProxyState::from_config(proxy))
-        };
+            ProxyState::from_config(proxy)
+        })
+        .map_err(|e| e.to_string());
         let server = ServerClient::from_mode(&server_http, network);
         let exchange = AdapterHandles::spawn_venues(&exchange_http, Venue::ALL, proxy);
 
@@ -58,7 +56,6 @@ impl DataSources {
             server,
             catalog_http,
             signed,
-            signed_proxy,
         }
     }
 }
@@ -92,23 +89,6 @@ fn base_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
-}
-
-/// Client for signed exchange requests (API keys in headers or query).
-///
-/// Differs from the other clients on purpose:
-/// - never follows redirects, so `X-MBX-APIKEY` / `OK-ACCESS-*` headers cannot be
-///   forwarded to another host (reqwest only strips the standard auth headers);
-/// - https only;
-/// - fails closed on an unusable proxy instead of connecting directly.
-fn signed_client(proxy_cfg: Option<&Proxy>) -> Result<reqwest::Client, String> {
-    let builder = base_client_builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .https_only(true);
-
-    exchange::adapter::proxy::apply_proxy_strict(builder, proxy_cfg)?
-        .build()
-        .map_err(|_| "failed to build the HTTP client for signed requests".to_string())
 }
 
 impl std::fmt::Debug for DataSources {

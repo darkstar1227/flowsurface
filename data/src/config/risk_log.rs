@@ -45,6 +45,8 @@ pub enum LogAction {
     UnknownSaved,
     UnknownRestored,
     UnknownReleased,
+    /// A saved record with an invalid client id was dropped by the user (two-step confirmation).
+    UnknownDiscarded,
 }
 
 /// One log line. The fields are private and the constructors take typed values only.
@@ -115,6 +117,7 @@ fn refusal_reason(r: RiskRefusal) -> &'static str {
         RiskRefusal::Locked => "locked",
         RiskRefusal::SettingsInvalid => "settings_invalid",
         RiskRefusal::WrongAccount => "wrong_account",
+        RiskRefusal::SnapshotNotApplied => "snapshot_not_applied",
     }
 }
 
@@ -217,6 +220,7 @@ impl RiskLogEntry {
         let reason = match action {
             LogAction::UnknownSaved => "unknown_saved",
             LogAction::UnknownRestored => "unknown_restored",
+            LogAction::UnknownDiscarded => "unknown_discarded_invalid_record",
             _ => "unknown_released_by_user",
         };
         let mut e = Self::base(meta, at_ms, action, reason);

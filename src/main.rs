@@ -20,6 +20,7 @@ use data::config::trade_gate::TradeSession;
 use data::{layout::WindowSpec, sidebar};
 use exchange::account::{AccountError, ProxyState, check_proxy_snapshot};
 use exchange::adapter::UniqueStreams;
+use exchange::signed_http::SignedHttp;
 use layout::{LayoutId, configuration};
 use modal::dashboard_modal;
 use modal::{
@@ -192,12 +193,17 @@ impl Flowsurface {
     /// Checked before every signed request (and, later, every private stream connect, which
     /// must use this same snapshot).
     fn proxy_snapshot_ok(&self) -> Result<(), AccountError> {
-        check_proxy_snapshot(&self.data_sources.signed_proxy, &self.current_proxy_state())
+        match &self.data_sources.signed {
+            Ok(signed) => check_proxy_snapshot(signed.proxy_state(), &self.current_proxy_state()),
+            // No client was built: nothing may be signed, whatever the proxy says now.
+            Err(_) if self.proxy_unreadable => Err(AccountError::ProxyBroken),
+            Err(_) => Err(AccountError::ClientBuild),
+        }
     }
 
     /// The signed-request client, unless the proxy settings changed since it was built:
     /// it must not silently keep using (or bypassing) an outdated proxy.
-    fn signed_client_for_current_proxy(&self) -> Result<reqwest::Client, String> {
+    fn signed_client_for_current_proxy(&self) -> Result<SignedHttp, String> {
         self.proxy_snapshot_ok().map_err(|e| e.to_string())?;
         self.data_sources.signed.clone()
     }

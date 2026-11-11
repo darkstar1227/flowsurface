@@ -8,12 +8,14 @@ use crate::{
     widget::{BannerKind, banner},
 };
 use data::config::exchange_accounts::{
-    AccountMeta, StoreError, delete_credentials, load_credentials, save_credentials,
+    AccountMeta, StoreError, check_key_not_bound, delete_credentials, load_credentials,
+    save_credentials,
 };
 use exchange::account::{
     AccountEnv, AccountProduct, AccountVenue, ApiCredentials, CheckReport, PositionMode, Verdict,
     check_account, is_usable,
 };
+use exchange::signed_http::SignedHttp;
 
 use iced::{
     Element, Task, Theme,
@@ -177,7 +179,7 @@ impl ExchangeAccounts {
     pub fn update(
         &mut self,
         message: Message,
-        signed: &Result<reqwest::Client, String>,
+        signed: &Result<SignedHttp, String>,
     ) -> (Task<Message>, Option<Action>) {
         match message {
             Message::GoBack => {
@@ -213,7 +215,8 @@ impl ExchangeAccounts {
                     Ok((meta, creds)) => {
                         self.error = None;
                         self.saving = true;
-                        return (save_task(meta, creds), None);
+                        let others = self.rows.iter().map(|r| r.meta.clone()).collect();
+                        return (save_task(meta, creds, others), None);
                     }
                     Err(e) => self.error = Some(format!("{e}. Credential fields were cleared.")),
                 }
@@ -323,7 +326,7 @@ impl ExchangeAccounts {
     fn start_test(
         &mut self,
         id: Uuid,
-        signed: &Result<reqwest::Client, String>,
+        signed: &Result<SignedHttp, String>,
     ) -> (Task<Message>, Option<Action>) {
         let Some(row) = self.rows.iter_mut().find(|r| r.meta.id == id) else {
             return (Task::none(), None);
@@ -540,10 +543,17 @@ impl ExchangeAccounts {
 }
 
 /// Keychain access can block on a system prompt, so it runs off the UI thread.
-fn save_task(meta: AccountMeta, creds: ApiCredentials) -> Task<Message> {
+fn save_task(meta: AccountMeta, creds: ApiCredentials, others: Vec<AccountMeta>) -> Task<Message> {
     Task::perform(
         async move {
             let job = tokio::task::spawn_blocking(move || {
+                // One exchange account must not be bound twice: refuse a key another account of
+                // the same venue, environment and product already uses (or when that cannot be
+                // checked). Only the other account's alias is shown.
+                if let Err(e) = check_key_not_bound(&others, &meta, &creds) {
+                    log::warn!("Refused to save exchange credentials: duplicate key check failed");
+                    return Err(e.to_string());
+                }
                 // Keychain first: no account is listed unless its credentials were stored
                 // and verified.
                 match save_credentials(&meta, &creds) {

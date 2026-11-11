@@ -21,12 +21,18 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 struct Entry {
     token: u64,
     state: StreamState,
+    /// Which snapshot of this stream the consumer must have applied (see [`sync_epoch`]).
+    epoch: u64,
 }
 
 static TABLE: LazyLock<Mutex<HashMap<AccountKey, Entry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Tokens start at 1; 0 is reserved for the test setter.
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// Sync epochs start at 1 and are unique across every stream, so an epoch a consumer applied
+/// for an earlier stream can never equal the one a later stream publishes. 0 means "no
+/// snapshot sent yet".
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 fn with<T>(f: impl FnOnce(&mut HashMap<AccountKey, Entry>) -> T) -> T {
     f(&mut TABLE.lock().unwrap_or_else(PoisonError::into_inner))
@@ -42,6 +48,7 @@ pub(crate) fn register(account: AccountKey) -> u64 {
             Entry {
                 token,
                 state: StreamState::Reconnecting,
+                epoch: 0,
             },
         );
     });
@@ -53,6 +60,40 @@ pub(crate) fn publish(account: AccountKey, token: u64, state: StreamState) {
     with(|m| {
         if let Some(e) = m.get_mut(&account).filter(|e| e.token == token) {
             e.state = state;
+        }
+    });
+}
+
+/// The stream is about to hand its consumer a new snapshot: take a new epoch for it. Returns the
+/// epoch to put into the snapshot (0 when `token` no longer owns the entry, which no consumer
+/// can match).
+pub(crate) fn begin_sync(account: AccountKey, token: u64) -> u64 {
+    with(|m| match m.get_mut(&account).filter(|e| e.token == token) {
+        Some(e) => {
+            e.epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+            e.epoch
+        }
+        None => 0,
+    })
+}
+
+/// The epoch of the account's latest snapshot, or 0 when none was sent. A consumer's risk
+/// tracker must have applied exactly this snapshot before an entry passes: the stream state
+/// turns `Connected` as soon as the snapshot is *sent*, which can be before the consumer has
+/// *applied* it (review N1).
+pub fn sync_epoch(account: AccountKey) -> u64 {
+    with(|m| m.get(&account).map_or(0, |e| e.epoch))
+}
+
+/// The supervisor ended: a stream that was `Connected` or `Resyncing` is `Reconnecting` now.
+/// Terminal states (`AuthFailed`, `Unavailable`) are kept, so the reason a stream stopped is
+/// not overwritten by the exit itself (review N6). Ignored unless `token` owns the entry.
+pub(crate) fn demote(account: AccountKey, token: u64) {
+    with(|m| {
+        if let Some(e) = m.get_mut(&account).filter(|e| e.token == token)
+            && matches!(e.state, StreamState::Connected | StreamState::Resyncing)
+        {
+            e.state = StreamState::Reconnecting;
         }
     });
 }
@@ -99,7 +140,14 @@ pub fn stream_state_for(
 #[cfg(test)]
 pub(crate) fn set_for_test(account: AccountKey, state: StreamState) {
     with(|m| {
-        m.insert(account, Entry { token: 0, state });
+        m.insert(
+            account,
+            Entry {
+                token: 0,
+                state,
+                epoch: 0,
+            },
+        );
     });
 }
 
@@ -186,5 +234,45 @@ mod tests {
             stream_state_for(a, AccountVenue::Okx, AccountProduct::Spot),
             StreamState::Connected
         );
+    }
+
+    #[test]
+    fn a_new_snapshot_takes_an_epoch_nobody_else_has() {
+        let (a, b) = (key(118), key(119));
+        let (ta, tb) = (register(a), register(b));
+        assert_eq!((sync_epoch(a), sync_epoch(b)), (0, 0));
+        let e1 = begin_sync(a, ta);
+        let e2 = begin_sync(b, tb);
+        let e3 = begin_sync(a, ta);
+        assert!(e1 > 0 && e2 > e1 && e3 > e2);
+        assert_eq!(sync_epoch(a), e3);
+        assert_eq!(sync_epoch(b), e2);
+        // A stream that lost the entry cannot take one.
+        let newer = register(a);
+        assert_eq!(begin_sync(a, ta), 0);
+        // The newer stream starts from "no snapshot": nothing the old one's consumer applied
+        // matches it.
+        assert_eq!(sync_epoch(a), 0);
+        assert!(begin_sync(a, newer) > e3);
+    }
+
+    #[test]
+    fn exiting_keeps_a_terminal_state() {
+        let a = key(120);
+        let t = register(a);
+        for terminal in [StreamState::AuthFailed, StreamState::Unavailable] {
+            publish(a, t, terminal);
+            demote(a, t);
+            assert_eq!(stream_state(a), terminal);
+        }
+        for live in [StreamState::Connected, StreamState::Resyncing] {
+            publish(a, t, live);
+            demote(a, t);
+            assert_eq!(stream_state(a), StreamState::Reconnecting);
+        }
+        // Another stream's guard changes nothing.
+        publish(a, t, StreamState::Connected);
+        demote(a, t + 1000);
+        assert_eq!(stream_state(a), StreamState::Connected);
     }
 }

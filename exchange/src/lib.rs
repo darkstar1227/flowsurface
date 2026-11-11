@@ -4,6 +4,7 @@ pub mod depth;
 mod error;
 pub mod rate_limit;
 mod serde_util;
+pub mod signed_http;
 pub(crate) mod signing;
 pub mod trade;
 pub mod unit;

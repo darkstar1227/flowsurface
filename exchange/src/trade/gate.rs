@@ -260,6 +260,9 @@ pub enum RiskRefusal {
     SettingsInvalid,
     /// The hook belongs to another account than the order.
     WrongAccount,
+    /// The account's private stream sent a new snapshot that the risk tracker has not applied
+    /// yet: its positions and equity are from before the reconnect.
+    SnapshotNotApplied,
 }
 
 /// Local risk controls (`risk::RiskSnapshot` is the implementation the app wires). Only
@@ -416,6 +419,13 @@ pub(crate) fn approve<G: SendGate>(
     // read from the account's entry in the stream table, which only the stream writes.
     let stream = stream_state_for(target.account, target.venue, target.product);
     if class == GateClass::Entry && !allows(stream, TradeAction::NewEntry) {
+        return Err(SubmitError::StreamNotReady(stream));
+    }
+    // Condition 57: a refused login or key voids the account's trade session, and it does so
+    // for every order, closes included (the credentials are not usable, and a stale `Usable`
+    // verdict must not outlive the failure). This reads the stream's own entry, so it holds
+    // even if the consumer never handles `StreamOutput::InvalidateSession`.
+    if stream == StreamState::AuthFailed {
         return Err(SubmitError::StreamNotReady(stream));
     }
     gate.check(GateRequest {

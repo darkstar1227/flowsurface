@@ -54,8 +54,9 @@ pub use types::{
     TradeError, Trailing, WorkingType,
 };
 pub use unknown::{
-    DEFAULT_SCHEDULE, ManualReleaseToken, PendingUnknown, ReleaseChallenge, ReleaseError,
-    ReleasedUnknown, Resolution, RestoreError, UnknownRecord, block_all_entries, lock_from_record,
+    DEFAULT_SCHEDULE, DiscardChallenge, DiscardError, DiscardToken, ManualReleaseToken,
+    PendingUnknown, ReleaseChallenge, ReleaseError, ReleasedUnknown, Resolution, RestoreError,
+    UnknownRecord, block_all_entries, lock_from_record,
 };
 
 #[cfg(test)]
