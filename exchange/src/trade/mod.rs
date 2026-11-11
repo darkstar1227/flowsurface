@@ -42,7 +42,7 @@ pub use client::{
     Balance, OpenKind, OpenOrder, Position, ReadError, Submitted, TradeClient, TradeSettings,
     settings_match,
 };
-pub use client_id::{ClientId, IdField, Role};
+pub use client_id::{ClientId, IdField, Role, looks_like_app_id};
 pub use decimal::{Decimal, DecimalError};
 pub use gate::{
     ApprovedOrder, AutoIntent, AutoPath, BulkAction, ConfirmToken, GateClass, GateRequest,
@@ -56,7 +56,8 @@ pub use preview::{OrderPreview, PreviewField};
 pub use protect::{
     MAX_TARGETS, Offset, PlanError, PositionProtection, ProtectPlan, ProtectRole, ProtectSpec,
     Protection, Rounding, SpecFingerprint, TargetLeg, TargetSpec, TrailingSpec, TriggerBasis,
-    orphan_protectives, plan, protected_status,
+    bare_positions, cancellable_by_id, describe_protective, orphan_protectives, plan,
+    protected_status, protecting_orders, residual_auto_orders, stop_guarded_position,
 };
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
 pub use risk::{

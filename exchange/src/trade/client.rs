@@ -1092,7 +1092,7 @@ pub(super) struct OpenOrdersRead {
 /// One open order as read over REST. The fields after `kind` are what the protection status
 /// needs (d1); each is `None` / `false` when the row does not carry it, and the status then
 /// counts the order as not protecting anything (it never guesses).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OpenOrder {
     pub symbol: String,
     pub id: String,
@@ -1112,6 +1112,40 @@ pub struct OpenOrder {
     /// (`attachAlgoOrds`). They exist on the exchange but act only once the entry is fully
     /// filled; they are not in force, so this never makes a position read as protected.
     pub attached: Option<super::protect::ProtectRole>,
+    /// The client id the order was sent under (Binance `clientOrderId` / `clientAlgoId`, OKX
+    /// `clOrdId` / `algoClOrdId`); `None` when the row does not carry a readable one. It is
+    /// never printed (see the `Debug` impl).
+    pub client_id: Option<String>,
+    /// The conditional order fills as a limit order once triggered (Binance `STOP` /
+    /// `TAKE_PROFIT`, OKX an order price other than `-1`): it may not fill.
+    pub limit: bool,
+    /// That limit order's price, when it could be read.
+    pub limit_price: Option<Decimal>,
+    /// A trailing order's activation price, when it has one and it could be read.
+    pub activation_price: Option<Decimal>,
+    /// A trailing order's callback, as a percent, when it could be read.
+    pub callback_rate: Option<Decimal>,
+}
+
+// The client id ties a log line to an order: it stays out of `{:?}` output.
+impl std::fmt::Debug for OpenOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenOrder")
+            .field("symbol", &self.symbol)
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("side", &self.side)
+            .field("position_side", &self.position_side)
+            .field("qty", &self.qty)
+            .field("trigger_price", &self.trigger_price)
+            .field("close_position", &self.close_position)
+            .field("reduce_only", &self.reduce_only)
+            .field("role", &self.role)
+            .field("attached", &self.attached)
+            .field("client_id", &self.client_id.as_ref().map(|_| "<redacted>"))
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OpenOrder {
@@ -1128,6 +1162,11 @@ impl OpenOrder {
             reduce_only: false,
             role: None,
             attached: None,
+            client_id: None,
+            limit: false,
+            limit_price: None,
+            activation_price: None,
+            callback_rate: None,
         }
     }
 }
@@ -1252,6 +1291,10 @@ fn parse_row_position_side(v: &Value) -> Option<Dir> {
     }
 }
 
+/// A client id longer than this is not read (an id of this app is 21 characters, exchanges allow
+/// at most 36 to 64): the row then has no id.
+const MAX_CLIENT_ID_LEN: usize = 64;
+
 /// The protection fields of one row. Field names follow the exchange docs copy; the algo-order
 /// list shapes are not verified against live responses (see the d1 report).
 fn fill_protection(o: &mut OpenOrder, row: &Value, wire: Wire, is_algo: bool) {
@@ -1259,6 +1302,13 @@ fn fill_protection(o: &mut OpenOrder, row: &Value, wire: Wire, is_algo: bool) {
     o.side = parse_row_side(row);
     o.position_side = parse_row_position_side(row);
     o.reduce_only = flag(row, "reduceOnly");
+    o.client_id = match (wire, is_algo) {
+        (Wire::Binance, true) => text(row, "clientAlgoId"),
+        (Wire::Binance, false) => text(row, "clientOrderId"),
+        (Wire::Okx, true) => text(row, "algoClOrdId"),
+        (Wire::Okx, false) => text(row, "clOrdId"),
+    }
+    .filter(|id| !id.is_empty() && id.len() <= MAX_CLIENT_ID_LEN);
     match wire {
         Wire::Binance => {
             o.qty = decimal(row, "origQty").or_else(|| decimal(row, "quantity"));
@@ -1274,6 +1324,13 @@ fn fill_protection(o: &mut OpenOrder, row: &Value, wire: Wire, is_algo: bool) {
                 Some("TRAILING_STOP_MARKET") => Some(ProtectRole::Trailing),
                 _ => None,
             };
+            o.limit = matches!(ty.as_deref(), Some("STOP" | "TAKE_PROFIT"));
+            if o.limit {
+                o.limit_price = decimal(row, "price");
+            }
+            o.activation_price =
+                decimal(row, "activatePrice").or_else(|| decimal(row, "activationPrice"));
+            o.callback_rate = decimal(row, "callbackRate");
         }
         Wire::Okx => {
             o.qty = decimal(row, "sz");
@@ -1287,6 +1344,19 @@ fn fill_protection(o: &mut OpenOrder, row: &Value, wire: Wire, is_algo: bool) {
                 let sl = decimal(row, "slTriggerPx");
                 let tp = decimal(row, "tpTriggerPx");
                 o.trigger_price = sl.or(tp).or_else(|| decimal(row, "triggerPx"));
+                // An order price of `-1` is a market order; any other value is a limit price.
+                let ord_px = decimal(row, "slOrdPx").or_else(|| decimal(row, "tpOrdPx"));
+                if let Some(px) = ord_px
+                    && px.checked_cmp(&Decimal::from_int(-1)) != Ok(std::cmp::Ordering::Equal)
+                {
+                    o.limit = true;
+                    o.limit_price = Some(px);
+                }
+                o.activation_price = decimal(row, "activePx");
+                o.callback_rate = decimal(row, "callbackRatio").and_then(|r| {
+                    // OKX gives a ratio (0.01 = 1%): shown as a percent.
+                    r.checked_mul(&Decimal::from_int(100)).ok()
+                });
                 o.role = match text(row, "ordType").as_deref() {
                     Some("move_order_stop") => Some(ProtectRole::Trailing),
                     Some("conditional" | "oco") => match (sl.is_some(), tp.is_some()) {
@@ -1486,6 +1556,73 @@ mod open_order_tests {
         assert!(o[2].reduce_only && !o[2].close_position);
         // Not a conditional protective type: no role.
         assert_eq!(o[3].role, None);
+    }
+
+    #[test]
+    fn client_ids_and_trailing_fields_are_read_per_venue() {
+        let algo = vec![
+            json!({"algoId": 1, "symbol": "BTCUSDT", "side": "SELL",
+            "orderType": "STOP", "triggerPrice": "60000", "price": "59900",
+            "clientAlgoId": "sAAAAAAAAAAAAAAAAAAAA", "closePosition": true}),
+            json!({"algoId": 2, "symbol": "BTCUSDT", "side": "SELL",
+            "orderType": "TRAILING_STOP_MARKET", "callbackRate": "1.5",
+            "activatePrice": "61000", "quantity": "1", "clientAlgoId": ""}),
+        ];
+        let o = parse_open(
+            &algo,
+            "symbol",
+            "algoId",
+            OpenKind::Algo(None),
+            Wire::Binance,
+        );
+        assert_eq!(o[0].client_id.as_deref(), Some("sAAAAAAAAAAAAAAAAAAAA"));
+        assert!(o[0].limit);
+        assert_eq!(o[0].limit_price, Some(d("59900")));
+        assert_eq!(o[1].client_id, None, "an empty id is no id");
+        assert_eq!(o[1].callback_rate, Some(d("1.5")));
+        assert_eq!(o[1].activation_price, Some(d("61000")));
+        let long = "s".repeat(65);
+        let rows = vec![
+            json!({"orderId": 4, "symbol": "BTCUSDT", "clientOrderId": long}),
+            json!({"orderId": 5, "symbol": "BTCUSDT", "clientOrderId": "s".repeat(64)}),
+        ];
+        let o = parse_open(&rows, "symbol", "orderId", OpenKind::Plain, Wire::Binance);
+        assert_eq!(o[0].client_id, None, "an id over 64 characters is no id");
+        assert_eq!(o[1].client_id.as_deref().map(str::len), Some(64));
+        let plain = vec![json!({"orderId": 3, "symbol": "BTCUSDT", "clientOrderId": "eBBBB"})];
+        let o = parse_open(&plain, "symbol", "orderId", OpenKind::Plain, Wire::Binance);
+        assert_eq!(o[0].client_id.as_deref(), Some("eBBBB"));
+        let okx = vec![
+            json!({"algoId": "9", "instId": "BTC-USDT-SWAP", "side": "sell",
+            "ordType": "conditional", "slTriggerPx": "59000", "slOrdPx": "58900",
+            "algoClOrdId": "sCCCC", "closeFraction": "1"}),
+        ];
+        let o = parse_open(&okx, "instId", "algoId", OpenKind::Algo(None), Wire::Okx);
+        assert_eq!(o[0].client_id.as_deref(), Some("sCCCC"));
+        assert!(o[0].limit);
+        let market = vec![
+            json!({"algoId": "9", "instId": "BTC-USDT-SWAP", "side": "sell",
+            "ordType": "conditional", "slTriggerPx": "59000", "slOrdPx": "-1"}),
+        ];
+        let o = parse_open(&market, "instId", "algoId", OpenKind::Algo(None), Wire::Okx);
+        assert!(!o[0].limit);
+    }
+
+    #[test]
+    fn a_position_side_that_cannot_be_read_gives_no_leg() {
+        for bad in [json!("FOO"), json!(7), json!(null), json!("BOTH")] {
+            let row = json!({"algoId": 1, "symbol": "BTCUSDT", "side": "SELL",
+                "orderType": "STOP_MARKET", "triggerPrice": "1", "closePosition": true,
+                "positionSide": bad});
+            let o = parse_open(
+                &[row],
+                "symbol",
+                "algoId",
+                OpenKind::Algo(None),
+                Wire::Binance,
+            );
+            assert_eq!(o[0].position_side, None);
+        }
     }
 
     #[test]

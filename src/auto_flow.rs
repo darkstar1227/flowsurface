@@ -293,6 +293,14 @@ pub struct FailureView {
     pub may_retry: bool,
     /// The entry still counts as automatic protection at work (it blocks a new entry).
     pub active: bool,
+    /// The entry order may still be open on the exchange: a later fill of it gets no stop-loss
+    /// once the entry is removed from the book.
+    pub entry_open: bool,
+    /// The result of the entry order was never found out: it may still be open.
+    pub entry_unresolved: bool,
+    /// How many protective orders of this entry may still stand on the exchange (open, being
+    /// cancelled, or a cancel that failed). Removing the entry stops the app watching them.
+    pub standing: usize,
 }
 
 impl fmt::Debug for FailureView {
@@ -645,10 +653,10 @@ pub struct PollEnv<'a> {
 
 /// What the book reads from the first snapshot after a reconnect (M4-4).
 pub struct ReconnectView<'a> {
-    /// Is an order that could be the entry still open on the symbol, on the entry's opening
-    /// side? (An open order carries the exchange's order id, not our client id, so the symbol and
-    /// the side are all there is to match.)
-    pub resting: &'a dyn Fn(&str, Dir) -> bool,
+    /// Is the entry still open on the symbol, on its opening side, under this client id? An open
+    /// order whose row carries no readable client id still counts when symbol and side match
+    /// (nothing is proven gone from a missing field).
+    pub resting: &'a dyn Fn(&str, Dir, &str) -> bool,
     /// The directions of the positions held on the symbol.
     pub held: &'a dyn Fn(&str) -> Vec<Dir>,
 }
@@ -763,9 +771,37 @@ impl AutoBook {
                     reasons,
                     may_retry,
                     active,
+                    entry_open: e.sent == Sent::Stands && !e.complete,
+                    entry_unresolved: e.sent == Sent::Unresolved,
+                    standing: e
+                        .placed
+                        .iter()
+                        .filter(|p| {
+                            matches!(
+                                p.state,
+                                Live::Open | Live::ToCancel | Live::Cancelling | Live::CancelFailed
+                            )
+                        })
+                        .count(),
                 })
             })
             .collect()
+    }
+
+    /// Does the book already speak for the account's position of `dir` on `symbol` with a failure
+    /// that left it bare (the failure banner shows it)?
+    pub fn covers_part(&self, account: Uuid, symbol: &str, dir: Dir) -> bool {
+        self.entries.values().any(|e| {
+            e.account == account
+                && e.dir == dir
+                && e.symbol.eq_ignore_ascii_case(symbol)
+                && e.failures.iter().any(|f| f.reason.may_leave_bare())
+        })
+    }
+
+    /// Is this client id one of an entry of the book, or of an order the book placed?
+    pub fn knows_client_id(&self, client_id: &str) -> bool {
+        self.entries.contains_key(client_id) || self.by_placed.contains_key(client_id)
     }
 
     /// The accounts of entries that have a failure the user has not been told about by a system
@@ -828,7 +864,7 @@ impl AutoBook {
             if e.account != account || e.sent != Sent::Stands || e.complete || e.attention {
                 continue;
             }
-            if (view.resting)(&e.symbol, e.dir) {
+            if (view.resting)(&e.symbol, e.dir, id) {
                 continue;
             }
             let short = e
@@ -2626,7 +2662,7 @@ pub(crate) mod tests {
     }
 
     fn reconnect(book: &mut AutoBook, resting: bool, held: Vec<Dir>) {
-        let resting = move |_: &str, _: Dir| resting;
+        let resting = move |_: &str, _: Dir, _: &str| resting;
         let held_fn = move |_: &str| held.clone();
         book.after_reconnect(
             account(),
@@ -2757,7 +2793,7 @@ pub(crate) mod tests {
         book.after_reconnect(
             Uuid::from_u128(9),
             &ReconnectView {
-                resting: &|_, _| false,
+                resting: &|_, _, _| false,
                 held: &|_| vec![Dir::Long],
             },
         );
@@ -2916,6 +2952,42 @@ pub(crate) mod tests {
         assert_eq!(book.dismiss(account(), &key), Ok("BTCUSDT".to_string()));
         assert!(book.failures_for(account()).is_empty());
         assert!(poll(&mut book).is_empty());
+    }
+
+    #[test]
+    fn the_handled_warning_facts_follow_the_entry_and_its_orders() {
+        // An entry still resting with its stop to come: the entry is open, nothing stands.
+        let (mut book, key) = booked(spec(2, true));
+        let v = book.failures_for(account());
+        assert_eq!(v.len(), 1);
+        assert!(v[0].entry_open);
+        assert_eq!(v[0].standing, 0);
+        // A fill and the stop placed: the stop stands, the entry is still open.
+        fill(&mut book, &key, "0.001");
+        let stop = poll(&mut book);
+        book.done(ok_all(&stop[0]));
+        let v = book.failures_for(account());
+        assert!(v[0].entry_open);
+        assert_eq!(v[0].standing, 1);
+        // The entry finished: only what stands is left to say.
+        book.on_order(
+            account(),
+            &order(&key, OrderCategory::Plain, OrderStatus::Filled, "0.001"),
+        );
+        let v = book.failures_for(account());
+        assert!(!v[0].entry_open);
+        assert_eq!(v[0].standing, 1);
+    }
+
+    #[test]
+    fn the_book_speaks_for_a_position_with_a_failure_only_and_knows_its_ids() {
+        let (book, key) = booked(spec(1, false));
+        // Work left (a stop still to be sent) does not hide a position: the lists decide.
+        assert!(!book.covers_part(account(), "BTCUSDT", Dir::Long));
+        assert!(book.knows_client_id(&key));
+        assert!(!book.knows_client_id("sNOTKNOWNNOTKNOWNNOT"));
+        let (failed, _) = with_failed_stop();
+        assert!(failed.covers_part(account(), "BTCUSDT", Dir::Long));
     }
 
     #[test]

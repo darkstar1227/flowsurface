@@ -297,7 +297,7 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
   - 與 PRD 3.4 原本的「撤舊單再下新單」不同，見使用者決定 9。
   - 驗證：純函式測試，座標 → 價格 → 取整。狀態機測試：舊單已觸發時中止改單。手動：測試網拖曳止損線。
 - **81（b、d）**：進場單在 app 關閉或私有流斷線期間成交時：Binance 合約與現貨（非 OTOCO）的保護單由 app 在成交後送出，附掛意圖只存在記憶體（條件 78），app 不在線時保護單永遠不會送出。要求：
-  1. 啟動時與每次重新同步後，比對所有持倉與掛著的保護單。**沒有任何保護單的持倉**一律顯示條件 65 的紅色橫幅，並提供「掛上預設保護單」（LIVE 需確認）與「平倉」。
+  1. 啟動時與每次重新同步後，比對所有持倉與掛著的保護單。**沒有任何保護單的持倉**一律顯示條件 65 的紅色橫幅，並提供「掛上預設保護單」（LIVE 需確認）與「平倉」。**（d5 已實作：橫幅、「Add a stop-loss」（必經確認視窗，新 client id）、「Flatten」、macOS 通知；「預設保護單」以重試止損的邏輯實作，用帳戶預設的止損設定。需 testnet／手動：限價進場、關閉 app、成交、重開，在主視窗與 popout 各驗一次。）**
   2. 進場確認視窗明示：「Binance 合約的自動附掛只在 app 執行中有效；若要離線也受保護，請改用 OKX `attachAlgoOrds` 或現貨 OTOCO，或進場後立即手動掛保護單」。
   3. 掛著進場限價單時關閉 app，要跳出提醒。
   - 依據：限價進場單常在 app 關閉後才成交，當下沒有任何東西會替它掛保護單。
@@ -308,7 +308,7 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 - **65（d）**：保護單失敗即裸倉。成交事件 → 送出保護單。保護單 `Rejected`、`Unknown` 未解決、或遇 429 時，顯示**常駐紅色橫幅**與系統通知，並提供「重試保護單」（手動、新 client id、LIVE 需確認）與「平倉」，直到持倉有保護或已平倉為止。不得只寫 log。OKX `attachAlgoOrds` 在部分成交期間沒有保護，UI 標示「部分成交，保護單尚未生效」。
   - 依據：本專案最大的資金風險。
   - 驗證：狀態機測試，成交 → 保護單失敗 → 橫幅出現 → 重試成功 → 橫幅消失。手動：測試網用不合法的觸發價，讓保護單被拒一次。
-- **66（d）**：Binance 合約兩張獨立保護單：收到其中一張的 `ALGO_UPDATE` 觸發或成交事件後，撤銷另一張（經 limiter 的優先級）。app 離線的風險要在 UI 與文件說明：one-way 用 `closePosition` 或 `reduceOnly`，不會反向開倉；hedge 下 `positionSide` 決定只能平哪一邊，不會反向開倉，但**殘留的那張可能作用在之後同方向的新持倉上**。啟動或重新同步時，偵測「沒有對應持倉的保護單」，並提示撤銷。`closePosition=true` 在沒有持倉時觸發的行為**未核對**。
+- **66（d）**：Binance 合約兩張獨立保護單：收到其中一張的 `ALGO_UPDATE` 觸發或成交事件後，撤銷另一張（經 limiter 的優先級）。app 離線的風險要在 UI 與文件說明：one-way 用 `closePosition` 或 `reduceOnly`，不會反向開倉；hedge 下 `positionSide` 決定只能平哪一邊，不會反向開倉，但**殘留的那張可能作用在之後同方向的新持倉上**。啟動或重新同步時，偵測「沒有對應持倉的保護單」，並提示撤銷。`closePosition=true` 在沒有持倉時觸發的行為**未核對**。**（d5 已實作：孤兒偵測與逐單撤銷、殘留自動單提示；仍需 testnet：`closePosition=true` 在無持倉時的行為、`openAlgoOrders`／`orders-algo-pending` 的 client id 欄位名稱；互撤由 d3 實作。）**
   - 驗證：狀態機測試，一張成交 → 撤另一張；離線後重新同步 → 偵測孤兒保護單。手動：測試網關閉 app，觸發止損後重開。
 - **67（a）**：不能下出撤不掉的單。每種支援的訂單類型，都必須同時具備已實作且測試過的「撤單」與「查單」路徑，才能開放下單。OKX `move_order_stop` 在核對並於模擬盤實測撤單端點前**不開放**。
   - 依據：`cancel-algos` 不含追蹤止損（explorer 報告 1.5）。
@@ -695,7 +695,7 @@ security-review 判 BLOCK 的四項與 AutoGrant 綁定補齊（2026-11-11 使�
 - `protection_added` 作用於同一帳戶、同一 symbol、同一方向的**所有**條目（包括進場單還在掛單的條目，以及使用者自己從訂單票下的 closePosition 止損）。closePosition 止損涵蓋整個持倉，所以這樣是安全的；但若使用者之後手動撤掉那張止損，這些條目不會自動補止損。
 - 重試止損的確認視窗寫明觸發基準是 mark price（帳戶的保護預設可能用 last price）；`check_fills_wait` 的等待改用單調時鐘（`Instant`，由 `PollEnv::mono_ms` 注入），系統時間被調整不會縮短或拉長等待。通知以帳戶 id 去重，alias 會濾掉 Unicode Cf 字元。
 - 偏離：只重試止損（止盈走訂單票）；基準價是當下報價（`HeldPosition` 沒有進場價）；手動止損一律監看 MARK_PRICE（`manual.rs` 寫死），不是帳戶設定的觸發基準。預覽視窗會列出這些數字。
-- 掃描測試：`submit_auto(`、`AutoIntent::new(` 仍只在 `src/auto_flow.rs`，`.submit(` 仍只在 `src/order_flow.rs`，`for_preview(` 仍只在 `order_confirm.rs`。新增掃描測試 `the_retry_only_opens_the_review_and_sends_nothing_itself`（`start_protection_retry` 的函式本體含 `start_review(`，且不含 `order_flow::send(`、`confirm_order`、`.submit(`、`submit_auto(`、`AutoIntent::new(`、`auto_flow::mint(`、`AutoGrant`）。本段動到的掃描測試：`order_flow.rs` 的 submit／auto／mint 掃描（切割條件改變，兼容 `mod tests` 與 `pub(crate) mod tests` 兩種寫法）、`trading.rs` 的 `the_only_trade_calls_here_are_reads`（同樣改切割條件，否則新的單項 `#[cfg(test)]` 會讓它只掃到檔案前段而空過）。`order_confirm.rs`、`order_ticket.rs` 的掃描沒有單項 `#[cfg(test)]` 在測試模組前，不受影響。`order_flow.rs` 的掃描測試改為只排除 `#[cfg(test)]\nmod tests` 之後的內容（原本遇到第一個 `#[cfg(test)]` 就截斷，會漏掉 `auto_flow.rs` 在測試模組之前的 `#[cfg(test)]` 單項）。允許檔案清單不變。
+- 掃描測試：`submit_auto(`、`AutoIntent::new(` 仍只在 `src/auto_flow.rs`，`.submit(` 仍只在 `src/order_flow.rs`，`for_preview(` 仍只在 `order_confirm.rs`。新增掃描測試 `the_stop_and_cancel_offers_only_open_the_review_and_send_nothing_themselves`（`start_protection_retry` 的函式本體含 `start_review(`，且不含 `order_flow::send(`、`confirm_order`、`.submit(`、`submit_auto(`、`AutoIntent::new(`、`auto_flow::mint(`、`AutoGrant`）。本段動到的掃描測試：`order_flow.rs` 的 submit／auto／mint 掃描（切割條件改變，兼容 `mod tests` 與 `pub(crate) mod tests` 兩種寫法）、`trading.rs` 的 `the_only_trade_calls_here_are_reads`（同樣改切割條件，否則新的單項 `#[cfg(test)]` 會讓它只掃到檔案前段而空過）。`order_confirm.rs`、`order_ticket.rs` 的掃描沒有單項 `#[cfg(test)]` 在測試模組前，不受影響。`order_flow.rs` 的掃描測試改為只排除 `#[cfg(test)]\nmod tests` 之後的內容（原本遇到第一個 `#[cfg(test)]` 就截斷，會漏掉 `auto_flow.rs` 在測試模組之前的 `#[cfg(test)]` 單項）。允許檔案清單不變。
 
 ### 4. 「I've handled it」語意
 - 只從 `AutoBook` 移除條目並解除該條目對 symbol 的阻擋；`Sent::Sending` 或 `busy`（有自動單正在送）時拒絕（`DismissError::Busy`）。
@@ -737,3 +737,54 @@ security-review 判 BLOCK 的四項與 AutoGrant 綁定補齊（2026-11-11 使�
 - 報價過舊時（側欄隱藏）的實際行為與 330 秒是否合適。
 - 重試的手動止損以 MARK_PRICE 為基準，與帳戶設定可能不同；確認視窗的欄位是否足夠清楚。
 - macOS 通知在權限關閉或勿擾模式下的表現。
+
+## M5 d5：孤兒偵測、保護標示、裸倉橫幅
+
+d 段最後一段。沒有新的送單路徑、沒有新的權杖來源，`LIVE_SENDING_ENABLED` 仍為 false，`saved-state.json` 型別沒有變動。
+
+### 1. T0／M1：「I've handled it」的確認文案
+- `FailureView` 新增 `entry_open`（進場單可能仍在掛單：`sent == Stands` 且未完成）與 `standing`（該條目自己的保護單仍 `Open`／`ToCancel`／`Cancelling`／`CancelFailed` 的數量）。
+- `account_panel::handled_warning` 依此補兩句：「The entry order is still open: a later fill will NOT get a stop-loss.」與「N protective order(s) of this entry may still stand on the exchange: cancel them first.」。單數用 "1 protective order"（偏離：簡報原文 N 一律複數）。測試 `the_handled_warning_says_what_stays_behind`、`the_handled_warning_facts_follow_the_entry_and_its_orders`。
+
+### 2. 裸倉偵測（`TradingState::watch_bare`，每次 poll 呼叫，單調時鐘）
+- 判定來源：`protected_status`（含 d4 的 `EntryPending` 覆蓋）。**只在 `lists_stale == false` 時下結論**；stale 時橫幅清空、寬限計時重來，面板顯示既有的 stale 橫幅與每個持倉的 "Cannot tell"，**不顯示已保護也不顯示裸倉**。
+- 算作裸倉：`Unprotected`、`PartialStop`、`TrailingOnly`、`TargetOnly`。`TargetOnly` 為較低嚴重度（琥珀色橫幅、不發通知）。`EntryPending` 與帳本仍有工作（`counts_active`）的持倉**不**算裸倉（那是正常自動進場的空窗，持倉列已寫 "Protection not active yet"）；d4 已有失敗橫幅（`may_leave_bare`）的同帳戶、symbol、方向不重複顯示（`AutoBook::covers_part`）。
+- **寬限 15 秒**（`BARE_GRACE_MS`）：Binance 自動進場在成交後送出止損，止損出現在清單上要再晚一點（algo 事件），這段空窗清單是新鮮的、持倉沒有止損，不能叫裸倉。連續 15 秒都在新鮮清單上無止損才確認。這是新增的偏離（簡報沒有寬限）。
+- 被手動解除的 Unresolved 進場：條目已離開帳本，所以不再被 `covers_part` 覆蓋，持倉若沒有止損就會成為裸倉（滿足 d3 審查的說法）。
+- 通知：每個（帳戶、symbol、方向）一次（`told`）；**只有新鮮清單判定部位消失或已有 `Stop` 才重設**，變 stale 不重設。同一輪同一帳戶合併為一則（`unique_accounts`）。文字固定、只帶 alias（`Notice::BarePosition`）。測試 `a_bare_position_is_confirmed_after_the_grace_time_and_told_once`、`going_stale_says_nothing_and_does_not_forget_who_was_told`、`a_position_that_is_gone_resets_the_notice`、`a_take_profit_only_position_is_shown_with_lower_severity_and_not_notified`、`a_pending_entry_does_not_hide_a_position_that_has_no_stop`、`a_stale_account_has_no_bare_rows_and_no_strays`；exchange：`bare_positions_are_the_ones_without_a_whole_stop`、`a_stale_list_has_no_bare_positions_and_no_orphans`、`hedge_legs_are_judged_one_by_one`。
+
+### 3. 橫幅與按鈕
+- `account_panel::bare_view`：「alias: the long/short position on SYMBOL has no stop-loss.」，按鈕「Add a stop-loss」與「Flatten (close all positions)」。
+- 「Add a stop-loss」→ `Action::AddStop(symbol, dir)` → `main::start_add_stop`：以值再查一次 `bare_rows`，然後走 `open_stop_review` → `protect_attach::retry_stop`（要求持倉清單新鮮、持倉存在、帳戶預設有止損、報價不過舊）→ `start_review` → 確認視窗 → `confirm_order` → `order_flow::send`。新 preview、新 client id、新權杖；不產生 `AutoGrant`。「Flatten」沿用 `Message::CloseAll` → `Kind::Bulk(Flatten)`。掃描測試 `the_stop_and_cancel_offers_only_open_the_review_and_send_nothing_themselves` 鎖住四個函式不得出現 `order_flow::send(`、`confirm_order`、`.submit(`、`submit_auto(`、`AutoIntent::new(`、`auto_flow::mint(`、`AutoGrant`、`for_bulk(`、`BulkAction::CancelAll`。
+
+### 4. 保護標示
+- 每個持倉下列出保護單（`protecting_orders` + `describe_protective`）：止損、止盈、止損＋止盈同一張、追蹤，含觸發價與數量（全平型寫 "whole position"）。**只在清單新鮮時列出。**
+- 文案：限價型止損／止盈（Binance `STOP`／`TAKE_PROFIT`，OKX 委託價不是 `-1`）寫 "then a limit order at P (it may not fill)"，讀不到價格就明說；追蹤寫 "Trailing stop (not counted as a stop-loss)"，帶 callback 與啟動價，讀不到就寫 "callback unreadable"、"no activation price read, so it may not be active"。欄位讀不到一律寫 unreadable，不猜。`OpenOrder` 新增 `limit`、`limit_price`、`activation_price`、`callback_rate`；欄位名稱（`price`、`activatePrice`／`activationPrice`、`callbackRate`；OKX `slOrdPx`／`tpOrdPx`、`activePx`、`callbackRatio`）**未對 testnet 核對**。測試 `every_protective_role_has_a_line_and_unreadable_fields_are_said`、`client_ids_and_trailing_fields_are_read_per_venue`、`protective_orders_are_listed_per_position_only_on_fresh_lists`。
+
+### 5. 孤兒保護單與殘留自動單
+- 孤兒：`orphan_protectives`（只在新鮮清單）。新增：讀不到 `positionSide` 的列（被當成 one-way）在該 symbol 持有 hedge 腿時**不算孤兒**，也不保護 hedge 腿（測試 `an_unreadable_position_side_neither_protects_a_hedge_leg_nor_is_an_orphan`），避免把真的 hedge 止損當孤兒提示撤銷。
+- 殘留自動單：algo 單、client id 形狀像 app 的（角色字母 `e/s/t/r` + 20 個 base62，`looks_like_app_id`），而且既不在 `AutoBook`（條目鍵或 `by_placed`）、也不在本次執行中使用者確認過的請求 id（`sent_ids`，記憶體、上限 512）。文案寫 "looks like"：只是形狀比對。**OKX 不判定**（進場附掛的 algo 單帶 app 形狀的 id 且不在帳本內）。
+- 「Cancel」**不使用** `BulkAction::CancelAll`（會撤其他持倉的止損），也**不新增權杖種類**：每張單走 `ManualSpec::Cancel` → `start_review` → 一般確認視窗（偏離：簡報寫「bulk 確認視窗同型」，改為逐單的一般確認，因為 bulk 權杖只有 `CancelAll`／`Flatten`，新增種類需要 exchange 的新權杖）。點擊時檢查（新鮮清單、仍是 stray、可依 id 撤）；確認時再檢查一次（`has_stray_mark` + `is_stray`），不符就不送。`OpenKind::Algo(None)` 的 OKX 單與 order list 不提供按鈕（`cancellable_by_id`）。
+- `OpenOrder.client_id`：Binance `clientOrderId`／`clientAlgoId`，OKX `clOrdId`／`algoClOrdId`；空字串視為沒有；`Debug` 遮蔽（`a_debug_print_of_an_open_order_hides_the_client_id`）。欄位名稱以 stream 的解析為佐證，REST 列表的欄位**需 testnet 確認**；讀不到就是 `None`，各處以保守方式處理。
+- d3 M4-4（偏離 1）：`ReconnectView.resting` 多帶進場 client id；有 client id 的列只在相同時才算「仍在掛單」，沒有 client id 的列維持 symbol＋方向比對（測試 `a_reconnect_matches_the_open_entry_by_client_id_when_the_row_has_one`）。
+
+### 6. c2b3 d 段沿用
+- hedge `positionSide` 解析失敗：測試 `a_position_side_that_cannot_be_read_gives_no_leg`（exchange）與上述孤兒測試。
+- OKX `tdMode`：本 app 送出的 OKX 單固定 cross。快照讀到該 symbol 持倉為 isolated 時，`start_review` 拒絕（非撤單），文案說明沒有送出。只有已知的 isolated 才算不符；事件產生的持倉沒有 margin（未知）不算不符；位置事件保留快照讀到的 margin。撤單沒有 `tdMode`，永不因此被擋。測試 `okx_isolated_margin_is_a_mismatch_but_an_unknown_mode_is_not`。
+
+### 7. 需要 testnet／手動
+- `closePosition=true` 的條件單在無持倉時的行為（條件 66）。
+- `openAlgoOrders`／`orders-algo-pending`／`orders-pending` 的 client id 欄位名稱，以及限價型止損、追蹤單的欄位名稱。
+- 限價進場 → 關閉 app → 成交 → 重開：橫幅出現（15 秒寬限之後）、macOS 通知一次；主視窗與 popout 各驗一次。
+- 手動：孤兒「Cancel」開啟確認視窗、LIVE 延遲、確認後清單更新；OKX isolated 持倉被拒的文案。
+- 未做（Live 前待辦沿用）：T1 per-symbol 即時價。
+
+### M5 d5 補充（審查後修正）
+- **裸倉判定看清單，不看 `EntryPending` 覆蓋**：`TradingState::protection_listed` 只依持倉與掛單清單；`EntryPending` 仍寫在持倉列，但不會讓裸倉橫幅消失。只有 d4 已有 `may_leave_bare` 失敗的部位才不重複顯示。待成交的限價單、OKX 部分成交，都在 15 秒寬限後照常判定為裸倉並通知一次。
+- **計時**：`Message::AutoPoll` 每秒觸發 `run_auto_jobs`，安靜帳戶重啟後寬限期也會走完。清單變 stale 時只隱藏橫幅，不重置寬限計時；只有新鮮清單判定部位已有止損或消失才丟掉計時。
+- **殘留自動單（審查 B1 修正）**：重啟後 app 先前放的止損仍會被列為殘留，但若它是仍持有部位的止損（`protects` 成立且角色有止損，`exchange::trade::stop_guarded_position`），**不提供「Cancel」**，只顯示資訊列（"keep it unless you replace it"）；點擊與確認時的 `is_stray` 以同一規則重判，確認時若已成為保護唯一止損即拒絕。其餘殘留單（止盈、部分量止損、追蹤）仍可撤，該 symbol 有持倉時文案加註 "Cancelling it changes the protection of the {symbol} position"。測試 `strays_are_orphans_and_unowned_orders_of_the_apps_shape`、`a_stop_that_guards_a_held_position_is_not_a_stray_to_cancel`。
+- **B2**：`open_stop_review` 在 `quote_of` 前先 `modal::order_ticket::valid_symbol`（≤28），`quote_of` 自己也檢查並回 `None`，避免交易所給的 29–32 字元 symbol 讓 `Ticker::new` panic。測試 `a_symbol_over_the_ticker_limit_is_not_valid`、掃描測試 `the_stop_and_cancel_offers_only_open_the_review_and_send_nothing_themselves`（檢查順序）。
+- **順手項**：S1 Unresolved 進場在「I've handled it」補一句進場單可能仍掛著（`FailureView.entry_unresolved`）；S2 單數文案「cancel it first」；S3 更正 `watch_bare` 註解；S5 確認視窗關閉時清掉 stray 標記（`clear_stray_marks`）；S6 `client_id` 超過 64 字元視為沒有（`MAX_CLIENT_ID_LEN`）；S8 字串改用 `\` 續行，測試斷言文字不含連續兩個空白。
+- **S7（只記錄）**：OKX `slOrdPx = -1` 搭配限價 `tpOrdPx` 的組合不會標成限價，只影響顯示文案。
+- **Flatten**：`bulk.rs` 對每個持倉用該持倉自己的 margin，不經 `margin_conflict`；該檢查只擋非撤單的 `start_review`。
+- **OKX「Add a stop-loss」**：OKX 永續（swap）以 `closeFraction=1` 的 order-algo 全平止損；OKX 現貨沒有手動保護單（`Unsupported`），按下後由 `retry_stop`／`build_intent` 顯示拒絕原因，不送單。

@@ -30,6 +30,15 @@ impl Role {
     }
 }
 
+/// Does `id` have the shape of an id this app generates (a role letter and 20 base62
+/// characters)? Only a shape: other software could produce the same text by chance (about 119
+/// bits make that unlikely), so a caller words what it finds as "looks like".
+pub fn looks_like_app_id(id: &str) -> bool {
+    id.len() == 1 + RANDOM_LEN
+        && id.starts_with(['e', 's', 't', 'r'])
+        && id.bytes().all(|b| BASE62.contains(&b))
+}
+
 /// Which field the id goes into; each has its own pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdField {

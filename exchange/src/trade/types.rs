@@ -156,7 +156,7 @@ impl Side {
 }
 
 /// Direction of a derivatives position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dir {
     Long,
     Short,
