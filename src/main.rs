@@ -8,6 +8,7 @@ mod layout;
 mod logger;
 mod modal;
 mod notify;
+mod notify_os;
 mod order_flow;
 mod protect_attach;
 mod screen;
@@ -109,6 +110,12 @@ struct Flowsurface {
     bulk_confirm: Option<modal::bulk_confirm::PendingBulk>,
     /// The request being sent, kept so an expired preview can be made again.
     order_requests: HashMap<(uuid::Uuid, String), order_flow::PrepareRequest>,
+    /// When the ticker list of each venue was last fetched successfully. The list keeps its old
+    /// prices when a fetch fails; this stamp is what tells a kept price from a fresh one (see
+    /// `auto_flow::reference_price`).
+    quote_stamps: HashMap<exchange::adapter::Venue, std::time::Instant>,
+    /// Origin of the monotonic clock the automatic protection waits on.
+    started: std::time::Instant,
     network_config: data::Network,
     /// The saved state could not be read, so the proxy setting is unknown (see `SavedState`).
     proxy_unreadable: bool,
@@ -457,7 +464,7 @@ impl Flowsurface {
             Action::BeginRelease(r) | Action::Release(_, r) | Action::Discard(_, r) => {
                 Some(r.account)
             }
-            Action::Bulk(_) | Action::AckTrip => None,
+            Action::Bulk(_) | Action::AckTrip | Action::Retry(_) | Action::Handled(_) => None,
         };
         if record_account
             .and_then(|key| self.meta_of_key(key))
@@ -473,6 +480,11 @@ impl Flowsurface {
         match action {
             Action::Bulk(kind) => self.start_bulk(kind),
             Action::AckTrip => self.start_ack_trip(),
+            Action::Retry(key) => self.start_protection_retry(&key),
+            Action::Handled(key) => {
+                self.handle_protection_failure(&key);
+                Task::none()
+            }
             Action::BeginRelease(record) => {
                 let Some(meta) = self.meta_of_key(record.account) else {
                     self.account_panel.form_done();
@@ -517,6 +529,135 @@ impl Flowsurface {
                     Message::Account(account_flow::Event::Discarded(Box::new(s)))
                 })
             }
+        }
+    }
+
+    /// The account the panel and the ticket show, if it still exists.
+    fn panel_account(&self) -> Option<data::config::exchange_accounts::AccountMeta> {
+        let id = self.order_ticket.account()?;
+        self.exchange_accounts
+            .persisted()
+            .accounts
+            .into_iter()
+            .find(|m| m.id == id)
+    }
+
+    /// "Retry protection" (condition 65): a stop for the whole position is offered again through
+    /// the ordinary manual path, so it gets a new preview, a new client id and a new
+    /// confirmation token, and nothing is sent before the user confirms it. It is not an
+    /// automatic order: no grant of the failed entry is used or made.
+    fn start_protection_retry(&mut self, key: &str) -> Task<Message> {
+        let Some(meta) = self.panel_account() else {
+            self.account_panel
+                .set_status("Pick an account.".to_string(), BannerKind::Error);
+            return Task::none();
+        };
+        if self.confirm_open() || self.order_ticket.is_preparing() {
+            self.account_panel.set_status(
+                "Another order is open or being prepared. Finish it first.".to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
+        let Some(failure) = self
+            .trading
+            .auto_failures(meta.id)
+            .into_iter()
+            .find(|f| f.key == key && f.may_retry)
+        else {
+            self.account_panel.set_status(
+                "That warning is no longer there, or a stop cannot be offered for it.".to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        };
+        let mode = self.trade_session.get(meta.id).and_then(|e| e.actual_mode);
+        let held = self.trading.holdings(meta.id, &failure.symbol);
+        let quote = self.quote_of(&meta, &failure.symbol);
+        match protect_attach::retry_stop(&meta, mode, failure.dir, &held, quote) {
+            Ok(spec) => {
+                // `start_review` may refuse (it says why on the ticket): only claim a preview
+                // when one is really being prepared.
+                let task = self.start_review(order_flow::PrepareRequest {
+                    account: meta.id,
+                    symbol: failure.symbol,
+                    spec,
+                    protect: None,
+                });
+                if self.order_ticket.is_preparing() {
+                    self.account_panel.set_status(
+                        "Preparing the stop. Check it in the confirmation window.".to_string(),
+                        BannerKind::Normal,
+                    );
+                } else {
+                    self.account_panel.set_status(
+                        "The stop could not be prepared. See the order ticket for the reason."
+                            .to_string(),
+                        BannerKind::Error,
+                    );
+                }
+                task
+            }
+            Err(why) => {
+                self.account_panel.set_status(why, BannerKind::Error);
+                Task::none()
+            }
+        }
+    }
+
+    /// "I've handled it", after its second click: the entry leaves the book, its symbol is no
+    /// longer blocked by it and a line goes to the risk log. Nothing is sent, and no unknown
+    /// result is released by this (that keeps its own confirmation phrase).
+    fn handle_protection_failure(&mut self, key: &str) {
+        let Some(meta) = self.panel_account() else {
+            self.account_panel
+                .set_status("Pick an account.".to_string(), BannerKind::Error);
+            return;
+        };
+        match self.trading.dismiss_failure(meta.id, key) {
+            Ok(symbol) => {
+                let logged = data::config::risk_log::RiskLog::in_data_dir()
+                    .append(&data::config::risk_log::RiskLogEntry::protection_handled(
+                        &meta,
+                        chrono::Utc::now().timestamp_millis(),
+                        &symbol,
+                    ))
+                    .is_ok();
+                let text = if logged {
+                    "The warning was removed.".to_string()
+                } else {
+                    "The warning was removed, but the risk log could not be written.".to_string()
+                };
+                let kind = if logged {
+                    BannerKind::Normal
+                } else {
+                    BannerKind::Warning
+                };
+                self.account_panel.set_status(text, kind);
+            }
+            Err(auto_flow::DismissError::NotFound) => self.account_panel.set_status(
+                "That warning is already gone.".to_string(),
+                BannerKind::Normal,
+            ),
+            Err(auto_flow::DismissError::Busy) => self.account_panel.set_status(
+                "An automatic order of this entry is being sent. Try again in a moment."
+                    .to_string(),
+                BannerKind::Warning,
+            ),
+        }
+    }
+
+    /// One system notification per entry whose protection failed (macOS only, fixed text with
+    /// the alias).
+    fn notify_failures(&mut self) {
+        let accounts = self.exchange_accounts.persisted().accounts;
+        for id in notify_os::unique_accounts(self.trading.take_failure_notices()) {
+            let alias = accounts
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| m.alias.clone())
+                .unwrap_or_default();
+            notify_os::send(notify_os::Notice::ProtectionFailed, &alias);
         }
     }
 
@@ -1051,9 +1192,35 @@ impl Flowsurface {
         Task::perform(order_flow::send(input), Message::OrderSent)
     }
 
+    /// The last price the ticker list holds for the symbol of the account, with its age (the
+    /// time since the list of its venue was last fetched successfully). `None` when the list has
+    /// no price or was never fetched.
+    fn quote_of(
+        &self,
+        meta: &data::config::exchange_accounts::AccountMeta,
+        symbol: &str,
+    ) -> Option<(exchange::trade::Decimal, std::time::Duration)> {
+        let market = order_flow::market_of(meta.venue, meta.product);
+        let ticker = exchange::Ticker::new(symbol, market);
+        let price = self
+            .sidebar
+            .tickers_table
+            .mark_price(&ticker)
+            .and_then(order_flow::price_to_decimal)?;
+        let fetched = self.quote_stamps.get(&market.venue())?;
+        Some((price, fetched.elapsed()))
+    }
+
     /// Start the automatic orders that are due (protective orders after a fill, the cancel of
     /// the other one). Each job is sent once; a failure is written down, never retried.
     fn run_auto_jobs(&mut self) -> Task<Message> {
+        let task = self.start_auto_jobs();
+        // Failures found while polling (or recorded by the last result) are told once.
+        self.notify_failures();
+        task
+    }
+
+    fn start_auto_jobs(&mut self) -> Task<Message> {
         let accounts = self.exchange_accounts.persisted().accounts;
         // Read again at the moment of sending (S3), not only when the entry was confirmed.
         let switch = |id: uuid::Uuid| {
@@ -1063,7 +1230,9 @@ impl Flowsurface {
                 .is_some_and(|m| m.protect.attaches_automatically(m.env))
         };
         let now = chrono::Utc::now().timestamp_millis();
-        let jobs = self.trading.poll_auto(now, &switch);
+        let jobs = self
+            .trading
+            .poll_auto(now, self.started.elapsed().as_millis() as i64, &switch);
         if jobs.is_empty() {
             return Task::none();
         }
@@ -1075,18 +1244,29 @@ impl Flowsurface {
             let (Some(meta), Ok(signed), Some(risk)) = (meta, signed.clone(), risk) else {
                 let summary = auto_flow::failed_summary(
                     &job,
+                    auto_flow::FailReason::SetupFailed,
                     "the account has no usable connection or trading state",
                 );
                 self.trading.auto_done(summary);
                 continue;
             };
-            let market = order_flow::market_of(meta.venue, meta.product);
-            let ticker = exchange::Ticker::new(&job.symbol, market);
-            let ref_price = self
-                .sidebar
-                .tickers_table
-                .mark_price(&ticker)
-                .and_then(order_flow::price_to_decimal);
+            // The price the triggers are checked against, and how old it is. A quote that is too
+            // old is not used: the orders of the stage are not sent and the failure goes to the
+            // panel (nothing is sent again by itself).
+            let quote = self.quote_of(&meta, &job.symbol);
+            let ref_price = if job.places() {
+                match auto_flow::reference_price(job.trigger_basis(), quote) {
+                    Ok(price) => price,
+                    Err(reason) => {
+                        let summary =
+                            auto_flow::failed_summary(&job, reason, "the market price is too old");
+                        self.trading.auto_done(summary);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let input = auto_flow::RunInput {
                 session: self.trade_session.get(meta.id).cloned(),
                 job,
@@ -1125,6 +1305,24 @@ impl Flowsurface {
         let request = self
             .order_requests
             .remove(&(summary.account, summary.symbol.clone()));
+        // A whole-position stop was accepted: the entry's failures that left the position bare
+        // are cleared and its own stop is never sent. Other results keep the warning.
+        if let (
+            order_flow::SendResult::Accepted { .. },
+            Some(order_flow::PrepareRequest {
+                spec:
+                    exchange::trade::ManualSpec::Stop {
+                        dir,
+                        size: exchange::trade::Size::ClosePosition,
+                        ..
+                    },
+                ..
+            }),
+        ) = (&summary.result, &request)
+        {
+            self.trading
+                .protection_added(summary.account, &summary.symbol, *dir);
+        }
         if summary.result == order_flow::SendResult::RulesExpired
             && let Some(request) = request
         {
@@ -1231,6 +1429,8 @@ impl Flowsurface {
             account_panel: modal::account_panel::AccountPanel::default(),
             bulk_confirm: None,
             order_requests: HashMap::new(),
+            quote_stamps: HashMap::new(),
+            started: std::time::Instant::now(),
             antialiasing: saved_state.antialiasing,
             applied_antialiasing: saved_state.antialiasing,
             restoring_windows: HashSet::new(),
@@ -1950,10 +2150,24 @@ impl Flowsurface {
                 return Task::batch([task.map(Message::Trading), self.run_auto_jobs()]);
             }
             Message::AutoDone(summary) => {
+                // An automatic order may have left an unknown result: read the list again so the
+                // panel offers the same release flow as for a manual one.
+                let unknown = summary.has_unknown();
                 self.trading.auto_done(*summary);
-                return self.run_auto_jobs();
+                let jobs = self.run_auto_jobs();
+                return if unknown {
+                    Task::batch([Self::reload_records(), jobs])
+                } else {
+                    jobs
+                };
             }
             Message::Sidebar(message) => {
+                if let screen::sidebar::Message::TickersTable(
+                    screen::sidebar::tickers_table::Message::UpdateStats(venue, _),
+                ) = &message
+                {
+                    self.quote_stamps.insert(*venue, std::time::Instant::now());
+                }
                 let (task, action) = self.sidebar.update(message);
 
                 if let Some(screen::sidebar::Action::MenuChanged(menu)) = &action

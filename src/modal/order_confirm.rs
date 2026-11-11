@@ -102,6 +102,22 @@ pub fn exposure_line(e: &Exposure) -> Option<String> {
     }
 }
 
+/// What a stop that closes the whole position watches. The order is sent to trigger on the mark
+/// price, whatever the account's defaults say for the protection that goes with an entry, and
+/// the retry works its trigger out from the last price: the window says so.
+pub fn trigger_basis_line(spec: &exchange::trade::ManualSpec) -> Option<&'static str> {
+    use exchange::trade::{ManualSpec, Size};
+    match spec {
+        ManualSpec::Stop {
+            size: Size::ClosePosition,
+            ..
+        } => Some(
+            "Trigger basis: mark price (the account's protective defaults may use the last price).",
+        ),
+        _ => None,
+    }
+}
+
 pub struct PendingConfirm {
     pub window: iced::window::Id,
     pub request: PrepareRequest,
@@ -200,6 +216,9 @@ impl PendingConfirm {
         if let Some(base) = &self.notes.base_amount {
             content = content.push(text(base.clone()).size(style::text_size::SMALL));
         }
+        if let Some(line) = trigger_basis_line(&self.request.spec) {
+            content = content.push(text(line).size(style::text_size::SMALL));
+        }
         match self.notes.deviation {
             Deviation::Exceeds => {
                 content = content.push(warn(format!(
@@ -294,6 +313,25 @@ mod tests {
         let mut test = ConfirmGuard::new(false, start);
         assert!(!test.waiting(start));
         assert!(test.try_confirm(start));
+    }
+
+    #[test]
+    fn a_close_position_stop_says_its_trigger_basis_is_the_mark_price() {
+        use exchange::trade::{Decimal, Dir, ManualSpec, Size};
+        let trigger = Decimal::parse("59000").unwrap();
+        let line = trigger_basis_line(&ManualSpec::Stop {
+            dir: Dir::Long,
+            size: Size::ClosePosition,
+            trigger,
+        })
+        .expect("a close-position stop names its basis");
+        assert!(line.contains("mark price"), "{line}");
+        // Other orders do not get the line.
+        let market = ManualSpec::Market {
+            dir: Dir::Long,
+            qty: Decimal::parse("1").unwrap(),
+        };
+        assert!(trigger_basis_line(&market).is_none());
     }
 
     #[test]

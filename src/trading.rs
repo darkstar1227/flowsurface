@@ -12,7 +12,8 @@
 //! terminal state such as `AuthFailed` is not lost when the session is voided.
 
 use crate::auto_flow::{
-    AutoBook, AutoInit, AutoJob, AutoSummary, FillVerdict, PollEnv, ReconnectView,
+    AutoBook, AutoInit, AutoJob, AutoSummary, DismissError, FailureView, FillVerdict, PollEnv,
+    ReconnectView,
 };
 use crate::order_flow::SendResult;
 use crate::protect_attach::{Holdings, PendingAttach, PendingAttachTable};
@@ -992,13 +993,20 @@ impl TradingState {
     /// The automatic jobs that are due now (never twice: a job leaves the book as it is made).
     /// `switch` says whether the account's auto-attach is on. Entries whose work ended leave the
     /// table of pending protection.
-    pub fn poll_auto(&mut self, now_ms: i64, switch: &dyn Fn(Uuid) -> bool) -> Vec<AutoJob> {
+    /// `mono_ms` is a monotonic clock for the waits (see [`PollEnv::mono_ms`]).
+    pub fn poll_auto(
+        &mut self,
+        now_ms: i64,
+        mono_ms: i64,
+        switch: &dyn Fn(Uuid) -> bool,
+    ) -> Vec<AutoJob> {
         // The book is taken out while it looks at the positions (which live in `self`).
         let mut auto = std::mem::take(&mut self.auto);
         let held = |id: Uuid, symbol: &str| self.holdings(id, symbol);
         let env = PollEnv {
             switch,
             held: &held,
+            mono_ms,
         };
         let jobs = auto.poll(now_ms, &env);
         self.auto = auto;
@@ -1018,9 +1026,41 @@ impl TradingState {
         }
     }
 
-    /// What went wrong with the automatic orders of the account (panel lines).
+    /// Every note of the automatic orders of the account (failures included).
+    #[cfg(test)]
     pub fn auto_notes(&self, id: Uuid) -> Vec<String> {
         self.auto.notes_for(id)
+    }
+
+    /// The notes of the automatic orders that are not failures of an entry (panel lines).
+    pub fn auto_info_notes(&self, id: Uuid) -> Vec<String> {
+        self.auto.info_notes_for(id)
+    }
+
+    /// The entries of the account whose protection needs the user (condition 65).
+    pub fn auto_failures(&self, id: Uuid) -> Vec<FailureView> {
+        self.auto.failures_for(id)
+    }
+
+    /// The user says an entry's protection is handled: it leaves the book and no longer blocks
+    /// its symbol. Only the book is touched, never an unknown result's record or lock.
+    pub fn dismiss_failure(&mut self, id: Uuid, key: &str) -> Result<String, DismissError> {
+        let symbol = self.auto.dismiss(id, key)?;
+        self.forget_finished();
+        Ok(symbol)
+    }
+
+    /// A whole-position stop was accepted for the position: the failures that left it bare are
+    /// cleared and the entry's own stop is never sent.
+    pub fn protection_added(&mut self, id: Uuid, symbol: &str, dir: exchange::trade::Dir) {
+        self.auto.protection_added(id, symbol, dir);
+        self.forget_finished();
+    }
+
+    /// The accounts that have a protection failure the user has not been told about by a system
+    /// notification, once per entry.
+    pub fn take_failure_notices(&mut self) -> Vec<Uuid> {
+        self.auto.take_to_notify()
     }
 
     /// Symbols with protection listed for an entry that has no position yet (a resting limit
@@ -1315,6 +1355,12 @@ impl TradingState {
                     }
                     (true, _, None) => {
                         log::info!("A fill without a client id was not matched to an entry.");
+                    }
+                    // Tied to an entry by its client id, but with no trade id it cannot be told from
+                    // a repeat: not counted, so the wait for fills may end as "not seen". The
+                    // client id is not written to the log.
+                    (true, false, Some(_)) => {
+                        log::info!("A fill with a client id but no trade id was not counted.");
                     }
                     _ => {}
                 }
@@ -2614,7 +2660,8 @@ mod tests {
     fn the_only_trade_calls_here_are_reads() {
         // The send paths are not used by this module (c2b-1 has no order path).
         let src = include_str!("trading.rs");
-        let code = src.split("#[cfg(test)]").next().unwrap();
+        // The tests module only: single `#[cfg(test)]` items come before it and stay scanned.
+        let code = src.split("#[cfg(test)]\nmod tests").next().unwrap();
         for call in [".submit(", ".cancel_all(", ".auto_close(", "submit_auto("] {
             assert!(!code.contains(call), "{call} must not appear in trading.rs");
         }
@@ -2880,9 +2927,9 @@ mod tests {
             filled_of(&t.auto, &entry_id),
             Some(Decimal::parse("0.001").unwrap())
         );
-        let jobs = t.poll_auto(2_000, &|_| true);
+        let jobs = t.poll_auto(2_000, 2_000, &|_| true);
         assert_eq!(jobs.len(), 1, "one stop for the one counted fill");
-        assert!(t.poll_auto(2_000, &|_| true).is_empty());
+        assert!(t.poll_auto(2_000, 2_000, &|_| true).is_empty());
     }
 
     #[test]
@@ -3050,6 +3097,43 @@ mod tests {
         assert!(!t.has_resting_limit_attach());
     }
 
+    /// OKX partial fill: a position exists while the attached orders wait for the entry to be
+    /// complete. The position says so in words (d4), over a stop that is already listed.
+    #[test]
+    fn a_partly_filled_okx_entry_says_protection_is_not_active_yet() {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        assert!(t.register_okx_attach("eAAAA".into(), pending_for(m.id, "BTCUSDT", true)));
+        let all = t.protection(m.id);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].protection, exchange::trade::Protection::EntryPending);
+        assert!(
+            all[0]
+                .protection
+                .label()
+                .starts_with("Protection not active yet")
+        );
+    }
+
+    /// An order the app sent by itself and could not confirm is an ordinary unknown record: the
+    /// same status, the same wait for the account test and lookup, and the same release step
+    /// (the typed phrase). Nothing in the status depends on who sent it (d4).
+    #[test]
+    fn an_unknown_result_of_an_automatic_order_follows_the_manual_release_flow() {
+        let m = meta("a", AccountVenue::Binance, AccountProduct::UsdM);
+        let mut r = rec(&m, "BTCUSDT", "sAuto123");
+        r.kind = "stop_market".into();
+        let mut t = boot_with(vec![r.clone()]);
+        let st = t.record_status(m.id, &r);
+        assert_eq!(st, RecordStatus::AwaitingTest);
+        assert!(!st.may_release());
+        assert!(t.is_record_locked(m.id, "BTCUSDT"));
+        assert_eq!(t.begin_lookup(m.id).len(), 1);
+        t.lookup_finished(&r, LookupEnd::StillUnknown);
+        assert!(t.record_status(m.id, &r).may_release());
+        assert!(t.is_record_locked(m.id, "BTCUSDT"));
+    }
+
     #[test]
     fn the_same_trade_id_on_two_symbols_is_two_fills() {
         let (mut t, m, _) = running();
@@ -3156,7 +3240,7 @@ mod tests {
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("connection was lost"));
         assert!(
-            t.poll_auto(2_000, &|_| true).is_empty(),
+            t.poll_auto(2_000, 2_000, &|_| true).is_empty(),
             "nothing is sent for it"
         );
         assert!(!t.auto_active(m.id, "BTCUSDT"));
@@ -3234,7 +3318,7 @@ mod tests {
             send(&mut t, event(entry_fill(&entry_id, "t1")));
         }
         let notes = t.auto_notes(m.id).len();
-        let jobs = t.poll_auto(2_000, &|_| true);
+        let jobs = t.poll_auto(2_000, 2_000, &|_| true);
         let stop = jobs.len() == 1 && format!("{:?}", jobs[0]).contains("Place(Stop)");
         assert!(stop || jobs.is_empty(), "{jobs:?}");
         (notes, stop, t.auto_active(m.id, "BTCUSDT"))

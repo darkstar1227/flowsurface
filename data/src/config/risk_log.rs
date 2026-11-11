@@ -47,6 +47,8 @@ pub enum LogAction {
     UnknownReleased,
     /// A saved record with an invalid client id was dropped by the user (two-step confirmation).
     UnknownDiscarded,
+    /// The user said an entry's automatic protection was handled by hand (it left the book).
+    ProtectionHandled,
 }
 
 /// One log line. The fields are private and the constructors take typed values only.
@@ -225,6 +227,19 @@ impl RiskLogEntry {
             _ => "unknown_released_by_user",
         };
         let mut e = Self::base(meta, at_ms, action, reason);
+        e.symbol = Some(clean_symbol(symbol));
+        e
+    }
+
+    /// The user removed an entry of the automatic protection from the book ("I've handled
+    /// it"). The symbol only: no client id, no order parameters, no failure text.
+    pub fn protection_handled(meta: &AccountMeta, at_ms: i64, symbol: &str) -> Self {
+        let mut e = Self::base(
+            meta,
+            at_ms,
+            LogAction::ProtectionHandled,
+            "protection_handled_by_user",
+        );
         e.symbol = Some(clean_symbol(symbol));
         e
     }
@@ -502,6 +517,19 @@ mod tests {
                 .mode();
             assert_eq!(m & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn a_handled_protection_logs_the_symbol_and_nothing_else() {
+        let e = RiskLogEntry::protection_handled(&meta("main"), 7, "BTCUSDT");
+        let v = serde_json::to_value(&e).expect("json");
+        assert_eq!(v["action"], "protection_handled");
+        assert_eq!(v["reason"], "protection_handled_by_user");
+        assert_eq!(v["symbol"], "BTCUSDT");
+        assert!(v["value"].is_null());
+        // A symbol that does not look like one is replaced.
+        let odd = RiskLogEntry::protection_handled(&meta("main"), 7, "BTC USDT; rm");
+        assert_eq!(serde_json::to_value(&odd).expect("json")["symbol"], "?");
     }
 
     #[test]

@@ -670,3 +670,70 @@ security-review 判 BLOCK 的四項與 AutoGrant 綁定補齊（2026-11-11 使�
 ### d4 待辦（本次不實作）
 - **`Filled` 但有未見成交**：記錄 `expected` 設定時間，poll 時超過 N 秒仍短少就寫 `FILLS_NOT_SEEN`，`filled == 0` 時 `give_up`；有 client id 但沒有 trade id 的成交至少 `log::info!`。
 - **永久擋住 symbol 的其他情況**（例如止損一直 `Open` 但部位已被手動平掉）：d4 的「我已處理」按鈕要涵蓋所有 `is_active` 的條目，不只 Unknown／CancelFailed。
+
+## M5 d4：保護失敗處理（條件 65）
+
+### 1. 保護失敗狀態（`src/auto_flow.rs`）
+- `FailReason` 共 18 種：`Rejected`、`RateLimited`（429／418）、`NotSent`、`Unknown`、`PlanError`、`QtyCheck`、`GrantRefused`、`SetupFailed`、`StaleReference`、`SwitchedOff`、`ReducedInstead`、`NotTakingEffect`、`CancelFailed`、`CancelUnknown`、`FillsNotSeen`、`FilledAfterClose`、`NotFoundOpen`、`LostConnection`。每種有固定英文文案（`FailReason::text`，測試 `every_fail_reason_has_a_text`）；`may_leave_bare` 表示「部位可能沒有止損」。
+- 失敗存在 `AutoEntry.failures`（只在記憶體，不進 `saved-state.json`）。有失敗的條目不會被 housekeeping 移除，直到使用者按「I've handled it」。
+- `is_active` 語意不變：失敗或 Unknown 的條目不擋 symbol（Unknown 另有 c2b-3 的紀錄鎖）。
+- 所有文案不含 client id、價格或交易所回傳原文；`FailureView` 的 `Debug` 也不印 client id。
+
+### 2. 帳戶面板（`src/modal/account_panel.rs`）
+- 常駐紅色橫幅：每個失敗條目一則（alias、symbol、各原因文案），按鈕：
+  - **Retry protection**：只在 `may_retry`（部位可能沒有止損、且沒有 app 的止損還立著、條目已送出）時出現。
+  - **Flatten (close all positions)**：重用 `Action::Bulk(BulkAction::Flatten)`，同一個確認視窗與 bulk 權杖，不另開路徑。
+  - **I've handled it**：兩段式（第一下出現說明與 Yes／Back，第二下才執行）。涵蓋所有仍算作用中的條目（沒有失敗但還擋著 symbol 的也會列出，只有這個按鈕）。
+- 撤單 Unknown／撤單失敗（M1）的文案直接寫在該條目的橫幅裡、按鈕旁。
+- 不是失敗的提示（例如 `STOP_KEPT`）仍用黃色提示（`auto_info_notes`）。
+
+### 3. 重試走既有手動路徑，不走 `submit_auto`
+- 理由：`AutoGrant::from_entry` 需要進場的 intent，重試沒有；為了重試硬造 grant 會讓「舊 grant 可被重用」變成可能。
+- 流程：`protect_attach::retry_stop` → `ManualSpec::Stop { size: ClosePosition }` → `start_review` → 確認視窗 → `order_flow::send`。因此有**新的 client id、新的 confirm token、沒有 grant**，必須使用者在確認視窗按下確認才會送出；沒有任何自動送出。
+- `retry_stop` 拒絕：清單過期、帳戶沒有該方向部位、持倉模式未知、預設設定不合法或沒有止損、沒有報價或報價過舊。
+- 手動止損被接受（`Accepted`）後，`main.rs::on_order_sent_inner` 呼叫 `TradingState::protection_added`：清掉該條目「部位可能沒有止損」的失敗，並把尚未送出的止損階段改成 `Failed`，所以舊 grant 之後不會再送第二張止損。被拒或 Unknown 的重試不清除失敗；`SendResult::Found`（Unknown 之後在交易所找到該單）也不清除，橫幅與 Retry 按鈕仍在，使用者確認部位後可按「I've handled it」。
+- `protection_added` 作用於同一帳戶、同一 symbol、同一方向的**所有**條目（包括進場單還在掛單的條目，以及使用者自己從訂單票下的 closePosition 止損）。closePosition 止損涵蓋整個持倉，所以這樣是安全的；但若使用者之後手動撤掉那張止損，這些條目不會自動補止損。
+- 重試止損的確認視窗寫明觸發基準是 mark price（帳戶的保護預設可能用 last price）；`check_fills_wait` 的等待改用單調時鐘（`Instant`，由 `PollEnv::mono_ms` 注入），系統時間被調整不會縮短或拉長等待。通知以帳戶 id 去重，alias 會濾掉 Unicode Cf 字元。
+- 偏離：只重試止損（止盈走訂單票）；基準價是當下報價（`HeldPosition` 沒有進場價）；手動止損一律監看 MARK_PRICE（`manual.rs` 寫死），不是帳戶設定的觸發基準。預覽視窗會列出這些數字。
+- 掃描測試：`submit_auto(`、`AutoIntent::new(` 仍只在 `src/auto_flow.rs`，`.submit(` 仍只在 `src/order_flow.rs`，`for_preview(` 仍只在 `order_confirm.rs`。新增掃描測試 `the_retry_only_opens_the_review_and_sends_nothing_itself`（`start_protection_retry` 的函式本體含 `start_review(`，且不含 `order_flow::send(`、`confirm_order`、`.submit(`、`submit_auto(`、`AutoIntent::new(`、`auto_flow::mint(`、`AutoGrant`）。本段動到的掃描測試：`order_flow.rs` 的 submit／auto／mint 掃描（切割條件改變，兼容 `mod tests` 與 `pub(crate) mod tests` 兩種寫法）、`trading.rs` 的 `the_only_trade_calls_here_are_reads`（同樣改切割條件，否則新的單項 `#[cfg(test)]` 會讓它只掃到檔案前段而空過）。`order_confirm.rs`、`order_ticket.rs` 的掃描沒有單項 `#[cfg(test)]` 在測試模組前，不受影響。`order_flow.rs` 的掃描測試改為只排除 `#[cfg(test)]\nmod tests` 之後的內容（原本遇到第一個 `#[cfg(test)]` 就截斷，會漏掉 `auto_flow.rs` 在測試模組之前的 `#[cfg(test)]` 單項）。允許檔案清單不變。
+
+### 4. 「I've handled it」語意
+- 只從 `AutoBook` 移除條目並解除該條目對 symbol 的阻擋；`Sent::Sending` 或 `busy`（有自動單正在送）時拒絕（`DismissError::Busy`）。
+- 不碰 `pairs`、`UnknownStore` 或 c2b-3 的紀錄；Unknown 紀錄的釋放／丟棄仍須手動流程的確認句，沒有新增繞過。
+- 風控日誌多一種 `LogAction::ProtectionHandled`（理由 `protection_handled_by_user`，只有帳戶與 symbol）；寫入失敗只在面板提示，不阻擋移除。
+
+### 5. 參考價新鮮度
+- 資料來源：側欄 ticker 表的價格（Binance 實際上是 REST 的最新成交價），表顯示時每 13 秒更新、隱藏時每 300 秒更新。側欄不在授權範圍，所以 `main.rs` 在 `UpdateStats(venue, _)` 成功時按交易所記錄時間（`quote_stamps`）。
+- `REF_PRICE_MAX_AGE_SECS = 330`（隱藏時的 300 秒加 30 秒餘裕；更短會在側欄隱藏時讓所有自動止損停擺）。超過就視為未知：該階段不送、歸為 `StaleReference`，交給重試。
+- `auto_flow::reference_price(basis, quote)`：觸發基準為 last 且報價夠新 → 用報價；基準為 mark → 沒有 mark 來源，不使用報價，沿用成交價（d3 已接受的偏離）；完全沒有報價 → 沿用成交價；報價過舊 → `StaleReference`。
+- **重要限制**：只有觸發基準為 last 的規格會檢查報價是否過舊；基準為 mark 的規格（測試用 `spec()` 預設就是 Mark）沒有 mark 來源，過舊檢查**不會觸發**，一律沿用成交價。另外 `UpdateStats(venue, _)` 只在該交易所的 ticker 抓取成功時發出（失敗走 `StatsFetchFailed`，不蓋時間），但時間戳是整個交易所一份：同一交易所的現貨與永續在同一次抓取內更新，若只有部分市場有更新，時間戳仍會前進。
+- Live 開放前建議改成每個 symbol 的即時價格串流，並區分 mark／last。
+
+### 6. 未見成交逾時與 R3
+- `FILLS_WAIT_MS = 10_000`：交易所說 `Filled` 但看到的成交量不足時，`expected_at` 在第一次 poll 時記錄，每次成交計入後重設；`poll` 內的 `check_fills_wait` 超過就寫 `FILLS_NOT_SEEN` 並加失敗。poll 由每個交易事件與連線中的 `EquityTick` 驅動，實際延遲可能略長。
+- 逾時後以已見成交量為準（`expected = filled`），後續階段照常進行。
+- R3：`filled == 0` 時改用 `give_up_rest`（止盈階段放棄，止損仍是 `Todo`，之後若看到**該單自己 client id** 的成交仍送 closePosition 止損），並設 `reported`、推入 `finished`，清掉 attach 表。取捨：條目會留在 book 直到使用者處理（有失敗不被 housekeeping 移除），換來「晚到的成交仍有止損」。`Canceled`／`Expired`／`Rejected` 帶有未見成交時走同一條路。
+- 有 client id 但沒有 trade id 的成交只寫 `log::info!`（不含 client id），不計入。
+
+### 7. 系統通知（`src/notify_os.rs`）
+- 只在保護失敗時、每個條目一次（`AutoEntry.notified`、`AutoBook::take_to_notify`），只在 macOS；其他平台不做事，面板橫幅就是通知。裸倉偵測屬 d5。
+- 文字來自固定表（`Notice`），只帶 alias：`Account <alias>: protection failed. Open the account panel in Flowsurface to see what to do.`。alias 去掉控制字元、最多 32 字元、空白改為 `(no alias)`。
+- AppleScript 是常數（`on run argv` … `item 1 of argv`），訊息以最後一個 argv 傳入，不拼進腳本；訊息一定以 `Account ` 開頭，不會被當成 osascript 選項。以絕對路徑 `/usr/bin/osascript` 啟動，不經 shell，stdio 為 null，由執行緒等待結束。啟動器以閉包注入，測試不啟動行程。
+- 測試：`the_script_is_fixed_and_the_alias_is_only_the_last_argument`（含惡意 alias）、`the_message_is_the_fixed_text_with_the_alias`、`the_notification_comes_once_per_entry`。
+
+### 8. 指紋限制（給 security-review）
+- grant 內的「spec 指紋」是 `ProtectSpec` 的行程內 `DefaultHasher` 雜湊：只用來辨認同一次執行中的設定有沒有被改，**不是密碼學雜湊**，不存檔、不送出，重啟後無意義。它不能證明設定的來源，只能擋「確認後設定被換掉」；真正的授權邊界仍是 grant 的帳戶、symbol、方向、角色、進場 client id、期限與數量上限。
+
+### 9. 自動路徑的 Unknown 紀錄
+- 沿用 c2b-3 的 `RecordStatus` 與手動釋放流程；`AutoDone` 若帶有 Unknown 步驟就重新載入紀錄，面板才會顯示。測試 `an_unknown_result_of_an_automatic_order_follows_the_manual_release_flow`。
+
+### 10. OKX 部分成交
+- 有掛附屬單的 OKX 進場在部分成交期間，持倉列顯示 "Protection not active yet (entry protection pending, not in force yet)"（`Protection::EntryPending`，優先於清單上已有的止損）。測試 `a_partly_filled_okx_entry_says_protection_is_not_active_yet`。OKX 附掛表在完全成交後不會自動移除，是 d2／d3 既有問題，不在本段處理。
+
+### 11. Live 開放前要在 testnet 確認
+- Binance algo 撤單「不存在」的 code（`CANCEL_NOT_FOUND` 仍為空）。
+- 同方向第二張 closePosition 是否回 -4130。
+- 止損 `TRIGGERED` → `CANCELED` 的序列是否真的會發生。
+- 報價過舊時（側欄隱藏）的實際行為與 330 秒是否合適。
+- 重試的手動止損以 MARK_PRICE 為基準，與帳戶設定可能不同；確認視窗的欄位是否足夠清楚。
+- macOS 通知在權限關閉或勿擾模式下的表現。

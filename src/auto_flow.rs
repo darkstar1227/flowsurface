@@ -76,6 +76,244 @@ pub const LOST_CONNECTION: &str = "The connection was lost while the entry was o
 pub const SWITCHED_OFF: &str = "Auto-attach was switched off before the protective orders \
      went out: they were not sent. The position may not be fully protected.";
 
+/// How long the fills of an entry that the exchange calls `Filled` may stay short of its quantity
+/// before they are written down as not seen. The order update and the fills come as separate
+/// messages (the order first on Binance), so a short wait is normal; ten seconds is far more than
+/// the gap between two messages of one stream. Read at the next poll, which runs on every stream
+/// event and on the periodic equity tick, so the real delay can be a little longer.
+pub const FILLS_WAIT_MS: i64 = 10_000;
+
+/// Why a position may not be protected, or an order of the app may still stand. One entry of the
+/// book keeps its list (never silent, never retried) until the user has handled it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailReason {
+    /// The exchange refused a protective order (its message is never shown or kept).
+    Rejected,
+    /// HTTP 429 or 418: the order was not executed and is not sent again.
+    RateLimited,
+    /// The app's own checks, the gate or the connection stopped the order before it went out.
+    NotSent,
+    /// No answer, and the lookup did not find the order either.
+    Unknown,
+    /// The trigger prices could not be worked out from the fill and the settings.
+    PlanError,
+    /// The quantity does not fit the symbol's size rules.
+    QtyCheck,
+    /// The grant made at the confirmation of the entry refused the request.
+    GrantRefused,
+    /// Credentials, trading rules or the connection could not be set up for the job.
+    SetupFailed,
+    /// The market price the stop was checked against was older than [`REF_PRICE_MAX_AGE_SECS`].
+    StaleReference,
+    SwitchedOff,
+    ReducedInstead,
+    /// A protective order triggered but did not take effect.
+    NotTakingEffect,
+    /// A cancel was refused: the order may still stand.
+    CancelFailed,
+    /// A cancel got no answer: the order may still stand.
+    CancelUnknown,
+    FillsNotSeen,
+    FilledAfterClose,
+    NotFoundOpen,
+    LostConnection,
+}
+
+impl FailReason {
+    /// Every reason, in the order of [`Self::index`]; the table test walks it.
+    #[cfg(test)]
+    const ALL: [FailReason; 18] = [
+        FailReason::Rejected,
+        FailReason::RateLimited,
+        FailReason::NotSent,
+        FailReason::Unknown,
+        FailReason::PlanError,
+        FailReason::QtyCheck,
+        FailReason::GrantRefused,
+        FailReason::SetupFailed,
+        FailReason::StaleReference,
+        FailReason::SwitchedOff,
+        FailReason::ReducedInstead,
+        FailReason::NotTakingEffect,
+        FailReason::CancelFailed,
+        FailReason::CancelUnknown,
+        FailReason::FillsNotSeen,
+        FailReason::FilledAfterClose,
+        FailReason::NotFoundOpen,
+        FailReason::LostConnection,
+    ];
+
+    /// Position in [`Self::ALL`]. An exhaustive match: a new reason does not compile until it is
+    /// given a place, and the test then checks it is in the table.
+    #[cfg(test)]
+    fn index(self) -> usize {
+        match self {
+            FailReason::Rejected => 0,
+            FailReason::RateLimited => 1,
+            FailReason::NotSent => 2,
+            FailReason::Unknown => 3,
+            FailReason::PlanError => 4,
+            FailReason::QtyCheck => 5,
+            FailReason::GrantRefused => 6,
+            FailReason::SetupFailed => 7,
+            FailReason::StaleReference => 8,
+            FailReason::SwitchedOff => 9,
+            FailReason::ReducedInstead => 10,
+            FailReason::NotTakingEffect => 11,
+            FailReason::CancelFailed => 12,
+            FailReason::CancelUnknown => 13,
+            FailReason::FillsNotSeen => 14,
+            FailReason::FilledAfterClose => 15,
+            FailReason::NotFoundOpen => 16,
+            FailReason::LostConnection => 17,
+        }
+    }
+
+    /// The line for the panel. Fixed text: nothing from the exchange is in it.
+    pub fn text(self) -> &'static str {
+        match self {
+            FailReason::Rejected => {
+                "The exchange refused a protective order. The position may not be protected."
+            }
+            FailReason::RateLimited => {
+                "The exchange is limiting requests (HTTP 429 or 418), so a protective order was \
+                 not placed. It was not sent again. The position may not be protected."
+            }
+            FailReason::NotSent => {
+                "A protective order was not sent: the app's own checks or the connection stopped \
+                 it. The position may not be protected."
+            }
+            FailReason::Unknown => {
+                "The exchange did not confirm a protective order. It was not sent again; check \
+                 the open orders."
+            }
+            FailReason::PlanError => {
+                "The protective prices could not be worked out from the fill and the account's \
+                 settings. The position may not be protected."
+            }
+            FailReason::QtyCheck => {
+                "A protective order's quantity does not fit the symbol's size rules. The \
+                 position may not be protected."
+            }
+            FailReason::GrantRefused => {
+                "The confirmation of the entry did not cover a protective order, so it was \
+                 refused. The position may not be protected."
+            }
+            FailReason::SetupFailed => {
+                "A protective order could not be started (credentials, trading rules or the \
+                 connection). The position may not be protected."
+            }
+            FailReason::StaleReference => {
+                "The market price a protective order is checked against was too old, so it was \
+                 not sent. The position may not be protected."
+            }
+            FailReason::SwitchedOff => SWITCHED_OFF,
+            FailReason::ReducedInstead => REDUCED_INSTEAD,
+            FailReason::NotTakingEffect => {
+                "A protective order triggered but did not take effect (refused, expired or \
+                 cancelled). The position may still be open and not protected."
+            }
+            FailReason::CancelFailed => {
+                "A protective order could not be cancelled and may still stand. It was not tried \
+                 again; check the open orders and cancel it by hand."
+            }
+            FailReason::CancelUnknown => {
+                "The exchange did not confirm the cancel of a protective order; it may still \
+                 stand. It was not tried again; check the open orders and cancel it by hand."
+            }
+            FailReason::FillsNotSeen => FILLS_NOT_SEEN,
+            FailReason::FilledAfterClose => FILLED_AFTER_CLOSE,
+            FailReason::NotFoundOpen => NOT_FOUND_OPEN,
+            FailReason::LostConnection => LOST_CONNECTION,
+        }
+    }
+
+    /// Does this leave a position without its stop-loss (a new stop is worth offering)? The
+    /// cancel reasons do not: the order that could not be cancelled still stands.
+    pub fn may_leave_bare(self) -> bool {
+        !matches!(self, FailReason::CancelFailed | FailReason::CancelUnknown)
+    }
+}
+
+/// A market price the stop is checked against, and how old it is.
+///
+/// The app has no per-symbol live price here: the quote is the last price of the 24 h ticker
+/// list, fetched by the sidebar every 13 s while the list is shown and every 300 s while it is
+/// hidden, and stamped (per venue) when a fetch succeeds. A failed fetch keeps the old value, so
+/// the age is what tells a kept value from a fresh one. 330 s is the hidden interval plus slack:
+/// a shorter limit would stop every automatic stop while the list is hidden. A quote older than
+/// this is not used. Before Live opens, a live price feed per symbol should replace it.
+pub const REF_PRICE_MAX_AGE_SECS: u64 = 330;
+
+/// The price a stage's trigger side is checked against.
+///
+/// - `Ok(Some(p))`: a quote that is fresh enough, for a spec that watches the last price (the
+///   quote is the last price; there is no mark price source, so a spec that watches the mark price
+///   gets none).
+/// - `Ok(None)`: no usable source; the fill price stands in (the stop is then checked against the
+///   fill only, see `run`).
+/// - `Err`: a quote exists but is older than the limit, so it is not used and the stage is not
+///   sent (the failure goes to the panel for a manual retry).
+pub fn reference_price(
+    basis: exchange::trade::TriggerBasis,
+    quote: Option<(Decimal, Duration)>,
+) -> Result<Option<Decimal>, FailReason> {
+    use exchange::trade::TriggerBasis;
+    match (basis, quote) {
+        (_, None) | (TriggerBasis::Mark, _) => Ok(None),
+        (TriggerBasis::Last, Some((price, age))) => {
+            if age > Duration::from_secs(REF_PRICE_MAX_AGE_SECS) {
+                Err(FailReason::StaleReference)
+            } else {
+                Ok(Some(price))
+            }
+        }
+    }
+}
+
+/// One thing that went wrong with an entry's protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Failure {
+    reason: FailReason,
+    /// The order it concerns, when it is about one placed order.
+    order: Option<IssuedRef>,
+}
+
+/// An entry that needs the user, as the panel shows it. The key is the entry's client id: never
+/// printed, used only to name the entry in a click.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FailureView {
+    pub key: String,
+    pub account: Uuid,
+    pub symbol: String,
+    pub reasons: Vec<FailReason>,
+    pub dir: Dir,
+    /// A stop-loss could be offered again: the position may be bare and no stop of the app
+    /// stands for it.
+    pub may_retry: bool,
+    /// The entry still counts as automatic protection at work (it blocks a new entry).
+    pub active: bool,
+}
+
+impl fmt::Debug for FailureView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "FailureView({}, {} reasons, <redacted>)",
+            self.symbol,
+            self.reasons.len()
+        )
+    }
+}
+
+/// Why an entry could not be removed by the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DismissError {
+    NotFound,
+    /// The entry is being sent or its orders are going out now.
+    Busy,
+}
+
 // ── The grant, shared with the task that sends ──────────────────────────
 
 /// The grant of one entry. `AutoGrant` itself cannot be cloned; this handle only lets the task
@@ -177,6 +415,18 @@ pub struct AutoJob {
     filled: Decimal,
 }
 
+impl AutoJob {
+    /// Does the job place orders (and so need a price to check the trigger against)?
+    pub fn places(&self) -> bool {
+        matches!(self.work, Work::Place { .. })
+    }
+
+    /// Which price the entry's triggers watch.
+    pub fn trigger_basis(&self) -> exchange::trade::TriggerBasis {
+        self.spec.trigger_price
+    }
+}
+
 impl fmt::Debug for AutoJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match &self.work {
@@ -192,7 +442,8 @@ pub enum StepResult {
     Ok,
     /// A cancel found nothing to cancel (already gone, or refused): not an error.
     Gone,
-    Failed(String),
+    /// Refused or not sent; the reason is kept for the panel, the text is for the note only.
+    Failed(FailReason, String),
     /// No answer, and the lookup did not find the order either. Nothing was resent.
     Unknown,
 }
@@ -211,25 +462,35 @@ pub struct AutoSummary {
     pub steps: Vec<(Which, StepResult)>,
 }
 
+impl AutoSummary {
+    /// An order whose result is unknown was left (its record is in the unknown list).
+    pub fn has_unknown(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|(_, r)| matches!(r, StepResult::Unknown))
+    }
+}
+
 /// A job that could not even start (no account, no connection): every step failed, nothing sent.
-pub fn failed_summary(job: &AutoJob, why: &str) -> AutoSummary {
+pub fn failed_summary(job: &AutoJob, reason: FailReason, why: &str) -> AutoSummary {
     AutoSummary {
         key: job.key.clone(),
         account: job.account,
         symbol: job.symbol.clone(),
-        steps: all_failed(&job.work, why),
+        steps: all_failed(&job.work, reason, why),
     }
 }
 
-fn all_failed(work: &Work, why: &str) -> Vec<(Which, StepResult)> {
+fn all_failed(work: &Work, reason: FailReason, why: &str) -> Vec<(Which, StepResult)> {
+    let failed = || StepResult::Failed(reason, why.to_string());
     match work {
         Work::Place { orders, .. } => orders
             .iter()
-            .map(|o| (Which::Placed(o.issued), StepResult::Failed(why.to_string())))
+            .map(|o| (Which::Placed(o.issued), failed()))
             .collect(),
         Work::Cancel { which } => which
             .iter()
-            .map(|r| (Which::Cancelled(*r), StepResult::Failed(why.to_string())))
+            .map(|r| (Which::Cancelled(*r), failed()))
             .collect(),
     }
 }
@@ -326,6 +587,13 @@ struct AutoEntry {
     /// The entry was given up with a note (fills not seen, connection lost): no more is sent for
     /// it, and it does not count as active work.
     attention: bool,
+    /// What went wrong, kept until the user has handled the entry (the notes list evicts).
+    failures: Vec<Failure>,
+    /// When `expected` was first seen at a poll (ms): a fill that is late is told from one that
+    /// was lost by the wait that follows ([`FILLS_WAIT_MS`]).
+    expected_at: Option<i64>,
+    /// The system notification for this entry went out (once per entry, never repeated).
+    notified: bool,
 }
 
 /// What a fill did to the book.
@@ -345,7 +613,9 @@ pub struct AutoBook {
     sending: HashMap<(Uuid, String), String>,
     /// Client id of a placed order → its entry.
     by_placed: HashMap<String, String>,
-    notes: VecDeque<(Uuid, String)>,
+    /// (account, text, is it a failure of the protection). A failure's text is also kept on its
+    /// entry; the panel shows those from the entry, and only the other notes from here.
+    notes: VecDeque<(Uuid, String, bool)>,
     finished: Vec<String>,
 }
 
@@ -368,6 +638,9 @@ pub struct PollEnv<'a> {
     pub switch: &'a dyn Fn(Uuid) -> bool,
     /// What the account holds on a symbol.
     pub held: &'a dyn Fn(Uuid, &str) -> Holdings,
+    /// A monotonic clock in milliseconds (from `Instant`, not the wall clock), for waits that a
+    /// change of the system time must not shorten or stretch.
+    pub mono_ms: i64,
 }
 
 /// What the book reads from the first snapshot after a reconnect (M4-4).
@@ -382,23 +655,44 @@ pub struct ReconnectView<'a> {
 
 impl AutoBook {
     fn note(&mut self, account: Uuid, text: impl Into<String>) {
-        self.notes.push_back((account, text.into()));
+        self.push_note(account, text.into(), false);
+    }
+
+    fn push_note(&mut self, account: Uuid, text: String, failure: bool) {
+        self.notes.push_back((account, text, failure));
         while self.notes.len() > MAX_NOTES {
             self.notes.pop_front();
         }
     }
 
-    /// The lines for the account's panel: what could not be attached or cancelled.
+    fn add_failure(e: &mut AutoEntry, reason: FailReason, order: Option<IssuedRef>) {
+        let failure = Failure { reason, order };
+        if !e.failures.contains(&failure) {
+            e.failures.push(failure);
+        }
+    }
+
+    /// Every note of the account (failures included).
+    #[cfg(test)]
     pub fn notes_for(&self, account: Uuid) -> Vec<String> {
         self.notes
             .iter()
-            .filter(|(a, _)| *a == account)
-            .map(|(_, t)| t.clone())
+            .filter(|(a, _, _)| *a == account)
+            .map(|(_, t, _)| t.clone())
+            .collect()
+    }
+
+    /// The notes that are not failures of an entry (those are shown from the entry).
+    pub fn info_notes_for(&self, account: Uuid) -> Vec<String> {
+        self.notes
+            .iter()
+            .filter(|(a, _, failure)| *a == account && !*failure)
+            .map(|(_, t, _)| t.clone())
             .collect()
     }
 
     pub fn clear_notes(&mut self, account: Uuid) {
-        self.notes.retain(|(a, _)| *a != account);
+        self.notes.retain(|(a, _, _)| *a != account);
     }
 
     /// Is protection still being worked on for an entry of the account on this symbol (M3)? Only
@@ -408,22 +702,120 @@ impl AutoBook {
     /// not block the symbol for the rest of the session.
     pub fn is_active(&self, account: Uuid, symbol: &str) -> bool {
         self.entries.values().any(|e| {
-            e.account == account
-                && e.symbol.eq_ignore_ascii_case(symbol)
-                && !e.attention
-                && match e.sent {
-                    Sent::Sending => true,
-                    Sent::Unresolved => false,
-                    Sent::Stands => {
-                        e.busy
-                            || !e.stop.terminal()
-                            || !e.rest.terminal()
-                            || e.placed
-                                .iter()
-                                .any(|p| p.state.holds_the_position() && !p.unsure)
-                    }
-                }
+            e.account == account && e.symbol.eq_ignore_ascii_case(symbol) && Self::counts_active(e)
         })
+    }
+
+    fn counts_active(e: &AutoEntry) -> bool {
+        !e.attention
+            && match e.sent {
+                Sent::Sending => true,
+                Sent::Unresolved => false,
+                Sent::Stands => {
+                    e.busy
+                        || !e.stop.terminal()
+                        || !e.rest.terminal()
+                        || e.placed
+                            .iter()
+                            .any(|p| p.state.holds_the_position() && !p.unsure)
+                }
+            }
+    }
+
+    /// A stop-loss of the app that stands, or is about to take effect or be cancelled (or whose
+    /// cancel failed): a new whole-position stop would be a second one.
+    fn stop_stands(e: &AutoEntry) -> bool {
+        e.placed.iter().any(|p| {
+            p.role == Role::StopLoss
+                && matches!(
+                    p.state,
+                    Live::Open
+                        | Live::ToCancel
+                        | Live::Cancelling
+                        | Live::CancelFailed
+                        | Live::Triggered
+                )
+        })
+    }
+
+    /// The entries of the account the user has to look at (condition 65): every one with a
+    /// failure written down, and every one that still counts as protection at work (it blocks
+    /// a new entry on its symbol, and a stop left open after the position was closed by hand has
+    /// no failure of its own).
+    pub fn failures_for(&self, account: Uuid) -> Vec<FailureView> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.account == account)
+            .filter_map(|(key, e)| {
+                let active = Self::counts_active(e);
+                if e.failures.is_empty() && !active {
+                    return None;
+                }
+                let reasons: Vec<FailReason> = e.failures.iter().map(|f| f.reason).collect();
+                let may_retry = e.sent == Sent::Stands
+                    && reasons.iter().any(|r| r.may_leave_bare())
+                    && !Self::stop_stands(e);
+                Some(FailureView {
+                    key: key.clone(),
+                    account,
+                    symbol: e.symbol.clone(),
+                    dir: e.dir,
+                    reasons,
+                    may_retry,
+                    active,
+                })
+            })
+            .collect()
+    }
+
+    /// The accounts of entries that have a failure the user has not been told about by a system
+    /// notification yet, once per entry (the entry is marked).
+    pub fn take_to_notify(&mut self) -> Vec<Uuid> {
+        let mut accounts = Vec::new();
+        for e in self.entries.values_mut() {
+            if !e.failures.is_empty() && !e.notified {
+                e.notified = true;
+                accounts.push(e.account);
+            }
+        }
+        accounts
+    }
+
+    /// The user says an entry is handled: it leaves the book (a failure, or protection still
+    /// "at work" that the user knows to be over). Refused while its entry is being sent or its
+    /// orders are going out. It touches nothing else: an unknown result of the entry stays
+    /// blocked by its own record, which only the manual release or discard (typed phrase)
+    /// can clear.
+    pub fn dismiss(&mut self, account: Uuid, key: &str) -> Result<String, DismissError> {
+        let e = self
+            .entries
+            .get(key)
+            .filter(|e| e.account == account)
+            .ok_or(DismissError::NotFound)?;
+        if e.sent == Sent::Sending || e.busy {
+            return Err(DismissError::Busy);
+        }
+        let symbol = e.symbol.clone();
+        self.entry_gone(key);
+        Ok(symbol)
+    }
+
+    /// A whole-position stop was accepted for the account's position of `dir` on `symbol`
+    /// (a retry, or one the user placed by hand): the failures that left it bare are cleared, and
+    /// the entry's own stop, if it was still to be sent, is given up, so the entry's grant is
+    /// never used for a stop again. The entry stays in the book while anything of it stands.
+    pub fn protection_added(&mut self, account: Uuid, symbol: &str, dir: Dir) {
+        for e in self.entries.values_mut().filter(|e| {
+            e.account == account && e.dir == dir && e.symbol.eq_ignore_ascii_case(symbol)
+        }) {
+            e.failures.retain(|f| !f.reason.may_leave_bare());
+            // A second whole-position stop would only be refused; the entry's own stop is not
+            // sent. Its take-profit stage is left alone.
+            if e.stop == StageState::Todo {
+                e.stop = StageState::Failed;
+            }
+        }
+        self.housekeeping();
     }
 
     /// The first snapshot after a reconnect (M4-4): an entry that was open when the connection
@@ -442,36 +834,26 @@ impl AutoBook {
             let short = e
                 .expected
                 .is_some_and(|x| e.filled.checked_cmp(&x) == Ok(std::cmp::Ordering::Less));
-            let text = if short || (view.held)(&e.symbol).contains(&e.dir) {
-                LOST_CONNECTION
+            let reason = if short || (view.held)(&e.symbol).contains(&e.dir) {
+                FailReason::LostConnection
             } else {
                 // Not resting does not prove it is gone (a snapshot taken before the send
                 // answered looks the same), so the entry is not dropped: it stops blocking the
                 // symbol and the user is told. Protective orders already placed stay in the book.
-                NOT_FOUND_OPEN
+                FailReason::NotFoundOpen
             };
             Self::give_up_rest(e);
+            Self::add_failure(e, reason, None);
             if !e.reported {
                 e.reported = true;
                 reported.push(id.clone());
             }
-            notes.push(format!("{}: {text}", e.symbol));
+            notes.push(format!("{}: {}", e.symbol, reason.text()));
         }
         self.finished.extend(reported);
         for n in notes {
-            self.note(account, n);
+            self.push_note(account, n, true);
         }
-    }
-
-    /// Stop sending for the entry: what is still to do is marked failed, and the entry is set
-    /// aside so it does not block the symbol. The caller writes the note.
-    fn give_up(e: &mut AutoEntry) {
-        for stage in [&mut e.stop, &mut e.rest] {
-            if *stage == StageState::Todo {
-                *stage = StageState::Failed;
-            }
-        }
-        e.attention = true;
     }
 
     /// Like `give_up`, but for a reconnect, where a fill may only be late: the take-profit and
@@ -522,6 +904,9 @@ impl AutoBook {
             kept_noted: false,
             closed_fill_noted: false,
             attention: false,
+            failures: Vec::new(),
+            expected_at: None,
+            notified: false,
         };
         self.sending.insert((account, symbol), entry_id.clone());
         self.entries.insert(entry_id, entry);
@@ -627,12 +1012,15 @@ impl AutoBook {
         }
         e.filled = filled;
         e.cost = value;
+        // A fill is progress: the wait for the rest starts again.
+        e.expected_at = None;
         let again = e.closed && !e.closed_fill_noted;
         e.closed_fill_noted |= e.closed;
         let symbol = e.symbol.clone();
         Self::check_complete(e);
         if again {
-            self.note(account, format!("{symbol}: {FILLED_AFTER_CLOSE}"));
+            Self::add_failure(e, FailReason::FilledAfterClose, None);
+            self.push_note(account, format!("{symbol}: {FILLED_AFTER_CLOSE}"), true);
         }
         FillVerdict::Counted
     }
@@ -671,6 +1059,7 @@ impl AutoBook {
             .filled_qty
             .filter(|q| q.checked_cmp(&e.filled) == Ok(std::cmp::Ordering::Greater));
         let mut note = None;
+        let mut report = false;
         if update.status == OrderStatus::Filled {
             // The fills may still be on their way: wait until they add up.
             e.expected = update.filled_qty.or(update.qty).or(Some(e.filled));
@@ -681,8 +1070,17 @@ impl AutoBook {
                 // Fills were not seen (a gap in the stream): the position is bigger than the
                 // book says. Never removed quietly; what is known is still protected.
                 note = Some(format!("{}: {FILLS_NOT_SEEN}", e.symbol));
+                Self::add_failure(e, FailReason::FillsNotSeen, None);
                 if !e.filled.is_positive() {
-                    Self::give_up(e);
+                    // R3: with no fill seen the take-profit stage is given up but the stop is
+                    // kept for a fill of this very entry that may still arrive (a closePosition
+                    // stop covers the part that was missed). The entry is reported, and stays in
+                    // the book (it has a failure) until the user has handled it.
+                    Self::give_up_rest(e);
+                    if !e.reported {
+                        e.reported = true;
+                        report = true;
+                    }
                 }
             }
         }
@@ -690,8 +1088,11 @@ impl AutoBook {
         let account = e.account;
         // An entry that finished with nothing filled has nothing to protect.
         let empty = e.complete && !e.filled.is_positive() && unseen.is_none();
+        if report {
+            self.finished.push(id.to_string());
+        }
         if let Some(n) = note {
-            self.note(account, n);
+            self.push_note(account, n, true);
         }
         if empty {
             let key = id.to_string();
@@ -745,6 +1146,8 @@ impl AutoBook {
                     if role == Role::StopLoss {
                         e.closed = false;
                     }
+                    let which = e.placed[idx].which;
+                    Self::add_failure(e, FailReason::NotTakingEffect, Some(which));
                     note = Some(format!(
                         "{}: the {} triggered but did not take effect. The position may still \
                          be open and not protected. Check it.",
@@ -756,6 +1159,8 @@ impl AutoBook {
                 Live::Triggered if role == Role::StopLoss => {
                     e.placed[idx].state = Live::Failed;
                     e.closed = false;
+                    let which = e.placed[idx].which;
+                    Self::add_failure(e, FailReason::NotTakingEffect, Some(which));
                     note = Some(format!(
                         "{}: the {} triggered and was then cancelled. The position may still \
                          be open and not protected. Check it.",
@@ -764,13 +1169,24 @@ impl AutoBook {
                     ));
                 }
                 Live::Triggered | Live::Finished | Live::Failed => {}
-                // Also the way a cancel that failed (or had no answer) turns out to have worked.
-                _ => e.placed[idx].state = Live::Cancelled,
+                // Also the way a cancel that failed (or had no answer) turns out to have worked:
+                // the failure of that cancel goes with it.
+                _ => {
+                    let which = e.placed[idx].which;
+                    e.placed[idx].state = Live::Cancelled;
+                    e.failures.retain(|f| {
+                        !(f.order == Some(which)
+                            && matches!(
+                                f.reason,
+                                FailReason::CancelFailed | FailReason::CancelUnknown
+                            ))
+                    });
+                }
             },
             OrderStatus::New | OrderStatus::PartiallyFilled => {}
         }
         if let Some(n) = note {
-            self.note(account, n);
+            self.push_note(account, n, true);
         }
     }
 
@@ -845,12 +1261,50 @@ impl AutoBook {
         let keys: Vec<String> = self.entries.keys().cloned().collect();
         let mut jobs = Vec::new();
         for key in keys {
+            self.check_fills_wait(&key, env.mono_ms);
             if let Some(job) = self.poll_entry(&key, now_ms, env) {
                 jobs.push(job);
             }
         }
         self.housekeeping();
         jobs
+    }
+
+    /// The exchange said the entry `Filled` but its fills have not added up: after
+    /// [`FILLS_WAIT_MS`] they are written down as not seen (a lost fill would otherwise leave
+    /// the entry waiting for ever, with no stop and no word). What was seen is protected as
+    /// usual; with nothing seen the take-profit stage is given up and the stop waits for a fill
+    /// of this entry (R3, as in the connection-lost case).
+    fn check_fills_wait(&mut self, key: &str, mono_ms: i64) {
+        let Some(e) = self.entries.get_mut(key) else {
+            return;
+        };
+        if e.complete || e.attention || e.sent != Sent::Stands || e.expected.is_none() {
+            return;
+        }
+        let since = *e.expected_at.get_or_insert(mono_ms);
+        if mono_ms.saturating_sub(since) < FILLS_WAIT_MS {
+            return;
+        }
+        let account = e.account;
+        let text = format!("{}: {FILLS_NOT_SEEN}", e.symbol);
+        Self::add_failure(e, FailReason::FillsNotSeen, None);
+        // Nothing more is waited for: the entry is complete with the fills seen.
+        e.expected = Some(e.filled);
+        e.expected_at = None;
+        let mut report = false;
+        if !e.filled.is_positive() {
+            Self::give_up_rest(e);
+            if !e.reported {
+                e.reported = true;
+                report = true;
+            }
+        }
+        Self::check_complete(e);
+        if report {
+            self.finished.push(key.to_string());
+        }
+        self.push_note(account, text, true);
     }
 
     fn poll_entry(&mut self, key: &str, now_ms: i64, env: &PollEnv<'_>) -> Option<AutoJob> {
@@ -910,7 +1364,9 @@ impl AutoBook {
         };
         if !(env.switch)(account) {
             set(e, StageState::Failed);
-            self.note(account, SWITCHED_OFF);
+            Self::add_failure(e, FailReason::SwitchedOff, None);
+            let text = format!("{}: {SWITCHED_OFF}", e.symbol);
+            self.push_note(account, text, true);
             return None;
         }
         // B1: only a fill that adds to a position of the entry's direction is protected. A
@@ -923,7 +1379,9 @@ impl AutoBook {
             let held = (env.held)(account, &e.symbol);
             if !held.stale && !held.dirs.is_empty() && !held.dirs.contains(&e.dir) {
                 set(e, StageState::Failed);
-                self.note(account, REDUCED_INSTEAD);
+                Self::add_failure(e, FailReason::ReducedInstead, None);
+                let text = format!("{}: {REDUCED_INSTEAD}", e.symbol);
+                self.push_note(account, text, true);
                 return None;
             }
         }
@@ -939,11 +1397,13 @@ impl AutoBook {
                 }),
                 Err(refusal) => {
                     set(e, StageState::Failed);
+                    Self::add_failure(e, FailReason::GrantRefused, None);
                     let text = format!(
-                        "A protective order was not placed: {refusal}. The position may not be \
-                         protected."
+                        "{}: A protective order was not placed: {refusal}. The position may not \
+                         be protected.",
+                        e.symbol
                     );
-                    self.note(account, text);
+                    self.push_note(account, text, true);
                     return None;
                 }
             }
@@ -988,21 +1448,23 @@ impl AutoBook {
                                 if let Some(p) = e.placed.iter_mut().find(|p| p.which == *r) {
                                     p.unsure = true;
                                 }
+                                Self::add_failure(e, FailReason::Unknown, Some(*r));
                                 notes.push(format!(
                                     "{symbol}: the exchange did not confirm the {}; check the \
                                      open orders. It was not sent again.",
                                     role_word(role)
                                 ));
                             }
-                            StepResult::Failed(_) | StepResult::Gone => {
+                            StepResult::Failed(..) | StepResult::Gone => {
                                 place_failed = true;
                                 if let Some(p) = e.placed.iter_mut().find(|p| p.which == *r) {
                                     p.state = Live::Failed;
                                 }
-                                let why = match result {
-                                    StepResult::Failed(w) => w.as_str(),
-                                    _ => "the exchange has no such order",
+                                let (reason, why) = match result {
+                                    StepResult::Failed(reason, w) => (*reason, w.as_str()),
+                                    _ => (FailReason::Rejected, "the exchange has no such order"),
                                 };
+                                Self::add_failure(e, reason, Some(*r));
                                 notes.push(format!(
                                     "{symbol}: the {} was not placed ({why}). The position may \
                                      not be protected. Nothing was sent again.",
@@ -1016,7 +1478,7 @@ impl AutoBook {
                         let state = match result {
                             StepResult::Ok | StepResult::Gone => Live::Cancelled,
                             // Not cancelled as far as we know: it may still stand. Not retried.
-                            StepResult::Failed(_) | StepResult::Unknown => Live::CancelFailed,
+                            StepResult::Failed(..) | StepResult::Unknown => Live::CancelFailed,
                         };
                         let failed = state == Live::CancelFailed;
                         let cancelling = e
@@ -1034,17 +1496,24 @@ impl AutoBook {
                         }
                         match result {
                             StepResult::Ok | StepResult::Gone => {}
-                            StepResult::Failed(why) => notes.push(format!(
-                                "{symbol}: the {} could not be cancelled ({why}); it may already \
-                                 be gone \u{2014} check the open orders and cancel it by hand.",
-                                role_word(role)
-                            )),
-                            StepResult::Unknown => notes.push(format!(
-                                "{symbol}: the exchange did not confirm the cancel of the {}; \
-                                 check the open orders and cancel it by hand. It was not tried \
-                                 again.",
-                                role_word(role)
-                            )),
+                            StepResult::Failed(_, why) => {
+                                Self::add_failure(e, FailReason::CancelFailed, Some(*r));
+                                notes.push(format!(
+                                    "{symbol}: the {} could not be cancelled ({why}); it may \
+                                     already be gone \u{2014} check the open orders and cancel it \
+                                     by hand.",
+                                    role_word(role)
+                                ));
+                            }
+                            StepResult::Unknown => {
+                                Self::add_failure(e, FailReason::CancelUnknown, Some(*r));
+                                notes.push(format!(
+                                    "{symbol}: the exchange did not confirm the cancel of the \
+                                     {}; check the open orders and cancel it by hand. It was not \
+                                     tried again.",
+                                    role_word(role)
+                                ));
+                            }
                         }
                     }
                 }
@@ -1073,8 +1542,9 @@ impl AutoBook {
                 }
             }
         }
+        // Everything written here is a failure of the protection or of a cancel.
         for n in notes {
-            self.note(account, n);
+            self.push_note(account, n, true);
         }
         self.housekeeping();
     }
@@ -1094,7 +1564,15 @@ impl AutoBook {
                 .placed
                 .iter()
                 .any(|p| p.state.holds_the_position() || p.state == Live::CancelFailed);
-            if ended && e.complete && !e.busy && !live && e.sent == Sent::Stands {
+            // An entry with a failure stays until the user has handled it: the failure is the
+            // record the panel shows (the notes list holds twelve lines and drops the oldest).
+            if ended
+                && e.complete
+                && !e.busy
+                && !live
+                && e.sent == Sent::Stands
+                && e.failures.is_empty()
+            {
                 remove.push(id.clone());
             }
         }
@@ -1143,7 +1621,34 @@ fn rejected_step(cancel: bool, kind: &RejectKind, code: &str, not_found: &[&str]
     if cancel && matches!(kind, RejectKind::Exchange) && not_found.contains(&code) {
         return StepResult::Gone;
     }
-    StepResult::Failed(format!("the exchange refused it, code {code}"))
+    match kind {
+        // 429 and 418 are told apart from a refusal of the order itself: the request was not
+        // executed, and it is not sent again.
+        RejectKind::RateLimited(status) => StepResult::Failed(
+            FailReason::RateLimited,
+            format!("the exchange limited requests, HTTP {status}"),
+        ),
+        RejectKind::Exchange | RejectKind::ClockSkew | RejectKind::Blocked => StepResult::Failed(
+            FailReason::Rejected,
+            format!("the exchange refused it, code {code}"),
+        ),
+    }
+}
+
+/// Why a request of a stage could not be built. A quantity that does not fit the symbol's rules
+/// is told apart from prices that cannot be worked out.
+fn build_failure(e: &exchange::trade::TradeError) -> (FailReason, String) {
+    use exchange::trade::TradeError as T;
+    let reason = match e {
+        T::NonPositive
+        | T::QtyBelowMin
+        | T::QtyAboveMax
+        | T::NotionalBelowMin
+        | T::NotionalAboveMax
+        | T::ExceedsAvailable => FailReason::QtyCheck,
+        _ => FailReason::PlanError,
+    };
+    (reason, e.to_string())
 }
 
 /// One request of a job: authorise it against the grant, write the risk-log line, send it, and
@@ -1160,16 +1665,22 @@ struct Sender<'a> {
 }
 
 impl Sender<'_> {
-    async fn step(&self, built: Result<AutoIntent, String>, cancel: bool) -> StepResult {
+    async fn step(
+        &self,
+        built: Result<AutoIntent, (FailReason, String)>,
+        cancel: bool,
+    ) -> StepResult {
         let auto = match built {
             Ok(a) => a,
-            Err(why) => return StepResult::Failed(why),
+            Err((reason, why)) => return StepResult::Failed(reason, why),
         };
         let path = auto.path();
         let granted = self.grant.lock().authorise(auto, now_ms());
         let granted = match granted {
             Ok(g) => g,
-            Err(refusal) => return StepResult::Failed(refusal.to_string()),
+            Err(refusal) => {
+                return StepResult::Failed(FailReason::GrantRefused, refusal.to_string());
+            }
         };
         let entry = RiskLogEntry::auto_path_send(self.meta, now_ms(), self.symbol, path);
         if let Err(e) = self.log.append(&entry) {
@@ -1180,23 +1691,25 @@ impl Sender<'_> {
             .submit_auto(self.gate, self.risk, self.journal, granted)
             .await;
         match sent {
-            Err(e) => StepResult::Failed(describe_submit_error(&e)),
+            Err(e) => StepResult::Failed(FailReason::NotSent, describe_submit_error(&e)),
             Ok(submitted) => match submitted.outcome {
                 Outcome::Accepted { .. } => StepResult::Ok,
                 Outcome::Rejected { kind, code, .. } => {
                     rejected_step(cancel, &kind, &code, CANCEL_NOT_FOUND)
                 }
-                Outcome::Partial { .. } => {
-                    StepResult::Failed("the exchange accepted only part of it".to_string())
-                }
-                Outcome::NotSent(e) => StepResult::Failed(e.to_string()),
+                Outcome::Partial { .. } => StepResult::Failed(
+                    FailReason::Rejected,
+                    "the exchange accepted only part of it".to_string(),
+                ),
+                Outcome::NotSent(e) => StepResult::Failed(FailReason::NotSent, e.to_string()),
                 Outcome::Unknown { .. } => match submitted.pending {
                     // Never a resend: the lookup only reads.
                     Some(p) => match self.client.resolve_unknown(p, self.journal).await {
                         Resolution::Found => StepResult::Ok,
-                        Resolution::NotPlacedPresumed => {
-                            StepResult::Failed("the exchange has no such order".to_string())
-                        }
+                        Resolution::NotPlacedPresumed => StepResult::Failed(
+                            FailReason::Unknown,
+                            "the exchange has no such order".to_string(),
+                        ),
                         Resolution::Unresolved(_) => StepResult::Unknown,
                     },
                     None => StepResult::Unknown,
@@ -1238,7 +1751,11 @@ pub async fn run(input: RunInput) -> AutoSummary {
     let Some(market) =
         crate::order_flow::trade_market(crate::order_flow::market_of(meta.venue, meta.product))
     else {
-        return summary(all_failed(&work, "this account's market cannot be traded"));
+        return summary(all_failed(
+            &work,
+            FailReason::SetupFailed,
+            "this account's market cannot be traded",
+        ));
     };
     let setup = tokio::time::timeout(SETUP_TIMEOUT, async {
         let loaded = {
@@ -1269,8 +1786,14 @@ pub async fn run(input: RunInput) -> AutoSummary {
     .await;
     let (client, table, identity, proxy_ok) = match setup {
         Ok(Ok(ready)) => ready,
-        Ok(Err(why)) => return summary(all_failed(&work, why)),
-        Err(_) => return summary(all_failed(&work, "reading the account took too long")),
+        Ok(Err(why)) => return summary(all_failed(&work, FailReason::SetupFailed, why)),
+        Err(_) => {
+            return summary(all_failed(
+                &work,
+                FailReason::SetupFailed,
+                "reading the account took too long",
+            ));
+        }
     };
     let keychain: Result<_, StoreError> = Ok(identity);
     let gate = SessionGate {
@@ -1282,7 +1805,11 @@ pub async fn run(input: RunInput) -> AutoSummary {
     let journal = UnknownStore::in_data_dir();
     let log = RiskLog::in_data_dir();
     let Ok(fresh) = client.fresh(&table, &symbol) else {
-        return summary(all_failed(&work, "the trading rules are out of date"));
+        return summary(all_failed(
+            &work,
+            FailReason::SetupFailed,
+            "the trading rules are out of date",
+        ));
     };
     let sender = Sender {
         client: &client,
@@ -1321,15 +1848,15 @@ pub async fn run(input: RunInput) -> AutoSummary {
             let built = build_stage(&input, ids);
             for (which, (_, request)) in issued.into_iter().zip(built) {
                 let auto = request
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| build_failure(&e))
                     .and_then(|r| {
                         OrderIntent::binance(account_key(meta.id), r, &fresh)
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| build_failure(&e))
                     })
                     .and_then(|i| {
                         AutoIntent::new(AutoPath::AttachProtective, i)
                             .map(|a| a.with_basis(basis.clone()))
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| build_failure(&e))
                     });
                 let result = sender.step(auto, false).await;
                 steps.push((Which::Placed(which), result));
@@ -1340,7 +1867,7 @@ pub async fn run(input: RunInput) -> AutoSummary {
                 let built = grant
                     .lock()
                     .cancel_intent(r, &fresh)
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| (FailReason::GrantRefused, e.to_string()));
                 let result = sender.step(built, true).await;
                 steps.push((Which::Cancelled(r), result));
             }
@@ -1445,6 +1972,7 @@ pub(crate) mod tests {
             &PollEnv {
                 switch: &switch,
                 held: &held,
+                mono_ms: now,
             },
         )
     }
@@ -1836,7 +2364,10 @@ pub(crate) mod tests {
         fill(&mut book, &key, "0.001");
         let jobs = poll(&mut book);
         let mut summary = ok_all(&jobs[0]);
-        summary.steps[0].1 = StepResult::Failed("the exchange refused it, code -2021".into());
+        summary.steps[0].1 = StepResult::Failed(
+            FailReason::Rejected,
+            "the exchange refused it, code -2021".into(),
+        );
         book.done(summary);
         let notes = book.notes_for(account());
         assert_eq!(notes.len(), 1);
@@ -1946,7 +2477,7 @@ pub(crate) mod tests {
         // A refused placement is never "gone", even with a listed code.
         assert!(matches!(
             rejected_step(false, &RejectKind::Exchange, "-9999", list),
-            StepResult::Failed(_)
+            StepResult::Failed(..)
         ));
         assert!(CANCEL_NOT_FOUND.is_empty(), "not confirmed on testnet yet");
     }
@@ -1958,7 +2489,10 @@ pub(crate) mod tests {
         let jobs = poll(&mut book);
         assert_eq!(cancel_count(&jobs[0]), 2);
         let mut summary = ok_all(&jobs[0]);
-        summary.steps[0].1 = StepResult::Failed("the exchange refused it, code 429".into());
+        summary.steps[0].1 = StepResult::Failed(
+            FailReason::RateLimited,
+            "the exchange refused it, code 429".into(),
+        );
         summary.steps[1].1 = StepResult::Unknown;
         book.done(summary);
         let notes = book.notes_for(account());
@@ -2009,7 +2543,10 @@ pub(crate) mod tests {
         book.on_order(account(), &algo(&ids[1], OrderStatus::Finished));
         let jobs = polled(&mut book, NOW, true, flat(false));
         let mut summary = ok_all(&jobs[0]);
-        summary.steps[0].1 = StepResult::Failed("the exchange refused it, code 429".into());
+        summary.steps[0].1 = StepResult::Failed(
+            FailReason::RateLimited,
+            "the exchange refused it, code 429".into(),
+        );
         book.done(summary);
         assert_eq!(state_of(&book, &key, &ids[0]), Live::CancelFailed);
         assert!(!book.is_active(account(), "BTCUSDT"));
@@ -2243,5 +2780,253 @@ pub(crate) mod tests {
         assert_eq!(filled_of(&book, &key), Some(Decimal::ZERO));
         assert_eq!(filled_of(&book, &other), Some(d("0.001")));
         assert_eq!(book.entries[&key].grant.lock().filled(), Decimal::ZERO);
+    }
+
+    // ---- d4: protection failures (condition 65) ----
+
+    #[test]
+    fn every_fail_reason_has_a_text() {
+        let mut seen = std::collections::HashSet::new();
+        for (i, reason) in FailReason::ALL.iter().enumerate() {
+            assert_eq!(reason.index(), i, "{reason:?} is out of place in ALL");
+            let text = reason.text();
+            assert!(text.len() > 20, "{reason:?}");
+            assert!(text.is_ascii(), "{reason:?}");
+            assert!(!text.contains('{'), "{reason:?}");
+            assert!(seen.insert(text), "{reason:?} repeats a text");
+        }
+    }
+
+    #[test]
+    fn the_reference_price_is_used_only_when_it_is_fresh_and_of_the_right_kind() {
+        use exchange::trade::TriggerBasis::{Last, Mark};
+        let p = d("60000");
+        let fresh = Duration::from_secs(REF_PRICE_MAX_AGE_SECS);
+        let stale = Duration::from_secs(REF_PRICE_MAX_AGE_SECS + 1);
+        assert_eq!(reference_price(Last, Some((p, fresh))), Ok(Some(p)));
+        assert_eq!(
+            reference_price(Last, Some((p, stale))),
+            Err(FailReason::StaleReference)
+        );
+        // No quote: the fill price stands in. A mark-price spec has no mark source.
+        assert_eq!(reference_price(Last, None), Ok(None));
+        assert_eq!(reference_price(Mark, Some((p, fresh))), Ok(None));
+        assert_eq!(reference_price(Mark, Some((p, stale))), Ok(None));
+    }
+
+    /// A stop that was refused: the entry holds one failure and offers a retry.
+    fn with_failed_stop() -> (AutoBook, String) {
+        let (mut book, key) = booked(spec(1, false));
+        fill(&mut book, &key, "0.001");
+        let jobs = poll(&mut book);
+        let mut summary = ok_all(&jobs[0]);
+        summary.steps[0].1 = StepResult::Failed(FailReason::Rejected, "refused".into());
+        book.done(summary);
+        (book, key)
+    }
+
+    #[test]
+    fn a_failed_stop_stays_in_the_book_with_its_reason_and_offers_a_retry() {
+        let (mut book, key) = with_failed_stop();
+        // Housekeeping does not remove it, even after every stage ended.
+        poll(&mut book);
+        let views = book.failures_for(account());
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].key, key);
+        assert_eq!(views[0].symbol, "BTCUSDT");
+        assert_eq!(views[0].reasons, vec![FailReason::Rejected]);
+        assert!(views[0].may_retry);
+        // The debug text never carries the client id.
+        assert!(!format!("{:?}", views[0]).contains(&key));
+        // The other account sees nothing.
+        assert!(book.failures_for(Uuid::from_u128(9)).is_empty());
+    }
+
+    #[test]
+    fn a_stop_that_stands_is_not_offered_again() {
+        let (mut book, key) = booked(spec(1, false));
+        fill(&mut book, &key, "0.001");
+        let jobs = poll(&mut book);
+        book.done(ok_all(&jobs[0]));
+        // Something else failed (the switch was off for the take-profits), the stop stands.
+        let e = book.entries.get_mut(&key).unwrap();
+        AutoBook::add_failure(e, FailReason::NotSent, None);
+        let views = book.failures_for(account());
+        assert_eq!(views.len(), 1);
+        assert!(!views[0].may_retry);
+    }
+
+    #[test]
+    fn a_stop_added_by_a_retry_clears_the_bare_failures_and_the_old_grant_places_no_second_one() {
+        let (mut book, key) = booked(spec(1, false));
+        // The connection was lost before any fill was seen: the entry's stop is still to do.
+        reconnect(&mut book, false, vec![Dir::Long]);
+        let views = book.failures_for(account());
+        assert_eq!(views.len(), 1);
+        assert!(views[0].may_retry, "{:?}", views[0].reasons);
+        // The user confirms a new stop (a new client id, no grant of this entry).
+        book.protection_added(account(), "BTCUSDT", Dir::Long);
+        assert!(
+            book.failures_for(account())
+                .iter()
+                .all(|v| v.reasons.iter().all(|r| !r.may_leave_bare()))
+        );
+        // A late fill of the old entry would have sent its own stop with the old grant.
+        fill(&mut book, &key, "0.001");
+        assert!(
+            poll(&mut book).is_empty(),
+            "the old grant is not used again"
+        );
+        // The other direction or another symbol is untouched.
+        let (mut other, _) = booked(spec(1, false));
+        reconnect(&mut other, false, vec![Dir::Long]);
+        other.protection_added(account(), "ETHUSDT", Dir::Long);
+        other.protection_added(account(), "BTCUSDT", Dir::Short);
+        assert!(!other.failures_for(account()).is_empty());
+    }
+
+    #[test]
+    fn i_have_handled_it_removes_the_entry_and_unblocks_the_symbol() {
+        let (mut book, key) = booked(spec(1, false));
+        fill(&mut book, &key, "0.001");
+        let jobs = poll(&mut book);
+        // The stop is going out: the entry cannot be removed under it.
+        assert_eq!(
+            book.dismiss(account(), &key),
+            Err(DismissError::Busy),
+            "while a job runs"
+        );
+        book.done(ok_all(&jobs[0]));
+        assert!(book.is_active(account(), "BTCUSDT"));
+        // The wrong account or key finds nothing.
+        assert_eq!(
+            book.dismiss(Uuid::from_u128(9), &key),
+            Err(DismissError::NotFound)
+        );
+        assert_eq!(book.dismiss(account(), "nope"), Err(DismissError::NotFound));
+        assert_eq!(book.dismiss(account(), &key), Ok("BTCUSDT".to_string()));
+        assert!(!book.is_active(account(), "BTCUSDT"));
+        assert!(book.failures_for(account()).is_empty());
+        assert_eq!(book.dismiss(account(), &key), Err(DismissError::NotFound));
+    }
+
+    #[test]
+    fn a_failed_entry_can_be_handled_and_is_gone() {
+        let (mut book, key) = with_failed_stop();
+        assert_eq!(book.dismiss(account(), &key), Ok("BTCUSDT".to_string()));
+        assert!(book.failures_for(account()).is_empty());
+        assert!(poll(&mut book).is_empty());
+    }
+
+    #[test]
+    fn a_rate_limit_is_its_own_reason() {
+        let list: &[&str] = &[];
+        for kind in [RejectKind::RateLimited(429)] {
+            match rejected_step(false, &kind, "429", list) {
+                StepResult::Failed(reason, _) => assert_eq!(reason, FailReason::RateLimited),
+                other => panic!("{other:?}"),
+            }
+        }
+        match rejected_step(false, &RejectKind::Exchange, "-2021", list) {
+            StepResult::Failed(reason, _) => assert_eq!(reason, FailReason::Rejected),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_notification_comes_once_per_entry() {
+        let (mut book, key) = with_failed_stop();
+        assert_eq!(book.take_to_notify(), vec![account()]);
+        assert!(book.take_to_notify().is_empty());
+        // A second failure on the same entry is not told again.
+        let e = book.entries.get_mut(&key).unwrap();
+        AutoBook::add_failure(e, FailReason::NotSent, None);
+        assert!(book.take_to_notify().is_empty());
+        // An entry without a failure is never told.
+        let (mut quiet, _) = booked(spec(1, false));
+        assert!(quiet.take_to_notify().is_empty());
+    }
+
+    #[test]
+    fn fills_that_never_add_up_write_one_note_after_the_wait() {
+        let (mut book, key) = booked(spec(1, false));
+        fill(&mut book, &key, "0.001");
+        let stop = poll(&mut book);
+        book.done(ok_all(&stop[0]));
+        // The exchange says 0.003 filled; only 0.001 was seen.
+        book.on_order(
+            account(),
+            &order(&key, OrderCategory::Plain, OrderStatus::Filled, "0.003"),
+        );
+        let early = |book: &mut AutoBook, at: i64| polled(book, at, true, Holdings::default());
+        assert!(early(&mut book, NOW).is_empty());
+        assert!(early(&mut book, NOW + FILLS_WAIT_MS - 1).is_empty());
+        assert!(book.notes_for(account()).is_empty());
+        // After the wait: a note, once, and the 0.001 seen is protected as usual.
+        let rest = early(&mut book, NOW + FILLS_WAIT_MS);
+        let notes = book.notes_for(account());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("fills of the entry were not seen"));
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].filled, d("0.001"));
+        early(&mut book, NOW + 3 * FILLS_WAIT_MS);
+        assert_eq!(book.notes_for(account()).len(), 1);
+        assert_eq!(
+            book.failures_for(account())[0].reasons,
+            vec![FailReason::FillsNotSeen]
+        );
+    }
+
+    #[test]
+    fn the_fills_wait_follows_the_monotonic_clock_not_the_wall_clock() {
+        let (mut book, key) = booked(spec(1, false));
+        book.on_order(
+            account(),
+            &order(&key, OrderCategory::Plain, OrderStatus::Filled, "0.003"),
+        );
+        let switch = |_: Uuid| true;
+        let held = |_: Uuid, _: &str| Holdings::default();
+        let at = |book: &mut AutoBook, wall: i64, mono: i64| {
+            book.poll(
+                wall,
+                &PollEnv {
+                    switch: &switch,
+                    held: &held,
+                    mono_ms: mono,
+                },
+            )
+        };
+        at(&mut book, NOW, 1_000);
+        // The wall clock jumps a day ahead: the wait has not passed.
+        at(&mut book, NOW + 86_400_000, 1_000 + FILLS_WAIT_MS - 1);
+        assert!(book.notes_for(account()).is_empty());
+        // The wall clock goes back: the wait still ends on the monotonic time.
+        at(&mut book, NOW - 86_400_000, 1_000 + FILLS_WAIT_MS);
+        assert_eq!(book.notes_for(account()).len(), 1);
+    }
+
+    #[test]
+    fn with_no_fill_seen_the_wait_gives_up_the_rest_but_keeps_the_stop_for_a_late_own_fill() {
+        let (mut book, key) = booked(spec(1, false));
+        book.on_order(
+            account(),
+            &order(&key, OrderCategory::Plain, OrderStatus::Filled, "0.003"),
+        );
+        let at = |book: &mut AutoBook, t: i64| polled(book, t, true, Holdings::default());
+        assert!(at(&mut book, NOW).is_empty());
+        assert!(at(&mut book, NOW + FILLS_WAIT_MS).is_empty());
+        assert_eq!(book.notes_for(account()).len(), 1);
+        // The entry is reported once and stays in the book for the user.
+        assert!(book.take_finished().contains(&key));
+        assert!(book.entries.contains_key(&key));
+        assert!(book.take_finished().is_empty());
+        let views = book.failures_for(account());
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].reasons, vec![FailReason::FillsNotSeen]);
+        // A fill of this very entry that arrives late still gets its closePosition stop.
+        fill(&mut book, &key, "0.003");
+        let jobs = at(&mut book, NOW + FILLS_WAIT_MS + 1);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(place_ids(&jobs[0]).len(), 1);
     }
 }

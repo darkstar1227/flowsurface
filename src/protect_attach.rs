@@ -492,6 +492,84 @@ pub fn hold_close(resting_limit: bool, warned_at: Option<Instant>, now: Instant)
 
 pub const CLOSE_WARNING: &str = "A limit entry with protection is still resting. If it fills while this app is closed, nothing will protect the position. Close again to quit anyway.";
 
+// ── A stop offered again (M5 d4) ────────────────────────────────────────
+
+/// The stop the panel offers again for a position whose protection failed (condition 65): a
+/// whole-position stop worked out **now** from the position that is held and the account's
+/// protective defaults. It is an ordinary manual request: it goes through the order ticket's
+/// preview and confirmation (a new client id and a new confirmation token), and is sent by
+/// `order_flow::send`. It is not an automatic order, so no grant of an earlier entry is used or
+/// needed, and the old one can no longer place anything for it (`AutoBook::protection_added`).
+///
+/// The base of the stop is the current price (the position's entry price is not kept), and a
+/// manual stop watches the mark price, as every manual stop does; the preview shows both.
+/// `Err` is the text for the panel; nothing is guessed:
+/// - the position lists must be fresh and show the position;
+/// - the defaults must hold a valid stop-loss;
+/// - the price must be known and not older than [`crate::auto_flow::REF_PRICE_MAX_AGE_SECS`].
+pub fn retry_stop(
+    meta: &AccountMeta,
+    mode: Option<PositionMode>,
+    dir: Dir,
+    held: &Holdings,
+    quote: Option<(Decimal, Duration)>,
+) -> Result<exchange::trade::ManualSpec, String> {
+    if held.stale {
+        return Err(
+            "The position list may be out of date, so the position cannot be \
+             confirmed. Wait for the connection, then try again."
+                .to_string(),
+        );
+    }
+    if !held.dirs.contains(&dir) {
+        return Err(
+            "The account holds no such position on this symbol now; there is nothing to \
+             protect. Use \"I've handled it\" to clear the warning."
+                .to_string(),
+        );
+    }
+    let mode = match (meta.product, mode) {
+        (AccountProduct::Spot, _) => PositionMode::OneWay,
+        (AccountProduct::UsdM, Some(m)) => m,
+        (AccountProduct::UsdM, None) => {
+            return Err(
+                "The position mode of the account is unknown. Test the account again.".to_string(),
+            );
+        }
+    };
+    let spec = meta
+        .protect
+        .spec(meta.venue, mode)
+        .map_err(|e| format!("The protection settings cannot be used: {e}."))?;
+    let Some(offset) = spec.stop else {
+        return Err(
+            "The account's protective defaults have no stop-loss. Set one, or place a \
+             stop by hand."
+                .to_string(),
+        );
+    };
+    // The quote is the last price; a stop that watches the mark price is still checked against
+    // it, as the order ticket does for a manual stop.
+    let base = match crate::auto_flow::reference_price(TriggerBasis::Last, quote) {
+        Ok(Some(price)) => price,
+        Ok(None) => {
+            return Err(
+                "There is no current price for the symbol, so a stop cannot be worked \
+                 out. Try again in a moment, or place a stop by hand."
+                    .to_string(),
+            );
+        }
+        Err(reason) => return Err(reason.text().to_string()),
+    };
+    let trigger = exchange::trade::protect::stop_trigger_at(dir, &base, offset)
+        .map_err(|e| format!("The stop cannot be worked out from the current price ({e:?})."))?;
+    Ok(exchange::trade::ManualSpec::Stop {
+        dir,
+        size: exchange::trade::Size::ClosePosition,
+        trigger,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,5 +1121,87 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn long_held() -> Holdings {
+        Holdings {
+            stale: false,
+            dirs: vec![Dir::Long],
+        }
+    }
+
+    fn fresh_quote() -> Option<(Decimal, Duration)> {
+        Some((d("60000"), Duration::from_secs(5)))
+    }
+
+    #[test]
+    fn a_retry_offers_a_whole_position_stop_worked_out_from_the_current_price() {
+        let m = with_defaults(
+            meta(
+                AccountVenue::Binance,
+                AccountEnv::Testnet,
+                PositionMode::OneWay,
+            ),
+            defaults(Some("1"), true),
+        );
+        let spec = retry_stop(
+            &m,
+            Some(PositionMode::OneWay),
+            Dir::Long,
+            &long_held(),
+            fresh_quote(),
+        )
+        .unwrap();
+        match spec {
+            exchange::trade::ManualSpec::Stop { dir, size, trigger } => {
+                assert_eq!(dir, Dir::Long);
+                assert_eq!(size, exchange::trade::Size::ClosePosition);
+                assert_eq!(trigger, d("59400"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_retry_is_refused_without_a_position_a_fresh_list_a_stop_setting_or_a_fresh_price() {
+        let m = with_defaults(
+            meta(
+                AccountVenue::Binance,
+                AccountEnv::Testnet,
+                PositionMode::OneWay,
+            ),
+            defaults(Some("1"), true),
+        );
+        let one = Some(PositionMode::OneWay);
+        let go =
+            |m: &AccountMeta, mode, held: &Holdings, q| retry_stop(m, mode, Dir::Long, held, q);
+        let stale = Holdings {
+            stale: true,
+            dirs: vec![Dir::Long],
+        };
+        assert!(go(&m, one, &stale, fresh_quote()).is_err());
+        let flat = Holdings::default();
+        assert!(go(&m, one, &flat, fresh_quote()).is_err());
+        let short = Holdings {
+            stale: false,
+            dirs: vec![Dir::Short],
+        };
+        assert!(go(&m, one, &short, fresh_quote()).is_err());
+        assert!(go(&m, None, &long_held(), fresh_quote()).is_err());
+        assert!(go(&m, one, &long_held(), None).is_err());
+        let old = Some((
+            d("60000"),
+            Duration::from_secs(crate::auto_flow::REF_PRICE_MAX_AGE_SECS + 1),
+        ));
+        assert!(go(&m, one, &long_held(), old).is_err());
+        let no_stop = with_defaults(
+            meta(
+                AccountVenue::Binance,
+                AccountEnv::Testnet,
+                PositionMode::OneWay,
+            ),
+            defaults(None, true),
+        );
+        assert!(go(&no_stop, one, &long_held(), fresh_quote()).is_err());
     }
 }
