@@ -330,7 +330,9 @@ mod tests {
 
     /// The tokens are made from what the confirmation stored, in the confirmation files only
     /// (condition 70): an order token from the stored preview, a bulk token from the stored
-    /// account and action. The unbound ways of making a request are not used anywhere. d2 adds
+    /// account and action. The unbound ways of making a request are not used anywhere. d3's
+    /// `auto_flow.rs` is not in this list either (it makes no token); it may only do the read-only
+    /// lookup after an unknown automatic send. d2 adds
     /// no file to the list: the protection block of the confirmation only lists text, and the
     /// token still comes from the stored preview alone.
     #[test]
@@ -379,7 +381,14 @@ mod tests {
                     code.matches(".discard_invalid_logged_async(").count(),
                     code.matches(".begin_manual_release_of_record(").count(),
                 ];
-                if !p.ends_with("account_flow.rs") && !p.ends_with("order_flow.rs") {
+                if p.ends_with("auto_flow.rs") {
+                    // d3: only the read-only lookup after an unknown automatic send.
+                    assert_eq!(
+                        [calls[0], calls[1], calls[3], calls[4], calls[5]],
+                        [0; 5],
+                        "auto_flow.rs makes a bulk call"
+                    );
+                } else if !p.ends_with("account_flow.rs") && !p.ends_with("order_flow.rs") {
                     assert_eq!(
                         calls,
                         [0; 6],

@@ -142,6 +142,23 @@ fn only_bulk_builds_the_risk_close_path() {
 }
 
 #[test]
+fn a_granted_request_is_made_by_the_grant_only_and_the_unbound_send_is_for_bulk_only() {
+    // `GrantedAuto` has a private-to-the-crate field; this scan is a second alarm that only
+    // `grant.rs` fills it, after its checks.
+    let g = hits(&crate_src(), "GrantedAuto { auto");
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert!(g[0].contains("grant.rs"), "{g:?}");
+    // The send without a grant: defined in client.rs, called from bulk.rs only.
+    let u = hits(&crate_src(), "submit_auto_unbound(");
+    assert_eq!(u.len(), 2, "{u:?}");
+    assert!(
+        u.iter()
+            .all(|x| x.contains("client.rs") || x.contains("bulk.rs")),
+        "{u:?}"
+    );
+}
+
+#[test]
 fn the_scan_skips_test_modules_and_keeps_production_code() {
     let src = "fn a() {}\n#[cfg(test)]\nfn only_for_tests() {}\nfn b() {}\n#[cfg(test)]\nmod tests {\n    fn x() { RiskHook for }\n}\n";
     let p = production_part(src);

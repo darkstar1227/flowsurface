@@ -384,14 +384,25 @@ impl AccountPanel {
         }
 
         // An entry with protection listed but no position yet (a resting limit order).
+        let attached = trading.attached_on_exchange(meta.id);
         for symbol in trading.pending_without_position(meta.id) {
-            col = col.push(
-                text(format!(
-                    "  {symbol}: {}",
-                    exchange::trade::Protection::EntryPending.label()
-                ))
-                .size(small),
-            );
+            // OKX: the exchange itself holds the attached orders for the resting entry.
+            let line = if attached.contains(&symbol) {
+                "Protection is attached on the exchange; it acts only once the entry is fully \
+                 filled"
+                    .to_string()
+            } else {
+                exchange::trade::Protection::EntryPending
+                    .label()
+                    .to_string()
+            };
+            col = col.push(text(format!("  {symbol}: {line}")).size(small));
+        }
+
+        // What the app could not do by itself after a fill (never retried): the position may be
+        // unprotected, so each line is a warning.
+        for note in trading.auto_notes(meta.id) {
+            col = col.push(banner(note, BannerKind::Error));
         }
 
         // Cancel all / close all.

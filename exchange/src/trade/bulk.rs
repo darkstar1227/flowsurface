@@ -127,7 +127,7 @@ impl TradeClient {
                     .await
             }
             Route::RiskClose => match AutoIntent::risk_close(intent) {
-                Ok(auto) => self.submit_auto(gate, risk, journal, auto).await,
+                Ok(auto) => self.submit_auto_unbound(gate, risk, journal, auto).await,
                 // A request that would add exposure is never sent on this path.
                 Err(_) => {
                     report.failed += 1;

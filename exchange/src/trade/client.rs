@@ -15,6 +15,7 @@ use super::gate::{
     ApprovedOrder, AutoIntent, ConfirmToken, OrderIntent, Prepared, RiskHook, SendGate, Spent,
     SubmitError, Target, approve,
 };
+use super::grant::GrantedAuto;
 use super::journal::UnknownJournal;
 use super::locks;
 use super::outcome::{Outcome, from_binance, from_binance_bulk, from_okx};
@@ -471,8 +472,23 @@ impl TradeClient {
         self.submit_spent(gate, risk, journal, spent, intent).await
     }
 
-    /// An automatic path (condition 71): pre-authorised, and only ever reducing.
+    /// An automatic path (condition 71): only what an [`AutoGrant`](super::AutoGrant) covers,
+    /// and only ever reducing. The request was authorised by the grant (`AutoGrant::authorise`),
+    /// which is the only way to make a [`GrantedAuto`].
     pub async fn submit_auto<G: SendGate>(
+        &self,
+        gate: &G,
+        risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
+        granted: GrantedAuto,
+    ) -> Result<Submitted, SubmitError<G::Refusal>> {
+        self.submit_auto_unbound(gate, risk, journal, granted.auto)
+            .await
+    }
+
+    /// The risk-control close (`AutoPath::RiskClose`): built by this crate only, so it has no
+    /// entry confirmation to bind to.
+    pub(super) async fn submit_auto_unbound<G: SendGate>(
         &self,
         gate: &G,
         risk: &dyn RiskHook,
@@ -1092,6 +1108,10 @@ pub struct OpenOrder {
     pub reduce_only: bool,
     /// What kind of conditional order this is; `None` for anything else.
     pub role: Option<super::protect::ProtectRole>,
+    /// OKX: a plain entry order that carries attached take-profit / stop-loss orders
+    /// (`attachAlgoOrds`). They exist on the exchange but act only once the entry is fully
+    /// filled; they are not in force, so this never makes a position read as protected.
+    pub attached: Option<super::protect::ProtectRole>,
 }
 
 impl OpenOrder {
@@ -1107,6 +1127,7 @@ impl OpenOrder {
             close_position: false,
             reduce_only: false,
             role: None,
+            attached: None,
         }
     }
 }
@@ -1259,6 +1280,9 @@ fn fill_protection(o: &mut OpenOrder, row: &Value, wire: Wire, is_algo: bool) {
             o.close_position = decimal(row, "closeFraction").is_some_and(|d| {
                 d.checked_cmp(&Decimal::from_int(1)) == Ok(std::cmp::Ordering::Equal)
             });
+            if !is_algo {
+                o.attached = parse_attached(row);
+            }
             if is_algo {
                 let sl = decimal(row, "slTriggerPx");
                 let tp = decimal(row, "tpTriggerPx");
@@ -1280,6 +1304,24 @@ fn fill_protection(o: &mut OpenOrder, row: &Value, wire: Wire, is_algo: bool) {
     // A trailing order has no trigger price of its own (it carries an activation price).
     if o.trigger_price.is_none() && o.role != Some(ProtectRole::Trailing) {
         o.role = None;
+    }
+}
+
+/// The attached orders of an OKX entry row (`attachAlgoOrds`), as the kind they would be once
+/// in force. An empty or missing list, or entries with no readable trigger, are `None`.
+fn parse_attached(row: &Value) -> Option<super::protect::ProtectRole> {
+    use super::protect::ProtectRole;
+    let list = row.get("attachAlgoOrds")?.as_array()?;
+    let (mut sl, mut tp) = (false, false);
+    for a in list {
+        sl |= decimal(a, "slTriggerPx").is_some();
+        tp |= decimal(a, "tpTriggerPx").is_some();
+    }
+    match (sl, tp) {
+        (true, true) => Some(ProtectRole::StopAndTarget),
+        (true, false) => Some(ProtectRole::Stop),
+        (false, true) => Some(ProtectRole::Target),
+        (false, false) => None,
     }
 }
 
@@ -1559,5 +1601,50 @@ mod open_order_tests {
         assert_eq!(o[0].role, None);
         assert_eq!(o[0].side, Some(Side::Buy));
         assert_eq!(o[0].position_side, Some(Dir::Long));
+    }
+}
+
+#[cfg(test)]
+mod attached_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rows(v: Value) -> Vec<OpenOrder> {
+        parse_open(
+            v.as_array().unwrap(),
+            "instId",
+            "ordId",
+            OpenKind::Plain,
+            Wire::Okx,
+        )
+    }
+
+    #[test]
+    fn an_okx_entry_with_attached_orders_says_which_kind_without_being_in_force() {
+        use super::super::protect::ProtectRole;
+        let out = rows(json!([
+            {"instId": "BTC-USDT-SWAP", "ordId": "1", "side": "buy", "sz": "3",
+             "attachAlgoOrds": [{"slTriggerPx": "49000", "tpTriggerPx": "52000"}]},
+            {"instId": "BTC-USDT-SWAP", "ordId": "2", "side": "buy", "sz": "3",
+             "attachAlgoOrds": [{"slTriggerPx": "49000", "tpTriggerPx": ""}]},
+            {"instId": "BTC-USDT-SWAP", "ordId": "3", "side": "buy", "sz": "3",
+             "attachAlgoOrds": []},
+            {"instId": "BTC-USDT-SWAP", "ordId": "4", "side": "buy", "sz": "3"},
+            {"instId": "BTC-USDT-SWAP", "ordId": "5", "side": "buy", "sz": "3",
+             "attachAlgoOrds": [{"slTriggerPx": "", "tpTriggerPx": ""}]}
+        ]));
+        let kinds: Vec<_> = out.iter().map(|o| o.attached).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(ProtectRole::StopAndTarget),
+                Some(ProtectRole::Stop),
+                None,
+                None,
+                None
+            ]
+        );
+        // Attached orders are not in force: the row itself has no protective role.
+        assert!(out.iter().all(|o| o.role.is_none()));
     }
 }

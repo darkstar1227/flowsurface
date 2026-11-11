@@ -11,8 +11,11 @@
 //! this session, and it is kept in [`TradingState`] (not derived from the session) so that a
 //! terminal state such as `AuthFailed` is not lost when the session is voided.
 
+use crate::auto_flow::{
+    AutoBook, AutoInit, AutoJob, AutoSummary, FillVerdict, PollEnv, ReconnectView,
+};
 use crate::order_flow::SendResult;
-use crate::protect_attach::{PendingAttach, PendingAttachTable};
+use crate::protect_attach::{Holdings, PendingAttach, PendingAttachTable};
 use crate::widget::{BannerKind, banner};
 use data::config::exchange_accounts::{AccountMeta, load_credentials};
 use data::config::protect::ProtectDefaults;
@@ -324,6 +327,11 @@ struct AccountRuntime {
     /// since: only then is a flat position list known to be current (an empty book may be
     /// refreshed, never before the first snapshot of a new stream).
     book_trusted: bool,
+    /// Events may have been missed (the connection dropped, the stream was rebuilt, or the
+    /// stream asked for a resync): the automatic entries are checked once the next
+    /// `Connected` state arrives, after the snapshot and the events held back during the read.
+    /// A resync caused only by a conditional order event does not set it.
+    recheck_auto: bool,
 }
 
 fn equity_basis(venue: AccountVenue, product: AccountProduct) -> EquityBasis {
@@ -367,6 +375,7 @@ impl AccountRuntime {
             risk_unavailable: false,
             equity_inflight: false,
             book_trusted: false,
+            recheck_auto: false,
             orders_dirty: false,
         }
     }
@@ -394,13 +403,15 @@ impl AccountRuntime {
     }
 
     /// Remember a fill once. `true` when it is new. A fill without a trade id cannot be told
-    /// apart, so it counts every time.
-    fn note_fill(&mut self, trade_id: Option<&str>) -> bool {
+    /// apart, so it counts every time. The key is the symbol and the trade id: trade ids are
+    /// numbered per symbol, so the same id on two symbols is two fills.
+    fn note_fill(&mut self, symbol: &str, trade_id: Option<&str>) -> bool {
         if let Some(id) = trade_id {
-            if !self.seen_trades.insert(id.to_string()) {
+            let key = format!("{symbol}\u{0}{id}");
+            if !self.seen_trades.insert(key.clone()) {
                 return false;
             }
-            self.seen_order.push_back(id.to_string());
+            self.seen_order.push_back(key);
             while self.seen_order.len() > SEEN_TRADES_CAP {
                 if let Some(old) = self.seen_order.pop_front() {
                     self.seen_trades.remove(&old);
@@ -569,9 +580,11 @@ pub struct TradingState {
     /// Accounts with a cancel-all or close-all running: no other order of the account is
     /// prepared or sent meanwhile.
     bulk_running: BTreeSet<Uuid>,
-    /// The protection each confirmed entry listed (d2). Remembered only; nothing consumes it
-    /// yet.
+    /// The protection each confirmed entry listed (d2): what the panel and the close warning
+    /// say. The orders themselves are sent by `auto`.
     attach: PendingAttachTable,
+    /// What is sent after an entry fills, and the state of it (d3).
+    auto: AutoBook,
 }
 
 /// What blocks the buttons of one (account, symbol) (condition 61).
@@ -599,6 +612,7 @@ impl TradingState {
             inflight: BTreeSet::new(),
             bulk_running: BTreeSet::new(),
             attach: PendingAttachTable::default(),
+            auto: AutoBook::default(),
         }
     }
 
@@ -650,6 +664,22 @@ impl TradingState {
         self.accounts
             .get(&id)
             .map_or(&[], |rt| rt.orders.as_slice())
+    }
+
+    /// Symbols with an open entry order that carries attached take-profit / stop-loss on the
+    /// exchange (OKX): they exist but act only once the entry is fully filled.
+    pub fn attached_on_exchange(&self, id: Uuid) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .open_orders(id)
+            .iter()
+            .filter(|o| {
+                o.attached.is_some() && !matches!(o.kind, exchange::trade::OpenKind::Algo(_))
+            })
+            .map(|o| o.symbol.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
     }
 
     /// The positions of the last snapshot and the events after it (may be stale: see
@@ -793,7 +823,12 @@ impl TradingState {
         let same =
             |r: &RecordView| r.account == record.account && r.record.client_id == record.client_id;
         match end {
-            LookupEnd::Found | LookupEnd::NotPlaced => boot.records.retain(|r| !same(r)),
+            LookupEnd::Found | LookupEnd::NotPlaced => {
+                boot.records.retain(|r| !same(r));
+                if end == LookupEnd::Found {
+                    self.auto.entry_stands(&record.client_id);
+                }
+            }
             LookupEnd::StillUnknown => {
                 for r in boot.records.iter_mut().filter(|r| same(r)) {
                     r.phase = RecordPhase::StillUnknown;
@@ -887,25 +922,105 @@ impl TradingState {
     pub fn remove(&mut self, id: Uuid) {
         self.accounts.remove(&id);
         self.attach.remove_account(id);
+        self.auto.remove_account(id);
     }
 
     /// An entry was confirmed: remember the protection its confirmation listed, by the
     /// entry's client id.
-    pub fn register_attach(&mut self, entry_id: String, pending: PendingAttach) {
-        if !self.attach.register(entry_id, pending) {
+    /// `false` when it could not be listed (a send for the symbol is in flight): the caller
+    /// then does not send the entry, which the confirmation said would be protected.
+    #[must_use]
+    pub fn register_attach(
+        &mut self,
+        entry_id: String,
+        pending: PendingAttach,
+        auto: AutoInit,
+    ) -> bool {
+        if !self.attach.register(entry_id.clone(), pending) {
+            log::warn!("Protection was not listed: a send for the same symbol is in flight.");
+            return false;
+        }
+        self.auto.register(entry_id, auto);
+        true
+    }
+
+    /// An entry that carries its protection on the exchange (OKX): only the listing is kept.
+    /// `false` when it could not be listed; the caller does not send the entry then.
+    #[must_use]
+    pub fn register_okx_attach(&mut self, entry_id: String, pending: PendingAttach) -> bool {
+        let listed = self.attach.register(entry_id, pending);
+        if !listed {
             log::warn!("Protection was not listed: a send for the same symbol is in flight.");
         }
+        listed
+    }
+
+    /// Is automatic protection still being worked on for an earlier entry of the account on
+    /// `symbol` (M3)? A new entry with automatic protection is refused meanwhile: two entries
+    /// would share one whole-position stop and cancel each other's orders.
+    pub fn auto_active(&self, id: Uuid, symbol: &str) -> bool {
+        self.auto.is_active(id, symbol)
     }
 
     /// The send of the (account, symbol) ended: keep or drop what was remembered for it.
     pub fn settle_attach(&mut self, id: Uuid, symbol: &str, result: &SendResult) {
         self.attach.settle(id, symbol, result);
+        self.auto.settle(id, symbol, result);
     }
 
     /// The entry with this client id is known not to stand on the exchange (a lookup found
     /// nothing, or the user released or discarded its record): its listed protection goes.
     pub fn entry_gone(&mut self, client_id: &str) {
         self.attach.remove_entry(client_id);
+        self.auto.entry_gone(client_id);
+    }
+
+    /// What the account holds on `symbol`, as far as the app knows (N3): the positions of the
+    /// symbol and whether the list may be out of date.
+    pub fn holdings(&self, id: Uuid, symbol: &str) -> Holdings {
+        Holdings {
+            stale: self.lists_stale(id),
+            dirs: self
+                .positions(id)
+                .iter()
+                .filter(|p| p.symbol.eq_ignore_ascii_case(symbol))
+                .map(|p| p.dir)
+                .collect(),
+        }
+    }
+
+    /// The automatic jobs that are due now (never twice: a job leaves the book as it is made).
+    /// `switch` says whether the account's auto-attach is on. Entries whose work ended leave the
+    /// table of pending protection.
+    pub fn poll_auto(&mut self, now_ms: i64, switch: &dyn Fn(Uuid) -> bool) -> Vec<AutoJob> {
+        // The book is taken out while it looks at the positions (which live in `self`).
+        let mut auto = std::mem::take(&mut self.auto);
+        let held = |id: Uuid, symbol: &str| self.holdings(id, symbol);
+        let env = PollEnv {
+            switch,
+            held: &held,
+        };
+        let jobs = auto.poll(now_ms, &env);
+        self.auto = auto;
+        self.forget_finished();
+        jobs
+    }
+
+    /// The result of an automatic job.
+    pub fn auto_done(&mut self, summary: AutoSummary) {
+        self.auto.done(summary);
+        self.forget_finished();
+    }
+
+    fn forget_finished(&mut self) {
+        for entry in self.auto.take_finished() {
+            self.attach.remove_entry(&entry);
+        }
+    }
+
+    /// What went wrong with the automatic orders of the account (panel lines).
+    pub fn auto_notes(&self, id: Uuid) -> Vec<String> {
+        self.auto.notes_for(id)
     }
 
     /// Symbols with protection listed for an entry that has no position yet (a resting limit
@@ -1043,6 +1158,7 @@ impl TradingState {
         let meta = rt.meta.clone();
         rt.feed = StreamEquityFeed::new(&key);
         rt.book_trusted = false;
+        rt.recheck_auto = true;
         rt.state = Some(StreamState::Reconnecting);
         rt.needs_retest = false;
         rt.phase = Phase::Running(StreamHandle {
@@ -1118,7 +1234,19 @@ impl TradingState {
                 if state != StreamState::Connected {
                     rt.book_trusted = false;
                 }
+                if matches!(
+                    state,
+                    StreamState::Reconnecting | StreamState::AuthFailed | StreamState::Unavailable
+                ) {
+                    rt.recheck_auto = true;
+                }
                 rt.state = Some(state);
+                if state == StreamState::Connected
+                    && rt.book_trusted
+                    && std::mem::take(&mut rt.recheck_auto)
+                {
+                    Self::check_after_reconnect(rt, &mut self.auto, id);
+                }
             }
             StreamOutput::InvalidateSession(_) => {
                 rt.needs_retest = true;
@@ -1130,11 +1258,44 @@ impl TradingState {
                     risk.snapshot_applied(&snapshot, now_ms, n)
                 });
             }
-            StreamOutput::Event(event) => Self::apply_event(rt, &event, now_ms),
+            StreamOutput::Event(event) => Self::apply_event(rt, &mut self.auto, id, &event, now_ms),
         }
     }
 
-    fn apply_event(rt: &mut AccountRuntime, event: &PrivateEvent, now_ms: i64) {
+    /// The stream is connected again and the snapshot and held-back events are applied: entries that were open when the
+    /// connection dropped may have filled without any event reaching the app (M4-4).
+    fn check_after_reconnect(rt: &AccountRuntime, auto: &mut AutoBook, id: Uuid) {
+        let resting = |symbol: &str, dir: Dir| {
+            rt.orders.iter().any(|o| {
+                o.symbol.eq_ignore_ascii_case(symbol)
+                    && matches!(o.kind, exchange::trade::OpenKind::Plain)
+                    && !o.reduce_only
+                    && o.side == Some(dir.opening_side())
+            })
+        };
+        let held = |symbol: &str| {
+            rt.positions
+                .iter()
+                .filter(|p| p.symbol.eq_ignore_ascii_case(symbol))
+                .map(|p| p.dir)
+                .collect::<Vec<_>>()
+        };
+        auto.after_reconnect(
+            id,
+            &ReconnectView {
+                resting: &resting,
+                held: &held,
+            },
+        );
+    }
+
+    fn apply_event(
+        rt: &mut AccountRuntime,
+        auto: &mut AutoBook,
+        id: Uuid,
+        event: &PrivateEvent,
+        now_ms: i64,
+    ) {
         if let Some(obs) = rt.feed.on_event(event, now_ms) {
             let r = rt.risk.observe(obs);
             rt.note_poisoned(r);
@@ -1142,7 +1303,21 @@ impl TradingState {
         match event {
             PrivateEvent::Fill(fill) => {
                 // A record of what happened; it never changes the held positions.
-                rt.note_fill(fill.trade_id.as_deref());
+                let new = rt.note_fill(&fill.symbol, fill.trade_id.as_deref());
+                // A fill with no trade id cannot be told from a repeat, and one with no client
+                // id cannot be tied to an entry: neither is counted (no guessing).
+                match (new, fill.trade_id.is_some(), fill.client_id.as_deref()) {
+                    (true, true, Some(client)) => {
+                        let verdict = auto.on_fill(id, client, fill.side, fill.qty, fill.price);
+                        if verdict == FillVerdict::WrongSide {
+                            log::info!("A fill that does not add to the entry was not counted.");
+                        }
+                    }
+                    (true, _, None) => {
+                        log::info!("A fill without a client id was not matched to an entry.");
+                    }
+                    _ => {}
+                }
             }
             PrivateEvent::Position(update) => {
                 rt.apply_position_event(&update.symbol, update.position_side, update.qty);
@@ -1156,7 +1331,11 @@ impl TradingState {
             // marked out of date and the stream reads it again (see the stream machine).
             PrivateEvent::Order(update) if update.category == OrderCategory::Algo => {
                 rt.orders_dirty = true;
+                auto.on_order(id, update);
             }
+            PrivateEvent::Order(update) => auto.on_order(id, update),
+            // The stream read everything again because it may have missed events.
+            PrivateEvent::ResyncRequired(_) => rt.recheck_auto = true,
             _ => {}
         }
     }
@@ -2031,7 +2210,7 @@ mod tests {
         let (mut t, m, _) = running();
         let rt = t.accounts.get_mut(&m.id).unwrap();
         for i in 0..(SEEN_TRADES_CAP + 10) {
-            rt.note_fill(Some(&i.to_string()));
+            rt.note_fill("BTCUSDT", Some(&i.to_string()));
         }
         assert_eq!(rt.seen_trades.len(), SEEN_TRADES_CAP);
         assert_eq!(rt.seen_order.len(), SEEN_TRADES_CAP);
@@ -2634,6 +2813,7 @@ mod tests {
             close_position: true,
             reduce_only: false,
             role: Some(ProtectRole::Stop),
+            attached: None,
         }
     }
 
@@ -2647,6 +2827,95 @@ mod tests {
             &[held("BTCUSDT", 2)],
             |r, n| r.set_positions(0, n),
         );
+    }
+
+    #[test]
+    fn a_fill_that_arrives_twice_is_counted_once_and_one_without_ids_is_not_guessed() {
+        use crate::auto_flow::tests::{entry_for, filled_of, spec};
+        use exchange::trade::Side;
+        use exchange::trade::stream::{Fill, PrivateEvent};
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        let (entry_id, init) = entry_for(m.id, spec(1, false));
+        assert!(t.register_attach(
+            entry_id.clone(),
+            PendingAttach {
+                account: m.id,
+                symbol: "BTCUSDT".into(),
+                plan: crate::protect_attach::AttachPlan {
+                    kind: crate::protect_attach::AttachKind::AfterFill,
+                    dir: Dir::Long,
+                    limit: true,
+                    spec: spec(1, false),
+                    lines: Vec::new(),
+                },
+            },
+            init,
+        ));
+        t.settle_attach(m.id, "BTCUSDT", &SendResult::Accepted { order_id: None });
+        let fill = |trade: Option<&str>, client: Option<&str>| {
+            PrivateEvent::Fill(Fill {
+                symbol: "BTCUSDT".into(),
+                client_id: client.map(str::to_string),
+                order_id: None,
+                trade_id: trade.map(str::to_string),
+                side: Some(Side::Buy),
+                qty: Decimal::parse("0.001").unwrap(),
+                price: Decimal::parse("60000").unwrap(),
+                fee: None,
+                fee_asset: None,
+                realized_pnl: None,
+                time_ms: None,
+            })
+        };
+        let send = |t: &mut TradingState, e: PrivateEvent| {
+            let _ = t.update(Message::Stream(key, StreamOutput::Event(Box::new(e))), 0);
+        };
+        send(&mut t, fill(Some("t1"), Some(&entry_id)));
+        send(&mut t, fill(Some("t1"), Some(&entry_id)));
+        // No client id, or no trade id: not matched, not counted.
+        send(&mut t, fill(Some("t2"), None));
+        send(&mut t, fill(None, Some(&entry_id)));
+        assert_eq!(
+            filled_of(&t.auto, &entry_id),
+            Some(Decimal::parse("0.001").unwrap())
+        );
+        let jobs = t.poll_auto(2_000, &|_| true);
+        assert_eq!(jobs.len(), 1, "one stop for the one counted fill");
+        assert!(t.poll_auto(2_000, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn holdings_name_the_directions_on_the_symbol_and_say_when_the_list_is_stale() {
+        use crate::protect_attach::check_new_entry;
+        use exchange::account::PositionMode;
+        let (mut t, m, key) = running();
+        // No stream state yet: the list cannot be trusted.
+        assert!(t.holdings(m.id, "BTCUSDT").stale);
+        connect_with_stop(&mut t, &m, key);
+        let h = t.holdings(m.id, "btcusdt");
+        assert!(!h.stale);
+        assert_eq!(h.dirs.len(), 1);
+        let held_dir = h.dirs[0];
+        // Another symbol is not held.
+        assert!(t.holdings(m.id, "ETHUSDT").dirs.is_empty());
+        // N1: a one-way entry against the held direction is refused with these holdings, one
+        // with it is not; a stale list refuses both.
+        let other = match held_dir {
+            Dir::Long => Dir::Short,
+            Dir::Short => Dir::Long,
+        };
+        let one_way = Some(PositionMode::OneWay);
+        let usdm = AccountProduct::UsdM;
+        assert!(check_new_entry(usdm, one_way, other, &h).is_err());
+        assert!(check_new_entry(usdm, one_way, held_dir, &h).is_ok());
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::Event(algo_update(OrderCategory::Algo))),
+            0,
+        );
+        let stale = t.holdings(m.id, "BTCUSDT");
+        assert!(stale.stale);
+        assert!(check_new_entry(usdm, one_way, held_dir, &stale).is_err());
     }
 
     #[test]
@@ -2755,7 +3024,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(status(&t), vec![exchange::trade::Protection::Stop]);
-        t.register_attach("eAAAA".into(), pending_for(m.id, "BTCUSDT", true));
+        assert!(t.register_okx_attach("eAAAA".into(), pending_for(m.id, "BTCUSDT", true)));
         assert_eq!(status(&t), vec![exchange::trade::Protection::EntryPending]);
         assert!(t.has_resting_limit_attach());
         assert!(
@@ -2774,10 +3043,231 @@ mod tests {
         assert!(!t.has_resting_limit_attach());
         assert_ne!(status(&t), vec![exchange::trade::Protection::EntryPending]);
         // Another symbol's pending entry does not touch this position.
-        t.register_attach("eBBBB".into(), pending_for(m.id, "ETHUSDT", false));
+        assert!(t.register_okx_attach("eBBBB".into(), pending_for(m.id, "ETHUSDT", false)));
         assert_ne!(status(&t), vec![exchange::trade::Protection::EntryPending]);
         // Deleting the account drops what was remembered for it.
         t.remove(m.id);
         assert!(!t.has_resting_limit_attach());
+    }
+
+    #[test]
+    fn the_same_trade_id_on_two_symbols_is_two_fills() {
+        let (mut t, m, _) = running();
+        let rt = t.accounts.get_mut(&m.id).unwrap();
+        assert!(rt.note_fill("BTCUSDT", Some("7")));
+        assert!(
+            rt.note_fill("ETHUSDT", Some("7")),
+            "another symbol, another fill"
+        );
+        assert!(
+            !rt.note_fill("BTCUSDT", Some("7")),
+            "a repeat on the same symbol"
+        );
+        assert!(!rt.note_fill("ETHUSDT", Some("7")));
+        assert_eq!(rt.fills_seen, 2);
+    }
+
+    /// An entry registered the way the confirmation does, with the send settled.
+    fn registered_entry(t: &mut TradingState, m: &AccountMeta) -> String {
+        use crate::auto_flow::tests::{entry_for, spec};
+        let (entry_id, init) = entry_for(m.id, spec(1, false));
+        assert!(t.register_attach(
+            entry_id.clone(),
+            PendingAttach {
+                account: m.id,
+                symbol: "BTCUSDT".into(),
+                plan: crate::protect_attach::AttachPlan {
+                    kind: crate::protect_attach::AttachKind::AfterFill,
+                    dir: Dir::Long,
+                    limit: true,
+                    spec: spec(1, false),
+                    lines: Vec::new(),
+                },
+            },
+            init,
+        ));
+        t.settle_attach(m.id, "BTCUSDT", &SendResult::Accepted { order_id: None });
+        entry_id
+    }
+
+    #[test]
+    fn a_second_entry_with_automatic_protection_waits_for_the_first_to_end() {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        assert!(!t.auto_active(m.id, "BTCUSDT"));
+        let entry_id = registered_entry(&mut t, &m);
+        assert!(t.auto_active(m.id, "BTCUSDT"));
+        assert!(t.auto_active(m.id, "btcusdt"));
+        assert!(!t.auto_active(m.id, "ETHUSDT"));
+        assert!(!t.auto_active(uuid::Uuid::from_u128(1), "BTCUSDT"));
+        // The entry is cancelled with nothing filled: nothing is owed, the symbol is free.
+        let update = |status| {
+            PrivateEvent::Order(exchange::trade::stream::OrderUpdate {
+                symbol: "BTCUSDT".into(),
+                client_id: Some(entry_id.clone()),
+                order_id: None,
+                category: OrderCategory::Plain,
+                side: None,
+                status,
+                price: None,
+                qty: None,
+                filled_qty: Some(Decimal::ZERO),
+                reduce_only: None,
+                position_side: None,
+                time_ms: None,
+            })
+        };
+        let _ = t.update(
+            Message::Stream(
+                key,
+                StreamOutput::Event(Box::new(update(
+                    exchange::trade::stream::OrderStatus::Canceled,
+                ))),
+            ),
+            0,
+        );
+        assert!(!t.auto_active(m.id, "BTCUSDT"));
+    }
+
+    #[test]
+    fn a_reconnect_that_finds_a_position_and_no_entry_order_is_noted_and_sends_nothing() {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        let _entry_id = registered_entry(&mut t, &m);
+        // The stream drops and comes back: the check runs at `Connected`, after the snapshot.
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::State(StreamState::Reconnecting)),
+            0,
+        );
+        assert!(!t.accounts[&m.id].book_trusted);
+        t.accounts
+            .get_mut(&m.id)
+            .unwrap()
+            .apply_snapshot(&[], &[held("BTCUSDT", 2)], |r, n| r.set_positions(0, n));
+        assert!(
+            t.auto_notes(m.id).is_empty(),
+            "not before the state is Connected"
+        );
+        let _ = t.update(
+            Message::Stream(key, StreamOutput::State(StreamState::Connected)),
+            0,
+        );
+        let notes = t.auto_notes(m.id);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("connection was lost"));
+        assert!(
+            t.poll_auto(2_000, &|_| true).is_empty(),
+            "nothing is sent for it"
+        );
+        assert!(!t.auto_active(m.id, "BTCUSDT"));
+    }
+
+    fn entry_event(
+        entry_id: &str,
+        status: exchange::trade::stream::OrderStatus,
+        category: OrderCategory,
+    ) -> PrivateEvent {
+        PrivateEvent::Order(exchange::trade::stream::OrderUpdate {
+            symbol: "BTCUSDT".into(),
+            client_id: Some(entry_id.to_string()),
+            order_id: None,
+            category,
+            side: None,
+            status,
+            price: None,
+            qty: None,
+            filled_qty: None,
+            reduce_only: None,
+            position_side: None,
+            time_ms: None,
+        })
+    }
+
+    fn entry_fill(entry_id: &str, trade: &str) -> PrivateEvent {
+        PrivateEvent::Fill(exchange::trade::stream::Fill {
+            symbol: "BTCUSDT".into(),
+            client_id: Some(entry_id.to_string()),
+            order_id: None,
+            trade_id: Some(trade.to_string()),
+            side: Some(exchange::trade::Side::Buy),
+            qty: Decimal::parse("0.001").unwrap(),
+            price: Decimal::parse("60000").unwrap(),
+            fee: None,
+            fee_asset: None,
+            realized_pnl: None,
+            time_ms: None,
+        })
+    }
+
+    /// A resync while an entry stands: `first` is what starts it, then a snapshot with a long
+    /// position and no entry order, then the fill (before or after `Connected`). Returns the
+    /// number of notes, whether a stop job came out, and whether the entry is still active.
+    fn resync_with_fill(
+        first: Option<PrivateEvent>,
+        fill_after_connected: bool,
+    ) -> (usize, bool, bool) {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        // The first connect of a stream consumes the flag in the real flow (the snapshot comes
+        // before `Connected`); this helper applies its snapshot after it.
+        t.accounts.get_mut(&m.id).unwrap().recheck_auto = false;
+        let entry_id = registered_entry(&mut t, &m);
+        let send = |t: &mut TradingState, o: StreamOutput| {
+            let _ = t.update(Message::Stream(key, o), 0);
+        };
+        let event = |e| StreamOutput::Event(Box::new(e));
+        let state = |s| StreamOutput::State(s);
+        match first {
+            Some(e) => send(&mut t, event(e)),
+            None => send(&mut t, state(StreamState::Reconnecting)),
+        }
+        send(&mut t, state(StreamState::Resyncing));
+        t.accounts
+            .get_mut(&m.id)
+            .unwrap()
+            .apply_snapshot(&[], &[held("BTCUSDT", 2)], |r, n| r.set_positions(0, n));
+        if !fill_after_connected {
+            send(&mut t, event(entry_fill(&entry_id, "t1")));
+        }
+        send(&mut t, state(StreamState::Connected));
+        if fill_after_connected {
+            send(&mut t, event(entry_fill(&entry_id, "t1")));
+        }
+        let notes = t.auto_notes(m.id).len();
+        let jobs = t.poll_auto(2_000, &|_| true);
+        let stop = jobs.len() == 1 && format!("{:?}", jobs[0]).contains("Place(Stop)");
+        assert!(stop || jobs.is_empty(), "{jobs:?}");
+        (notes, stop, t.auto_active(m.id, "BTCUSDT"))
+    }
+
+    #[test]
+    fn a_resync_caused_by_an_algo_event_is_not_a_reconnect() {
+        use exchange::trade::stream::OrderStatus;
+        let algo = entry_event("x", OrderStatus::New, OrderCategory::Algo);
+        let (notes, stop, active) = resync_with_fill(Some(algo), false);
+        assert_eq!(notes, 0, "no note: the fill was held back, not lost");
+        assert!(stop, "the fill still gets its stop");
+        assert!(active);
+    }
+
+    #[test]
+    fn a_reconnect_notes_and_a_later_fill_still_gets_its_stop() {
+        let (notes, stop, active) = resync_with_fill(None, true);
+        assert_eq!(notes, 1);
+        assert!(
+            stop,
+            "a fill of the entry seen after the note still gets its stop"
+        );
+        assert!(!active);
+    }
+
+    #[test]
+    fn a_resync_required_event_is_treated_like_a_reconnect() {
+        use exchange::trade::stream::ResyncReason;
+        let ev = PrivateEvent::ResyncRequired(ResyncReason::MalformedFrame);
+        let (notes, stop, active) = resync_with_fill(Some(ev), true);
+        assert_eq!(notes, 1);
+        assert!(stop);
+        assert!(!active);
     }
 }

@@ -414,7 +414,7 @@ async fn matrix_binance_futures_send_paths() {
         let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
         let intent = OrderIntent::binance(c.account(), place, &fresh).unwrap();
         let out = c
-            .submit_auto(
+            .submit_auto_unbound(
                 &OpenGate,
                 &NoRisk,
                 &NoJournal,
@@ -3994,8 +3994,12 @@ fn every_send_path_future_is_send() {
         ConfirmToken,
         OrderIntent,
     ) = |c, r, j, t, i| assert_send(&c.submit(&OpenGate, r, j, t, i));
-    let _: fn(&TradeClient, &dyn RiskHook, &dyn super::journal::UnknownJournal, AutoIntent) =
-        |c, r, j, a| assert_send(&c.submit_auto(&OpenGate, r, j, a));
+    let _: fn(
+        &TradeClient,
+        &dyn RiskHook,
+        &dyn super::journal::UnknownJournal,
+        super::grant::GrantedAuto,
+    ) = |c, r, j, a| assert_send(&c.submit_auto(&OpenGate, r, j, a));
     let _: fn(&TradeClient, PendingUnknown, &dyn super::journal::UnknownJournal) =
         |c, p, j| assert_send(&c.resolve_unknown(p, j));
     let _: fn(
@@ -4414,4 +4418,328 @@ fn requests_that_differ_only_in_the_query_have_different_preview_hashes() {
     assert_eq!(a.path, "/api/v5/trade/order");
     assert_eq!(a.path, b.path);
     assert_ne!(a.hash, b.hash);
+}
+
+// ── The automatic path is bound to the entry confirmation (M5 d3) ───────
+
+mod auto_grant {
+    use super::*;
+    use crate::trade::grant::{AutoGrant, Basis, GrantRefusal, GrantRoles};
+
+    const ROLES: GrantRoles = GrantRoles {
+        stop: true,
+        targets: 1,
+        trailing: false,
+    };
+
+    fn spec() -> crate::trade::protect::ProtectSpec {
+        use crate::trade::protect::{Offset, ProtectSpec, TriggerBasis};
+        ProtectSpec {
+            stop: Some(Offset::Percent(d("1"))),
+            targets: vec![crate::trade::protect::TargetSpec {
+                offset: Offset::Percent(d("2")),
+                share_pct: 100,
+            }],
+            trailing: None,
+            trigger_price: TriggerBasis::Mark,
+        }
+    }
+
+    fn entry_intent(c: &TradeClient, t: &RulesTable) -> OrderIntent {
+        let r = t.lookup("BTCUSDT").unwrap();
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        OrderIntent::binance(
+            c.account(),
+            futures_limit(r, &ClientId::generate(Role::Entry), Action::Open(Dir::Long)),
+            &fresh,
+        )
+        .unwrap()
+    }
+
+    /// A grant for a new entry, the entry's client id and what its placements are based on.
+    fn grant_and_basis(c: &TradeClient, t: &RulesTable) -> (AutoGrant, String, Basis) {
+        let entry = entry_intent(c, t);
+        let id = entry.client_ids()[0].to_string();
+        let grant = AutoGrant::from_entry(&entry, ROLES, &spec(), 10_000, NOW).unwrap();
+        let basis = Basis::new(&id, &spec());
+        (grant, id, basis)
+    }
+
+    fn protective(
+        c: &TradeClient,
+        t: &RulesTable,
+        kind: ProtectiveKind,
+        size: Size,
+        id: &ClientId,
+        basis: &Basis,
+    ) -> AutoIntent {
+        let r = t.lookup("BTCUSDT").unwrap();
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let p = Protective {
+            kind,
+            dir: Dir::Long,
+            size,
+            trigger_price: Some(d(if kind.is_stop_side() {
+                "59000"
+            } else {
+                "61000"
+            })),
+            limit_price: None,
+            tif: TimeInForce::Gtc,
+            working_type: WorkingType::MarkPrice,
+            trailing: None,
+            ref_price: d("60000"),
+            client_id: dup(id),
+        };
+        let place = bf::new_algo_order(r, Some(PositionMode::OneWay), p).unwrap();
+        let intent = OrderIntent::binance(c.account(), place, &fresh).unwrap();
+        AutoIntent::new(AutoPath::AttachProtective, intent)
+            .unwrap()
+            .with_basis(basis.clone())
+    }
+
+    #[tokio::test]
+    async fn only_what_the_grant_covers_reaches_the_server() {
+        let fake = serve(gen_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let (mut grant, entry_id, basis) = grant_and_basis(&c, &t);
+        assert!(grant.add_fill(&entry_id, d("0.002")));
+        let (stop_ref, stop) = grant.issue(Role::StopLoss, NOW).unwrap();
+        let (_, tp) = grant.issue(Role::TakeProfit, NOW).unwrap();
+
+        // The stop and the take-profit go out once each.
+        for (kind, size, id) in [
+            (ProtectiveKind::StopMarket, Size::ClosePosition, &stop),
+            (ProtectiveKind::TakeProfitMarket, Size::Qty(d("0.002")), &tp),
+        ] {
+            let granted = grant
+                .authorise(protective(&c, &t, kind, size, id, &basis), NOW)
+                .unwrap();
+            let out = c
+                .submit_auto(&OpenGate, &NoRisk, &NoJournal, granted)
+                .await
+                .unwrap();
+            assert!(matches!(out.outcome, Outcome::Accepted { .. }));
+        }
+        assert_eq!(fake.count("POST /fapi/v1/algoOrder"), 2);
+
+        // The same stop again, a larger take-profit and a stranger's id never leave the app.
+        let again = protective(
+            &c,
+            &t,
+            ProtectiveKind::StopMarket,
+            Size::ClosePosition,
+            &stop,
+            &basis,
+        );
+        assert_eq!(
+            grant.authorise(again, NOW).unwrap_err(),
+            GrantRefusal::IdNotAvailable
+        );
+        let stranger = ClientId::generate(Role::StopLoss);
+        let foreign = protective(
+            &c,
+            &t,
+            ProtectiveKind::StopMarket,
+            Size::ClosePosition,
+            &stranger,
+            &basis,
+        );
+        assert_eq!(
+            grant.authorise(foreign, NOW).unwrap_err(),
+            GrantRefusal::UnknownId
+        );
+        assert_eq!(fake.count("POST /fapi/v1/algoOrder"), 2);
+
+        // The sibling cancel: once.
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let cancel = grant.cancel_intent(stop_ref, &fresh).unwrap();
+        let granted = grant.authorise(cancel, NOW).unwrap();
+        let out = c
+            .submit_auto(&OpenGate, &NoRisk, &NoJournal, granted)
+            .await
+            .unwrap();
+        assert!(matches!(out.outcome, Outcome::Accepted { .. }));
+        assert_eq!(fake.count("DELETE /fapi/v1/algoOrder"), 1);
+        assert_eq!(
+            grant.cancel_intent(stop_ref, &fresh).unwrap_err(),
+            GrantRefusal::AlreadyCancelled
+        );
+        // Nothing reduced, so no request of the run added exposure: the entry never went out.
+        assert_eq!(fake.count("POST /fapi/v1/order"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_stops_a_granted_request_too() {
+        let fake = serve(gen_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let (mut grant, entry_id, basis) = grant_and_basis(&c, &t);
+        assert!(grant.add_fill(&entry_id, d("0.002")));
+        let (_, stop) = grant.issue(Role::StopLoss, NOW).unwrap();
+        let granted = grant
+            .authorise(
+                protective(
+                    &c,
+                    &t,
+                    ProtectiveKind::StopMarket,
+                    Size::ClosePosition,
+                    &stop,
+                    &basis,
+                ),
+                NOW,
+            )
+            .unwrap();
+        let out = c
+            .submit_auto(&ClosedGate, &NoRisk, &NoJournal, granted)
+            .await;
+        assert!(matches!(out, Err(SubmitError::Gate("closed"))));
+        assert_eq!(fake.count("algoOrder"), 0);
+    }
+
+    /// One stage as the app sends it: issue the ids, build the requests, authorise each against
+    /// the grant and send it. Returns what was issued.
+    async fn send_stage(
+        c: &TradeClient,
+        t: &RulesTable,
+        grant: &mut AutoGrant,
+        entry_id: &str,
+        spec: &crate::trade::protect::ProtectSpec,
+        stage: crate::trade::Stage,
+        filled: &str,
+    ) -> Vec<crate::trade::IssuedRef> {
+        let rules = t.lookup("BTCUSDT").unwrap();
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let mut issued = Vec::new();
+        let mut ids = Vec::new();
+        for role in crate::trade::stage_roles(spec, stage) {
+            let (r, id) = grant.issue(role, NOW).unwrap();
+            issued.push(r);
+            ids.push((role, id));
+        }
+        let input = crate::trade::StageInput {
+            rules,
+            mode: PositionMode::OneWay,
+            dir: Dir::Long,
+            avg_price: d("60000"),
+            filled: d(filled),
+            ref_price: d("60000"),
+            spec,
+            stage,
+        };
+        for (_, request) in crate::trade::build_stage(&input, ids) {
+            let intent = OrderIntent::binance(c.account(), request.unwrap(), &fresh).unwrap();
+            let auto = AutoIntent::new(AutoPath::AttachProtective, intent)
+                .unwrap()
+                .with_basis(input.basis(entry_id));
+            let granted = grant.authorise(auto, NOW).unwrap();
+            let out = c
+                .submit_auto(&OpenGate, &NoRisk, &NoJournal, granted)
+                .await
+                .unwrap();
+            assert!(matches!(out.outcome, Outcome::Accepted { .. }));
+        }
+        issued
+    }
+
+    /// First fill → one whole-position stop; the entry completes → the take-profits for the
+    /// total; the stop fires → the take-profits are cancelled, once. Nothing adds exposure.
+    #[tokio::test]
+    async fn a_partial_fill_sequence_reaches_the_server_as_a_stop_then_the_take_profits_then_the_cancels()
+     {
+        use crate::trade::Stage;
+        use crate::trade::protect::{Offset, ProtectSpec, TargetSpec, TriggerBasis};
+        let fake = serve(gen_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let entry = OrderIntent::binance(
+            c.account(),
+            futures_limit_qty(
+                t.lookup("BTCUSDT").unwrap(),
+                &ClientId::generate(Role::Entry),
+                "0.004",
+            ),
+            &fresh,
+        )
+        .unwrap();
+        let roles = GrantRoles {
+            stop: true,
+            targets: 2,
+            trailing: false,
+        };
+        let entry_id = entry.client_ids()[0].to_string();
+        let spec = ProtectSpec {
+            stop: Some(Offset::Percent(d("1"))),
+            targets: vec![
+                TargetSpec {
+                    offset: Offset::Percent(d("2")),
+                    share_pct: 50,
+                },
+                TargetSpec {
+                    offset: Offset::Percent(d("4")),
+                    share_pct: 50,
+                },
+            ],
+            trailing: None,
+            trigger_price: TriggerBasis::Mark,
+        };
+        let mut grant = AutoGrant::from_entry(&entry, roles, &spec, 10_000, NOW).unwrap();
+        // Nothing is authorised before a fill exists.
+        let (_, early) = grant.issue(Role::StopLoss, NOW).unwrap();
+        let too_early = protective(
+            &c,
+            &t,
+            ProtectiveKind::StopMarket,
+            Size::ClosePosition,
+            &early,
+            &crate::trade::Basis::new(&entry_id, &spec),
+        );
+        assert_eq!(
+            grant.authorise(too_early, NOW).unwrap_err(),
+            GrantRefusal::NoFill
+        );
+        assert_eq!(fake.count("POST /fapi/v1/algoOrder"), 0);
+        let mut grant = AutoGrant::from_entry(&entry, roles, &spec, 10_000, NOW).unwrap();
+
+        assert!(grant.add_fill(&entry_id, d("0.001")));
+        let stop = send_stage(&c, &t, &mut grant, &entry_id, &spec, Stage::Stop, "0.001").await;
+        assert_eq!(fake.count("POST /fapi/v1/algoOrder"), 1);
+        assert!(grant.add_fill(&entry_id, d("0.003")));
+        let tps = send_stage(&c, &t, &mut grant, &entry_id, &spec, Stage::Rest, "0.004").await;
+        assert_eq!(fake.count("POST /fapi/v1/algoOrder"), 3);
+        let raw = fake.raw.lock().unwrap().clone();
+        let posts: Vec<&String> = raw
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p.contains("/fapi/v1/algoOrder"))
+            .map(|(_, p, b)| if b.is_empty() { p } else { b })
+            .collect();
+        assert!(posts[0].contains("closePosition=true"), "{}", posts[0]);
+        assert!(posts[1].contains("quantity=0.002") && posts[1].contains("reduceOnly=true"));
+        assert!(posts[2].contains("quantity=0.002") && posts[2].contains("reduceOnly=true"));
+        // Nothing of the run was an entry.
+        assert_eq!(fake.count("POST /fapi/v1/order"), 0);
+
+        // The stop fired: both take-profits are cancelled, each once.
+        for r in &tps {
+            let cancel = grant.cancel_intent(*r, &fresh).unwrap();
+            let granted = grant.authorise(cancel, NOW).unwrap();
+            let out = c
+                .submit_auto(&OpenGate, &NoRisk, &NoJournal, granted)
+                .await
+                .unwrap();
+            assert!(matches!(out.outcome, Outcome::Accepted { .. }));
+        }
+        assert_eq!(fake.count("DELETE /fapi/v1/algoOrder"), 2);
+        // A second cancel of the same order, and a cancel of a placed one that was never
+        // cancelled by the grant's own id list, change nothing on the wire.
+        assert_eq!(
+            grant.cancel_intent(tps[0], &fresh).unwrap_err(),
+            GrantRefusal::AlreadyCancelled
+        );
+        assert_eq!(fake.count("DELETE /fapi/v1/algoOrder"), 2);
+        // The stop is still cancellable once (the take-profits fired instead).
+        assert!(grant.cancel_intent(stop[0], &fresh).is_ok());
+    }
 }

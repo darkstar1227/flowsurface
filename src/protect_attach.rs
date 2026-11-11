@@ -3,8 +3,8 @@
 //!
 //! Nothing here sends anything. OKX carries its protection on the entry itself (the builder
 //! adds `attachAlgoOrds`, so it goes through the same confirmation and the same send as the
-//! entry); on Binance futures the protection would follow the fill, and **nothing consumes the
-//! table yet** (d3): the table only remembers what the confirmation showed.
+//! entry); on Binance futures the protection follows the fill and is sent by `auto_flow` (d3):
+//! the table only remembers what the confirmation showed, for the panel and the close warning.
 //!
 //! One rule decides what applies: the account's saved defaults, or the ticket's override for
 //! this order, both checked by `ProtectDefaults::spec`. The account's auto-attach switch (and,
@@ -79,6 +79,11 @@ pub struct Holdings {
     /// The direction of each position held on the symbol.
     pub dirs: Vec<Dir>,
 }
+
+/// Shown when a new entry would get automatic protection while an earlier one on the same
+/// symbol is still being protected (M3).
+pub const AUTO_STILL_ACTIVE: &str = "Automatic protection is still active for an earlier entry on \
+     this symbol; wait until it ends or cancel it.";
 
 const REDUCES: &str = "This order reduces or reverses a position; protective defaults apply to new \
      entries only. Choose \"No protection\" to send it.";
@@ -324,19 +329,19 @@ pub fn confirmation_lines(note: &AttachNote, fields: &[PreviewField]) -> Vec<Lin
                 lines
             }
             AttachKind::AfterFill => {
-                // d3: when the after-fill send path exists, restore "Sent automatically after the entry
-                // fills:" and drop the warning below (see docs/trading-security.md, d2 notes).
-                let mut lines = vec![line(
-                    "Planned after the entry fills (not sent by this build):",
-                )];
+                let mut lines = vec![line("Sent automatically after the entry fills:")];
                 lines.extend(plan.lines.iter().map(|t| line(t)));
+                lines.push(line(
+                    "The stop-loss is placed at the first fill and covers the whole position; \
+                     the take-profit and trailing orders follow when the entry has filled \
+                     completely, sized by what filled.",
+                ));
                 lines.push(line(
                     "The stop-loss and the take-profit cancel each other: when one triggers, \
                      the app cancels the other.",
                 ));
-                lines.push(warn(
-                    "This build does not send them yet: place the protective orders by hand \
-                     after the fill.",
+                lines.push(line(
+                    "Protective orders are placed only within 24 hours of this confirmation.",
                 ));
                 lines.push(warn(
                     "This works only while the app is running. If it is closed, or the \
@@ -928,24 +933,15 @@ mod tests {
     }
 
     #[test]
-    fn the_after_fill_block_says_it_is_not_sent_by_this_build() {
+    fn the_after_fill_block_says_it_is_sent_automatically() {
         let lines = confirmation_lines(
             &AttachNote::Attach(attach_plan(AttachKind::AfterFill, false)),
             &[],
         );
-        assert_eq!(
-            lines[0].text,
-            "Planned after the entry fills (not sent by this build):"
-        );
-        assert!(
-            lines.iter().any(|l| l.warn
-                && l.text.contains(
-                    "This build does not send them yet: place the protective orders by hand \
-                     after the fill."
-                )),
-            "{lines:?}"
-        );
-        assert!(!lines.iter().any(|l| l.text.contains("Sent automatically")));
+        assert_eq!(lines[0].text, "Sent automatically after the entry fills:");
+        assert!(!lines.iter().any(|l| l.text.contains("not sent")));
+        assert!(!lines.iter().any(|l| l.text.contains("does not send")));
+        assert!(lines.iter().any(|l| l.text.contains("first fill")));
     }
 
     #[test]

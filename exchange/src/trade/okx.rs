@@ -298,8 +298,12 @@ pub fn place_order(i: OkxEntry<'_>) -> Result<OkxRequest, TradeError> {
     {
         return Err(TradeError::AttachOnlyOnOpen);
     }
+    // A limit entry fills at its own price, and the triggers sit relative to that fill: they are
+    // checked against the limit price (rounded as it is sent), not against a market that may be
+    // far away. A market entry fills near the last price.
+    let attach_base = limit_px.or(i.ref_price);
     let attach_algo_ords = match &i.attach {
-        Some(a) => vec![attach_algo(i.rules, &c, a, i.ref_price.as_ref())?],
+        Some(a) => vec![attach_algo(i.rules, &c, a, attach_base.as_ref())?],
         None => Vec::new(),
     };
 
@@ -775,6 +779,45 @@ mod tests {
             client_id: dup(&aid),
         });
         assert_eq!(place_order(&e).unwrap_err(), TradeError::TriggerOnWrongSide);
+    }
+
+    #[test]
+    fn a_limit_entry_checks_its_attached_triggers_against_the_limit_price() {
+        let t = okx_swap_table();
+        let r = t.lookup("BTC-USDT-SWAP").unwrap();
+        let (cid, aid) = (id("eAAAA"), id("aBBBB"));
+        // A buy limit far below the market (60000): the take-profit at 51000 is above the
+        // limit, which is what matters, although it is below the market.
+        let mut e = entry(
+            r,
+            swap(net(), Action::Open(Dir::Long)),
+            LIMIT_GTC("50000"),
+            &cid,
+        );
+        e.attach = Some(OkxAttach {
+            tp_trigger: Some(d("51000")),
+            sl_trigger: Some(d("49000")),
+            trigger_type: TriggerPxType::Mark,
+            client_id: dup(&aid),
+        });
+        assert!(place_order(&e).is_ok());
+        // Wrong side of the limit price: refused, whatever the market is.
+        e.attach = Some(OkxAttach {
+            tp_trigger: Some(d("49500")),
+            sl_trigger: None,
+            trigger_type: TriggerPxType::Mark,
+            client_id: dup(&aid),
+        });
+        assert_eq!(place_order(&e).unwrap_err(), TradeError::TriggerOnWrongSide);
+        // No market price is needed for a limit entry; a market entry still needs one.
+        e.ref_price = None;
+        e.attach = Some(OkxAttach {
+            tp_trigger: Some(d("51000")),
+            sl_trigger: None,
+            trigger_type: TriggerPxType::Mark,
+            client_id: dup(&aid),
+        });
+        assert!(place_order(&e).is_ok());
     }
 
     #[test]
