@@ -1,4 +1,6 @@
+pub mod account_panel;
 pub mod audio;
+pub mod bulk_confirm;
 pub mod exchange_accounts;
 pub mod indicator_editor;
 pub mod layout_manager;

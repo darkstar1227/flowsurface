@@ -285,6 +285,11 @@ impl ExchangeAccounts {
         }
     }
 
+    /// The account is being deleted: no order, cancel all or close all may start for it.
+    pub fn is_deleting(&self, id: uuid::Uuid) -> bool {
+        self.rows.iter().any(|r| r.meta.id == id && r.deleting)
+    }
+
     /// Non-secret account list for `saved-state.json`.
     pub fn persisted(&self) -> data::ExchangeAccounts {
         data::ExchangeAccounts {
@@ -472,11 +477,7 @@ impl ExchangeAccounts {
         if alias.is_empty() {
             return Err("Alias is required".into());
         }
-        if self
-            .rows
-            .iter()
-            .any(|r| r.meta.alias.eq_ignore_ascii_case(&alias))
-        {
+        if alias_taken(self.rows.iter().map(|r| r.meta.alias.as_str()), &alias) {
             return Err("An account with this alias already exists".into());
         }
         if key.is_empty() || secret.is_empty() {
@@ -966,8 +967,25 @@ fn verdict_view<'a>(env: AccountEnv, report: &'a CheckReport) -> Element<'a, Mes
     }
 }
 
+/// Whether `alias` is already used: trimmed and compared in lower case, so two accounts cannot
+/// be mistaken for each other in a confirmation (I3).
+pub(crate) fn alias_taken<'a>(mut existing: impl Iterator<Item = &'a str>, alias: &str) -> bool {
+    let want = alias.trim().to_lowercase();
+    existing.any(|a| a.trim().to_lowercase() == want)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_alias_is_taken_without_regard_to_case_or_edge_spaces() {
+        let existing = ["Main", "  Ünï  "];
+        assert!(super::alias_taken(existing.iter().copied(), "main"));
+        assert!(super::alias_taken(existing.iter().copied(), "  MAIN "));
+        assert!(super::alias_taken(existing.iter().copied(), "ünï"));
+        assert!(!super::alias_taken(existing.iter().copied(), "main2"));
+        assert!(!super::alias_taken(std::iter::empty(), "main"));
+    }
+
     use super::*;
 
     const FAKE_KEY: &str = "fake-key-AAAA1111";

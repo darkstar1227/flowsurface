@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod account_flow;
 mod audio;
 mod connector;
 mod layout;
@@ -99,6 +100,11 @@ struct Flowsurface {
     order_ticket: modal::order_ticket::OrderTicket,
     /// The confirmation window of one prepared order, while it is open.
     order_confirm: Option<modal::order_confirm::PendingConfirm>,
+    /// The account section of the ticket (unknown results, cancel all, close all).
+    account_panel: modal::account_panel::AccountPanel,
+    /// The confirmation of a cancel all, a close all or a lifted risk lock, while it is open.
+    /// Never open together with `order_confirm`: one confirmation at a time.
+    bulk_confirm: Option<modal::bulk_confirm::PendingBulk>,
     /// The request being sent, kept so an expired preview can be made again.
     order_requests: HashMap<(uuid::Uuid, String), order_flow::PrepareRequest>,
     network_config: data::Network,
@@ -186,6 +192,9 @@ enum Message {
     OrderTicket(modal::order_ticket::Message),
     OrderConfirm(modal::order_confirm::Message),
     OrderSent(order_flow::SendSummary),
+    AccountPanel(modal::account_panel::Message),
+    BulkConfirm(modal::bulk_confirm::Message),
+    Account(account_flow::Event),
     Trading(trading::Message),
     Layouts(modal::layout_manager::Message),
     SharedChartResources(manifest::Message),
@@ -226,14 +235,58 @@ impl Flowsurface {
     /// Drops the pending preview and the confirmation (the ticket was left, or Escape).
     fn discard_order(&mut self) {
         self.order_confirm = None;
+        self.bulk_confirm = None;
+        self.account_panel.reset_form();
+        self.account_panel.finish_bulk_prepare();
         self.order_requests.clear();
         // Makes any preview still on its way stale.
         self.order_ticket.finish_prepare();
     }
 
+    /// A confirmation window of either kind is open (one at a time).
+    fn confirm_open(&self) -> bool {
+        self.order_confirm.is_some() || self.bulk_confirm.is_some()
+    }
+
+    /// The saved account behind an exchange-layer key.
+    fn meta_of_key(
+        &self,
+        key: exchange::account::AccountKey,
+    ) -> Option<data::config::exchange_accounts::AccountMeta> {
+        self.exchange_accounts
+            .persisted()
+            .accounts
+            .into_iter()
+            .find(|m| trading::account_key(m.id) == key)
+    }
+
+    fn client_input(
+        &self,
+        meta: data::config::exchange_accounts::AccountMeta,
+    ) -> Result<account_flow::ClientInput, String> {
+        Ok(account_flow::ClientInput {
+            meta,
+            signed: self.signed_client_for_current_proxy()?,
+            proxy: self.trading.proxy_reader(),
+        })
+    }
+
+    fn reload_records() -> Task<Message> {
+        Task::perform(account_flow::load_records(), |r| {
+            Message::Account(account_flow::Event::RecordsLoaded(r))
+        })
+    }
+
     /// Checks the gate again and starts the background preview of a request.
     fn start_review(&mut self, request: order_flow::PrepareRequest) -> Task<Message> {
         use modal::order_ticket as ticket;
+        if self.trading.bulk_running(request.account) || self.account_panel.is_bulk_preparing() {
+            self.order_ticket.set_status(
+                "A cancel all or close all is being prepared or sent. Wait for it.".to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
         let accounts = self.exchange_accounts.persisted().accounts;
         let Some(meta) = accounts.iter().find(|m| m.id == request.account).cloned() else {
             self.order_ticket.set_status(
@@ -311,7 +364,7 @@ impl Flowsurface {
                 Ok(prepared) => {
                     // Never replace a confirmation that is open: the user may be about to
                     // press its Confirm (M2). The new preview is dropped.
-                    if self.order_confirm.is_some() {
+                    if self.confirm_open() {
                         self.order_ticket.set_status(
                             "Another order is waiting for confirmation. Review again after it."
                                 .to_string(),
@@ -326,6 +379,7 @@ impl Flowsurface {
                             self.order_confirm = Some(modal::order_confirm::PendingConfirm::new(
                                 self.main_window.id,
                                 meta,
+                                &accounts,
                                 *prepared,
                                 std::time::Instant::now(),
                             ));
@@ -340,7 +394,13 @@ impl Flowsurface {
             }
             return Task::none();
         }
-        match self.order_ticket.update(msg) {
+        let account_before = self.order_ticket.account();
+        let action = self.order_ticket.update(msg);
+        if self.order_ticket.account() != account_before {
+            // A form typed for the previous account never carries over to the new one.
+            self.account_panel.reset_form();
+        }
+        match action {
             Some(Action::Review(request)) => self.start_review(request),
             Some(Action::Exit) => {
                 self.discard_order();
@@ -363,6 +423,456 @@ impl Flowsurface {
         }
     }
 
+    fn update_account_panel(&mut self, msg: modal::account_panel::Message) -> Task<Message> {
+        use modal::account_panel::Action;
+        let accounts = self.exchange_accounts.persisted().accounts;
+        let meta = self
+            .order_ticket
+            .account()
+            .and_then(|id| accounts.iter().find(|m| m.id == id))
+            .cloned();
+        let ticket_deleting = meta
+            .as_ref()
+            .is_some_and(|m| self.exchange_accounts.is_deleting(m.id));
+        let action = self
+            .account_panel
+            .update(msg, &self.trading, meta.as_ref(), ticket_deleting);
+        let Some(action) = action else {
+            return Task::none();
+        };
+        // An account that is being deleted starts nothing (no Keychain read, no client). It is
+        // the account of the record that counts, not the one the ticket shows now (N4).
+        let record_account = match &action {
+            Action::BeginRelease(r) | Action::Release(_, r) | Action::Discard(_, r) => {
+                Some(r.account)
+            }
+            Action::Bulk(_) | Action::AckTrip => None,
+        };
+        if record_account
+            .and_then(|key| self.meta_of_key(key))
+            .is_some_and(|m| self.exchange_accounts.is_deleting(m.id))
+        {
+            self.account_panel.form_done();
+            self.account_panel.set_status(
+                "The account is being deleted.".to_string(),
+                BannerKind::Error,
+            );
+            return Task::none();
+        }
+        match action {
+            Action::Bulk(kind) => self.start_bulk(kind),
+            Action::AckTrip => self.start_ack_trip(),
+            Action::BeginRelease(record) => {
+                let Some(meta) = self.meta_of_key(record.account) else {
+                    self.account_panel.form_done();
+                    return Task::none();
+                };
+                match self.client_input(meta) {
+                    Ok(input) => {
+                        let shown = record.clone();
+                        Task::perform(account_flow::begin_release(input, *record), move |r| {
+                            Message::Account(account_flow::Event::ReleaseBegun(shown.clone(), r))
+                        })
+                    }
+                    Err(e) => {
+                        self.account_panel.form_done();
+                        self.account_panel.set_status(e, BannerKind::Error);
+                        Task::none()
+                    }
+                }
+            }
+            Action::Release(token, record) => {
+                let Some(meta) = self.meta_of_key(record.account) else {
+                    self.account_panel.form_done();
+                    return Task::none();
+                };
+                match self.client_input(meta) {
+                    Ok(input) => Task::perform(account_flow::release(input, token, *record), |s| {
+                        Message::Account(account_flow::Event::Released(Box::new(s)))
+                    }),
+                    Err(e) => {
+                        self.account_panel.form_done();
+                        self.account_panel.set_status(e, BannerKind::Error);
+                        Task::none()
+                    }
+                }
+            }
+            Action::Discard(token, record) => {
+                let Some(meta) = self.meta_of_key(record.account) else {
+                    self.account_panel.form_done();
+                    return Task::none();
+                };
+                Task::perform(account_flow::discard(token, meta, *record), |s| {
+                    Message::Account(account_flow::Event::Discarded(Box::new(s)))
+                })
+            }
+        }
+    }
+
+    /// Cancel all or close all: gate, then a fresh read for the confirmation window.
+    fn start_bulk(&mut self, action: exchange::trade::BulkAction) -> Task<Message> {
+        use modal::{account_panel as panel, order_ticket as ticket};
+        let accounts = self.exchange_accounts.persisted().accounts;
+        let Some(meta) = self
+            .order_ticket
+            .account()
+            .and_then(|id| accounts.iter().find(|m| m.id == id))
+            .cloned()
+        else {
+            self.account_panel
+                .set_status("Pick an account.".to_string(), BannerKind::Error);
+            return Task::none();
+        };
+        let signed = self.signed_client_for_current_proxy();
+        let gate = ticket::gate_for(
+            Some(&meta),
+            None,
+            "",
+            &self.trading,
+            &self.trade_session,
+            signed.is_ok(),
+            self.order_ticket.is_preparing() || self.account_panel.is_bulk_preparing(),
+        );
+        let why = panel::bulk_blocked_reason(
+            &gate,
+            self.exchange_accounts.is_deleting(meta.id),
+            self.trading.bulk_running(meta.id),
+            self.confirm_open(),
+        )
+        .or_else(|| {
+            (action == exchange::trade::BulkAction::Flatten
+                && !panel::flatten_offered(meta.venue, meta.product))
+            .then_some("Close all is not offered for a spot account.")
+        });
+        if let Some(why) = why {
+            self.account_panel
+                .set_status(why.to_string(), BannerKind::Error);
+            return Task::none();
+        }
+        let signed = match signed {
+            Ok(s) => s,
+            Err(e) => {
+                self.account_panel.set_status(e, BannerKind::Error);
+                return Task::none();
+            }
+        };
+        let nonce = self.account_panel.start_bulk();
+        let request = account_flow::BulkRequest {
+            account: meta.id,
+            action,
+        };
+        let input = account_flow::BulkPrepareInput {
+            client: account_flow::ClientInput {
+                meta,
+                signed,
+                proxy: self.trading.proxy_reader(),
+            },
+            request,
+        };
+        Task::perform(account_flow::prepare_bulk(input), move |r| {
+            Message::Account(account_flow::Event::BulkPrepared(nonce, r.map(Box::new)))
+        })
+    }
+
+    /// Lifting a risk lock needs its own confirmation step.
+    fn start_ack_trip(&mut self) -> Task<Message> {
+        let accounts = self.exchange_accounts.persisted().accounts;
+        let Some(meta) = self
+            .order_ticket
+            .account()
+            .and_then(|id| accounts.iter().find(|m| m.id == id))
+        else {
+            return Task::none();
+        };
+        if self.confirm_open() {
+            self.account_panel.set_status(
+                "Another confirmation is open. Finish or cancel it first.".to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
+        let Some(reason) = self.trading.trip_reason(meta.id) else {
+            self.account_panel.set_status(
+                "The account has no risk lock.".to_string(),
+                BannerKind::Normal,
+            );
+            return Task::none();
+        };
+        let lines = vec![
+            format!("The risk lock is on: {reason}."),
+            "Lifting it allows new entries again for this account. Nothing is sent.".to_string(),
+        ];
+        self.bulk_confirm = Some(modal::bulk_confirm::PendingBulk::new(
+            self.main_window.id,
+            modal::bulk_confirm::Kind::AckTrip,
+            meta,
+            &accounts,
+            lines,
+            true,
+            std::time::Instant::now(),
+        ));
+        Task::none()
+    }
+
+    fn update_bulk_confirm(&mut self, msg: modal::bulk_confirm::Message) -> Task<Message> {
+        use modal::bulk_confirm::Message as B;
+        match msg {
+            B::Cancel => {
+                self.bulk_confirm = None;
+                Task::none()
+            }
+            B::Confirm => self.confirm_bulk(),
+        }
+    }
+
+    /// The one click of a bulk confirmation: the account is the one stored when the window
+    /// opened, the gate is checked once more, and the token comes out of the window (once).
+    fn confirm_bulk(&mut self) -> Task<Message> {
+        use modal::{account_panel as panel, bulk_confirm::Confirmed, order_ticket as ticket};
+        let Some(conf) = self.bulk_confirm.as_ref() else {
+            return Task::none();
+        };
+        let (id, kind) = (conf.account, conf.kind());
+        let accounts = self.exchange_accounts.persisted().accounts;
+        let meta = accounts.iter().find(|m| m.id == id).cloned();
+        let signed = self.signed_client_for_current_proxy();
+        if let modal::bulk_confirm::Kind::Bulk(_) = kind {
+            let gate = ticket::gate_for(
+                meta.as_ref(),
+                None,
+                "",
+                &self.trading,
+                &self.trade_session,
+                signed.is_ok(),
+                false,
+            );
+            let risk_missing = self.trading.risk_for(id).is_none();
+            let why = panel::bulk_blocked_reason(
+                &gate,
+                self.exchange_accounts.is_deleting(id),
+                self.trading.bulk_running(id),
+                false,
+            )
+            .or_else(|| {
+                risk_missing.then_some(
+                    "The account has no running trading state. Test it again in Exchange \
+                     accounts.",
+                )
+            });
+            if let Some(why) = why {
+                self.bulk_confirm = None;
+                self.account_panel
+                    .set_status(why.to_string(), BannerKind::Error);
+                return Task::none();
+            }
+        }
+        // Once: the window closes with the token, so a second click finds none.
+        let Some(confirmed) =
+            modal::bulk_confirm::take_confirmed(&mut self.bulk_confirm, std::time::Instant::now())
+        else {
+            return Task::none();
+        };
+        match confirmed {
+            Confirmed::AckTrip => {
+                // Only a local change, but not while the account is deleted or a bulk runs.
+                if self.exchange_accounts.is_deleting(id) || self.trading.bulk_running(id) {
+                    self.account_panel.set_status(
+                        "The risk lock was not lifted: the account is being deleted or a cancel \
+                         all or close all is running."
+                            .to_string(),
+                        BannerKind::Error,
+                    );
+                    return Task::none();
+                }
+                let (text, kind) = if self.trading.acknowledge_trip(id) {
+                    ("The risk lock was lifted.", BannerKind::Normal)
+                } else {
+                    (
+                        "The risk lock could not be lifted (the risk state is unavailable).",
+                        BannerKind::Error,
+                    )
+                };
+                self.account_panel.set_status(text.to_string(), kind);
+                Task::none()
+            }
+            Confirmed::Bulk(token) => {
+                let (Some(meta), Ok(signed), Some(risk), modal::bulk_confirm::Kind::Bulk(action)) =
+                    (meta, signed, self.trading.risk_for(id), kind)
+                else {
+                    return Task::none();
+                };
+                self.trading.begin_bulk(id);
+                self.account_panel
+                    .set_status("Sending…".to_string(), BannerKind::Normal);
+                let input = account_flow::BulkSendInput {
+                    session: self.trade_session.get(meta.id).cloned(),
+                    client: account_flow::ClientInput {
+                        meta,
+                        signed,
+                        proxy: self.trading.proxy_reader(),
+                    },
+                    risk,
+                    token,
+                    request: account_flow::BulkRequest {
+                        account: id,
+                        action,
+                    },
+                };
+                Task::perform(account_flow::send_bulk(input), |s| {
+                    Message::Account(account_flow::Event::BulkDone(Box::new(s)))
+                })
+            }
+        }
+    }
+
+    fn say(&mut self, text: String, kind: BannerKind) {
+        // With the ticket closed nobody sees the panel: say it in a toast as well.
+        if self.sidebar.active_menu() != Some(sidebar::Menu::OrderTicket) {
+            self.notifications.push(match kind {
+                BannerKind::Normal => Toast::info(text.clone()),
+                BannerKind::Warning => Toast::warn(text.clone()),
+                BannerKind::Error => Toast::error(text.clone()),
+            });
+        }
+        self.account_panel.set_status(text, kind);
+    }
+
+    fn on_account_event(&mut self, event: account_flow::Event) -> Task<Message> {
+        use account_flow::Event as E;
+        match event {
+            E::BulkPrepared(nonce, result) => {
+                // An answer for a request that was replaced or discarded is dropped.
+                if !self.account_panel.is_bulk_current(nonce) {
+                    return Task::none();
+                }
+                self.account_panel.finish_bulk_prepare();
+                match result {
+                    Err(e) => self.account_panel.set_status(e, BannerKind::Error),
+                    Ok(preview) => {
+                        // Never replace a confirmation that is open (M2).
+                        if self.confirm_open() {
+                            self.account_panel.set_status(
+                                "Another confirmation is open. This one was dropped; start it \
+                                 again afterwards."
+                                    .to_string(),
+                                BannerKind::Warning,
+                            );
+                            return Task::none();
+                        }
+                        let accounts = self.exchange_accounts.persisted().accounts;
+                        match accounts.iter().find(|m| m.id == preview.request.account) {
+                            Some(meta) => {
+                                self.bulk_confirm = Some(modal::bulk_confirm::PendingBulk::new(
+                                    self.main_window.id,
+                                    modal::bulk_confirm::Kind::Bulk(preview.request.action),
+                                    meta,
+                                    &accounts,
+                                    preview.lines(),
+                                    !preview.nothing_to_do(),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                            None => self.account_panel.set_status(
+                                "The account no longer exists.".to_string(),
+                                BannerKind::Error,
+                            ),
+                        }
+                    }
+                }
+                Task::none()
+            }
+            E::BulkDone(summary) => {
+                let account_flow::BulkSummary { request, outcome } = *summary;
+                self.trading.finish_bulk(request.account);
+                if let account_flow::BulkOutcome::Done(n) = &outcome {
+                    if n.journal_failed {
+                        self.trading.set_journal_failed();
+                    }
+                    for symbol in &n.unresolved {
+                        self.trading.finish_send(request.account, symbol, true);
+                    }
+                }
+                let (lines, kind) = account_flow::describe_bulk(request.action, &outcome);
+                self.say(lines.join(" "), kind);
+                Self::reload_records()
+            }
+            E::RecordsLoaded(result) => {
+                match result {
+                    Ok(records) => self.account_panel.set_records(records),
+                    Err(e) => self.account_panel.set_status(
+                        format!("The saved unknown results could not be read: {e}."),
+                        BannerKind::Error,
+                    ),
+                }
+                Task::none()
+            }
+            E::ReleaseBegun(record, result) => {
+                self.account_panel.release_begun(&record, result);
+                Task::none()
+            }
+            E::Released(summary) => {
+                self.account_panel.form_done();
+                let (text, kind) = account_flow::describe_release(&summary);
+                if let account_flow::ReleaseResult::Released { .. } = summary.result
+                    && let Some(meta) = self.meta_of_key(summary.record.account)
+                {
+                    let still_stored = summary.remaining.as_ref().is_none_or(|rs| {
+                        rs.iter().any(|r| {
+                            r.account == summary.record.account && r.symbol == summary.record.symbol
+                        })
+                    });
+                    self.trading.record_released(
+                        meta.id,
+                        &summary.record.symbol,
+                        &summary.record.client_id,
+                        still_stored,
+                    );
+                }
+                self.say(text, kind);
+                match summary.remaining {
+                    Some(records) => {
+                        self.account_panel.set_records(records);
+                        Task::none()
+                    }
+                    None => Self::reload_records(),
+                }
+            }
+            E::Discarded(summary) => {
+                self.account_panel.form_done();
+                let (text, kind) = account_flow::describe_discard(&summary.result);
+                if summary.result.is_ok()
+                    && let Some(meta) = self.meta_of_key(summary.record.account)
+                {
+                    // The account stays blocked until restart: only the list entry changes.
+                    self.trading
+                        .record_discarded(meta.id, &summary.record.client_id);
+                }
+                self.say(text, kind);
+                match summary.remaining {
+                    Some(records) => {
+                        self.account_panel.set_records(records);
+                        Task::none()
+                    }
+                    None => Self::reload_records(),
+                }
+            }
+            E::Looked(summary) => {
+                for (record, end) in &summary.ends {
+                    self.trading.lookup_finished(record, *end);
+                    let (text, kind) = account_flow::describe_lookup(&record.symbol, *end);
+                    self.say(text, kind);
+                }
+                match summary.remaining {
+                    Some(records) => {
+                        self.account_panel.set_records(records);
+                        Task::none()
+                    }
+                    None => Self::reload_records(),
+                }
+            }
+        }
+    }
+
     /// The one click that sends: checks the gate once more, takes the intent out of the
     /// confirmation (once) and starts the send in the background.
     fn confirm_order(&mut self) -> Task<Message> {
@@ -371,6 +881,16 @@ impl Flowsurface {
             return Task::none();
         };
         let request = conf.request.clone();
+        if self.trading.bulk_running(request.account) {
+            self.order_confirm = None;
+            self.order_ticket.set_status(
+                "A cancel all or close all of this account is running. Review the order again \
+                 after it."
+                    .to_string(),
+                BannerKind::Warning,
+            );
+            return Task::none();
+        }
         let accounts = self.exchange_accounts.persisted().accounts;
         let meta = accounts.iter().find(|m| m.id == request.account).cloned();
         let signed = self.signed_client_for_current_proxy();
@@ -444,10 +964,7 @@ impl Flowsurface {
             // Not a failure: the data aged between the preview and the click. A new preview
             // is made only when nothing else is open or being prepared; it would replace or
             // outdate that other order (M2). Otherwise the user is told to review again.
-            if order_flow::may_review_again(
-                self.order_confirm.is_some(),
-                self.order_ticket.is_preparing(),
-            ) {
+            if order_flow::may_review_again(self.confirm_open(), self.order_ticket.is_preparing()) {
                 let task = self.start_review(request);
                 if self.order_ticket.is_preparing() {
                     self.order_ticket.set_status(
@@ -480,6 +997,10 @@ impl Flowsurface {
             });
         }
         self.order_ticket.show_result(&summary, line);
+        // An unknown result was saved: the unknown list is read again.
+        if summary.pair_after().is_some() {
+            return Self::reload_records();
+        }
         Task::none()
     }
 
@@ -539,6 +1060,8 @@ impl Flowsurface {
             ),
             order_ticket: modal::order_ticket::OrderTicket::default(),
             order_confirm: None,
+            account_panel: modal::account_panel::AccountPanel::default(),
+            bulk_confirm: None,
             order_requests: HashMap::new(),
             antialiasing: saved_state.antialiasing,
             applied_antialiasing: saved_state.antialiasing,
@@ -703,8 +1226,9 @@ impl Flowsurface {
                 }
 
                 // Escape closes the confirmation first, and never confirms.
-                if self.order_confirm.is_some() {
+                if self.confirm_open() {
                     self.order_confirm = None;
+                    self.bulk_confirm = None;
                     return Task::none();
                 }
 
@@ -1158,6 +1682,22 @@ impl Flowsurface {
                         };
                         // A usable account gets a new stream (a re-test brings an AuthFailed
                         // account back); anything else closes its stream.
+                        // Saved unresolved sends of this account are looked up now (not before:
+                        // until the account is tested this session they only say "pending").
+                        if usable && let Ok(signed) = signed.clone() {
+                            let records = self.trading.begin_lookup(meta.id);
+                            if !records.is_empty() {
+                                let input = account_flow::ClientInput {
+                                    meta: (*meta).clone(),
+                                    signed,
+                                    proxy: self.trading.proxy_reader(),
+                                };
+                                extra.push(Task::perform(
+                                    account_flow::look_up(input, records),
+                                    |s| Message::Account(account_flow::Event::Looked(Box::new(s))),
+                                ));
+                            }
+                        }
                         extra.push(
                             self.trading
                                 .on_tested(&meta, usable, signed)
@@ -1223,6 +1763,9 @@ impl Flowsurface {
             Message::OrderTicket(msg) => return self.update_order_ticket(msg),
             Message::OrderConfirm(msg) => return self.update_order_confirm(msg),
             Message::OrderSent(summary) => return self.on_order_sent(summary),
+            Message::AccountPanel(msg) => return self.update_account_panel(msg),
+            Message::BulkConfirm(msg) => return self.update_bulk_confirm(msg),
+            Message::Account(event) => return self.on_account_event(event),
             Message::Trading(msg) => {
                 let (task, effects) = self
                     .trading
@@ -1265,6 +1808,11 @@ impl Flowsurface {
                         sidebar::Menu::IndicatorEditor,
                     ))) => {
                         self.indicator_editor.refresh();
+                    }
+                    Some(screen::sidebar::Action::MenuChanged(Some(
+                        sidebar::Menu::OrderTicket,
+                    ))) => {
+                        return Task::batch([task.map(Message::Sidebar), Self::reload_records()]);
                     }
                     Some(screen::sidebar::Action::MenuChanged(_)) => {}
                     Some(screen::sidebar::Action::TickerSelected(ticker_info, content)) => {
@@ -1435,7 +1983,8 @@ impl Flowsurface {
     /// The alerts that must stay on screen, above the content of every window (the main window
     /// and each popout; a toast fades, these do not).
     fn with_standing_alerts<'a>(&'a self, content: Element<'a, Message>) -> Element<'a, Message> {
-        let alerts = trading::standing_alerts(&self.trading, &self.trade_session);
+        let saved = self.exchange_accounts.persisted().accounts;
+        let alerts = trading::standing_alerts(&self.trading, &self.trade_session, &saved);
         match trading::alerts_view(alerts) {
             Some(banners) => column![banners, content].into(),
             None => content,
@@ -1449,12 +1998,15 @@ impl Flowsurface {
         id: window::Id,
         content: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let Some(confirm) = self.order_confirm.as_ref().filter(|c| c.window == id) else {
-            return content;
-        };
-        let dialog = confirm
-            .view(std::time::Instant::now())
-            .map(Message::OrderConfirm);
+        let now = std::time::Instant::now();
+        let dialog: Element<'a, Message> =
+            if let Some(confirm) = self.order_confirm.as_ref().filter(|c| c.window == id) {
+                confirm.view(now).map(Message::OrderConfirm)
+            } else if let Some(bulk) = self.bulk_confirm.as_ref().filter(|c| c.window == id) {
+                bulk.view(now).map(Message::BulkConfirm)
+            } else {
+                return content;
+            };
         iced::widget::stack![
             content,
             iced::widget::opaque(iced::widget::mouse_area(
@@ -1598,10 +2150,9 @@ impl Flowsurface {
         };
 
         // Redraws a LIVE confirmation so its button turns on after the delay.
-        let confirm_delay = if self
-            .order_confirm
-            .as_ref()
-            .is_some_and(|c| c.waiting(std::time::Instant::now()))
+        let now = std::time::Instant::now();
+        let confirm_delay = if self.order_confirm.as_ref().is_some_and(|c| c.waiting(now))
+            || self.bulk_confirm.as_ref().is_some_and(|c| c.waiting(now))
         {
             iced::time::every(std::time::Duration::from_millis(100))
                 .map(|_| Message::OrderConfirm(modal::order_confirm::Message::DelayElapsed))
@@ -1650,7 +2201,7 @@ impl Flowsurface {
         use modal::layout_manager::Message as Layouts;
 
         // While a confirmation is open only Escape (which cancels it) does anything.
-        if self.order_confirm.is_some() {
+        if self.confirm_open() {
             return match hotkey {
                 Hotkey::Escape => Task::done(Message::GoBack),
                 _ => Task::none(),
@@ -2547,11 +3098,51 @@ impl Flowsurface {
 
                 let accounts = self.exchange_accounts.persisted().accounts;
                 let signed_ok = self.proxy_snapshot_ok().is_ok();
+                let ticket = self
+                    .order_ticket
+                    .view(&accounts, &self.trading, &self.trade_session, signed_ok)
+                    .map(Message::OrderTicket);
+                let picked = self
+                    .order_ticket
+                    .account()
+                    .and_then(|id| accounts.iter().find(|m| m.id == id));
+                let content: Element<'_, Message> = match picked {
+                    Some(meta) => {
+                        let gate = modal::order_ticket::gate_for(
+                            Some(meta),
+                            None,
+                            "",
+                            &self.trading,
+                            &self.trade_session,
+                            signed_ok,
+                            self.order_ticket.is_preparing()
+                                || self.account_panel.is_bulk_preparing(),
+                        );
+                        let blocked = modal::account_panel::bulk_blocked_reason(
+                            &gate,
+                            self.exchange_accounts.is_deleting(meta.id),
+                            self.trading.bulk_running(meta.id),
+                            self.confirm_open(),
+                        );
+                        let panel = self
+                            .account_panel
+                            .view(meta, &accounts, &self.trading, blocked)
+                            .map(Message::AccountPanel);
+                        column![
+                            ticket,
+                            container(panel)
+                                .max_width(360)
+                                .padding(24)
+                                .style(style::dashboard_modal)
+                        ]
+                        .spacing(4)
+                        .into()
+                    }
+                    None => ticket,
+                };
                 dashboard_modal(
                     base,
-                    self.order_ticket
-                        .view(&accounts, &self.trading, &self.trade_session, signed_ok)
-                        .map(Message::OrderTicket),
+                    content,
                     Message::Sidebar(screen::sidebar::Message::ToggleSidebarMenu(None)),
                     padding,
                     Alignment::End,

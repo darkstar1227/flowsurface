@@ -72,14 +72,21 @@ pub fn account_of<'a>(
     accounts.iter().find(|m| m.id == request.account)
 }
 
-/// Alias, venue, product and environment, as the confirmation names the account.
-pub fn account_label(m: &AccountMeta) -> String {
+/// Alias, venue, product and environment, as the confirmation names the account. `saved` is
+/// the saved account list: an alias that two accounts share also gets its venue and the end of
+/// its id (I3), so they cannot be mistaken for each other.
+pub fn account_label(m: &AccountMeta, saved: &[AccountMeta]) -> String {
     let env = if crate::order_flow::env_is_live(m.env) {
         "LIVE"
     } else {
         "TESTNET"
     };
-    format!("{} · {} {} · {env}", m.alias, m.venue, m.product)
+    format!(
+        "{} · {} {} · {env}",
+        crate::trading::display_name(saved, m),
+        m.venue,
+        m.product
+    )
 }
 
 /// What the order does to the exposure, in words. `None` for a cancel or a read.
@@ -106,10 +113,12 @@ pub struct PendingConfirm {
 }
 
 impl PendingConfirm {
-    /// `meta` is the account of `prepared.request` (see `account_of`).
+    /// `meta` is the account of `prepared.request` (see `account_of`); `saved` is the whole
+    /// saved list.
     pub fn new(
         window: iced::window::Id,
         meta: &AccountMeta,
+        saved: &[AccountMeta],
         prepared: Prepared,
         now: Instant,
     ) -> Self {
@@ -117,7 +126,7 @@ impl PendingConfirm {
         Self {
             window,
             request: prepared.request,
-            account_label: account_label(meta),
+            account_label: account_label(meta, saved),
             live,
             preview: prepared.preview,
             slot: prepared.slot,
@@ -277,21 +286,30 @@ mod tests {
     #[test]
     fn the_confirmation_and_the_ticket_have_no_keyboard_path() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modal");
-        for name in ["order_confirm.rs", "order_ticket.rs"] {
+        for name in [
+            "order_confirm.rs",
+            "order_ticket.rs",
+            "bulk_confirm.rs",
+            "account_panel.rs",
+        ] {
             let text = std::fs::read_to_string(dir.join(name)).unwrap();
             let code = text.split("#[cfg(test)]").next().unwrap_or_default();
             for banned in ["on_submit", "keyboard::", "text_input("] {
-                if name == "order_ticket.rs" && banned == "text_input(" {
-                    continue; // the ticket has the number fields, but never submits by key
+                if (name == "order_ticket.rs" || name == "account_panel.rs")
+                    && banned == "text_input("
+                {
+                    continue; // number fields and the typed phrase; nothing submits by key
                 }
                 assert!(!code.contains(banned), "{name} contains {banned}");
             }
         }
     }
 
-    /// The token is made from the stored preview, here only (condition 70).
+    /// The tokens are made from what the confirmation stored, in the confirmation files only
+    /// (condition 70): an order token from the stored preview, a bulk token from the stored
+    /// account and action. The unbound ways of making a request are not used anywhere.
     #[test]
-    fn the_token_comes_from_the_stored_preview_in_this_file_only() {
+    fn the_tokens_come_from_the_stored_values_in_the_confirmation_files_only() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![src];
         while let Some(dir) = stack.pop() {
@@ -312,6 +330,41 @@ mod tests {
                         "{}: {line}",
                         p.display()
                     );
+                }
+                for line in code.lines().filter(|l| l.contains("for_bulk(")) {
+                    assert!(
+                        p.ends_with("bulk_confirm.rs")
+                            && line.contains("for_bulk(self.account_key,"),
+                        "{}: {line}",
+                        p.display()
+                    );
+                }
+                // The plain discard (no audit line) and the unlogged async one are not used.
+                for banned in ["discard_invalid(", "discard_invalid_async("] {
+                    assert!(!code.contains(banned), "{} contains {banned}", p.display());
+                }
+                // The bulk and unknown calls live in `account_flow.rs` only.
+                let flatten_with_args =
+                    code.matches(".flatten(").count() - code.matches(".flatten()").count();
+                let calls = [
+                    code.matches(".cancel_all(").count(),
+                    flatten_with_args,
+                    code.matches(".resolve_unknown(").count(),
+                    code.matches(".release_unknown_manually(").count(),
+                    code.matches(".discard_invalid_logged_async(").count(),
+                    code.matches(".begin_manual_release_of_record(").count(),
+                ];
+                if !p.ends_with("account_flow.rs") && !p.ends_with("order_flow.rs") {
+                    assert_eq!(
+                        calls,
+                        [0; 6],
+                        "{} makes a bulk or unknown call",
+                        p.display()
+                    );
+                }
+                if p.ends_with("order_flow.rs") {
+                    // Only the lookup after an unknown manual send.
+                    assert_eq!(calls[0] + calls[1] + calls[3] + calls[4] + calls[5], 0);
                 }
             }
         }
@@ -345,7 +398,7 @@ mod tests {
         };
         let found = account_of(&accounts, &request).unwrap();
         assert_eq!(found.id, a.id);
-        let label = account_label(found);
+        let label = account_label(found, &accounts);
         assert!(
             label.contains("alpha") && label.contains("TESTNET"),
             "{label}"
@@ -354,7 +407,7 @@ mod tests {
             !label.contains("bravo") && !label.contains("LIVE"),
             "{label}"
         );
-        assert!(account_label(&b).contains("LIVE"));
+        assert!(account_label(&b, &accounts).contains("LIVE"));
         // An account that is gone gives no confirmation at all.
         let gone = PrepareRequest {
             account: uuid::Uuid::from_u128(9),
