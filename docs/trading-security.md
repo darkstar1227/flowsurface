@@ -813,3 +813,28 @@ d 段最後一段。沒有新的送單路徑、沒有新的權杖來源，`LIVE_
 - 送單點未增加：`.submit(` 仍只在 `order_flow.rs`，`submit_auto(`／`AutoIntent::new(` 仍只在 `auto_flow.rs`。
 - 條件 51 仍只擋進場；拖曳改單的「非 Connected 禁止」判定留給 f3（含 EX 端旗標）。
 - 兩處 `#[expect(dead_code)]`（解析函式與其訊息文字）只在非測試建置生效，f1 開始使用時編譯器會要求移除。
+
+## M5 f1：DOM 點價下單
+
+不新增送單點：`.submit(` 仍只在 `order_flow.rs`，`submit_auto(`／`AutoIntent::new(` 仍只在 `auto_flow.rs`，`LIVE_SENDING_ENABLED` 仍為 false，`exchange/` 沒有改動，`saved-state.json` 沒有新欄位。
+
+### 條件 80 已實作的部分
+
+- **只有 Cmd（macOS）／Ctrl＋左鍵會發起下單。** `ladder.rs` 的 `press_message` 是純函式：修飾鍵＋左鍵落在有價格的列才產生 `Message::PriceClicked`；其他按下（單擊、Shift、右鍵、中鍵）一律維持既有的 `ResetScroll`；修飾鍵＋左鍵落在沒有價格的列（idx 0 的價差列）什麼都不做。修飾鍵判定與 kline 共用 `widget::is_command_modifier`。單擊永不下單。
+- **列座標 → 價格**是純函式 `row_at(y, scroll, height, grid)`（含捲動、idx 0 無價、最佳價移動），價格轉成精確的 `Decimal`（`order_flow::price_to_decimal`，不經浮點）。
+- **取整在交易所 builder，不在 GUI。** 限價價格由 `exchange/src/trade/{binance_futures,binance_spot,okx}.rs` 的 builder 以 `round_limit_price(side, …)` 取整（買向下、賣向上，用交易所 tick，不是 `PriceStep` 顯示分組）。確認視窗與偏離檢查看到的是 builder 預覽裡取整後的價。GUI 不再取整，避免重複或遺漏。
+- **數量**取票據目前的數量（`OrderTicket::quantity`），沒有就拒絕並用 toast 說明；不存在 pane。
+- **帳戶**用 `resolve_pane_account`（票據帳戶符合就用，否則只有一個符合才用，多個就拒絕），拒絕原因以 toast 顯示。ladder 標題列顯示解析到的帳戶名與 TESTNET／LIVE，或原因的簡短字樣（`TradeOverlay::account_tag_of`）。
+- **會立即成交**：`Notes.takes_liquidity`（買價 ≥ 現價、賣價 ≤ 現價，現價為 ticker 表的 mark price）時，確認視窗顯示 "Takes liquidity"；既有 5% 偏離檢查照舊。
+- **條件 51** 照舊由 `blocked_reason` 擋進場，點價走同一個 `start_review`，拒絕以 toast 顯示。
+- **視窗關閉**：app 處理 `window::Event::Closed`（`window.rs` 映射，`main.rs` 呼叫 `forget_window`），所以不論哪條路徑關閉非主視窗（使用者關閉、detached layout、切換 layout 時關 popout、`merge_pane` 合併 popout）視窗消失後都會移除 scale factor 並清掉開在該視窗的確認（同 Escape 的 `discard_order`）；`forget_window` 可重複呼叫。`Action::Select` 在關 popout 前另外只清開在這些 popout 的確認（`confirm_lost_with_any`），不提早移除 scale factor。預覽完成時若發起視窗已不在，確認退回主視窗（`live_origin`），`RulesExpired` 重送亦同。`discard_order` 只移除該確認那一筆 `order_requests`（`forget_request`），不影響其他在途的送單。
+- **雙擊保護（S0）**：pane 點價開出的確認（`OrderSource::Dom`）在 testnet 也等 `DOM_DELAY`（400 ms）才接受 Confirm，LIVE 取 700 ms 與 400 ms 較大者（700 ms）。來源在 `RulesExpired` 重送時保留。
+- **深度檢查（S1）**：ladder 沒有任何深度（bid 與 ask 最佳價都不存在）、只有單邊，或深度超過 `DEPTH_MAX_AGE`（5 秒）沒更新時，Cmd＋點不產生請求（靜默不動作，沒有 toast）。沒有 mark 價時確認視窗的 "No market price…" 以警告樣式顯示。
+- **拒絕與提示（S2、S3）**：有確認開在別處時，新預覽被丟棄改走 `review_refused`（票據關著時為 toast）；點價取代票據正在準備的預覽時 toast 提示。
+- **確認視窗來源（L3）**：點價開出的確認多一行 "From the order book (DOM)"；帳戶名稱與 TESTNET／LIVE 沿用確認視窗既有的標題與帳戶行。
+
+### 尚未做（留給後續段）
+
+- 點價列的暫時高亮（沒做，成本不低：ladder 的畫面是快取的，要另加一層）。
+- 不做市價與觸價單；不做 kline 上的點價。
+- f3 的拖曳改單與 EX 的 `ReplaceProtective` 不在本段。

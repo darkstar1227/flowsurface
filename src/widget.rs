@@ -98,6 +98,13 @@ pub fn tooltip_with_delay<'a, Message: 'a>(
     }
 }
 
+/// The key that arms a click that does something more than look (Cmd on macOS, Ctrl elsewhere).
+/// The chart and the ladder share it, so the same key means the same thing in both and never
+/// clashes with Shift (the measuring tool).
+pub fn is_command_modifier(modifiers: iced::keyboard::Modifiers) -> bool {
+    modifiers.intersects(iced::keyboard::Modifiers::COMMAND)
+}
+
 pub mod text {
     use iced::{Renderer, Theme};
 

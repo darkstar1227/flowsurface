@@ -6,7 +6,7 @@
 //! `main`). The token is made from the stored preview, never from a fresh one.
 
 use crate::{
-    order_flow::{Deviation, IntentSlot, Notes, PrepareRequest, Prepared},
+    order_flow::{Deviation, IntentSlot, Notes, OrderSource, PrepareRequest, Prepared},
     protect_attach::{AttachNote, AttachPlan, confirmation_lines},
     style,
 };
@@ -21,6 +21,12 @@ use std::time::{Duration, Instant};
 /// How long a LIVE confirmation ignores clicks after it opens.
 pub const LIVE_DELAY: Duration = Duration::from_millis(700);
 
+/// How long a confirmation that a click in the order book opened ignores clicks, testnet too.
+/// A double click on a price row can put its second click on the Confirm button once the
+/// review is ready (a review takes about as long as a double click does); this is longer than
+/// a double click interval and shorter than a deliberate second look.
+pub const DOM_DELAY: Duration = Duration::from_millis(400);
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Confirm,
@@ -32,22 +38,30 @@ pub enum Message {
 /// The click rules, without the intent: single use and the LIVE delay. The clock is passed in.
 #[derive(Debug, Clone)]
 pub struct ConfirmGuard {
-    live: bool,
+    /// How long clicks are ignored after opening: the larger of the LIVE and the order book
+    /// delays that apply.
+    delay: Duration,
     opened_at: Instant,
     used: bool,
 }
 
 impl ConfirmGuard {
-    pub fn new(live: bool, now: Instant) -> Self {
+    pub fn new(live: bool, source: OrderSource, now: Instant) -> Self {
+        let live_delay = if live { LIVE_DELAY } else { Duration::ZERO };
+        let dom_delay = if source == OrderSource::Dom {
+            DOM_DELAY
+        } else {
+            Duration::ZERO
+        };
         Self {
-            live,
+            delay: live_delay.max(dom_delay),
             opened_at: now,
             used: false,
         }
     }
 
     pub fn ready(&self, now: Instant) -> bool {
-        !self.used && (!self.live || now.saturating_duration_since(self.opened_at) >= LIVE_DELAY)
+        !self.used && now.saturating_duration_since(self.opened_at) >= self.delay
     }
 
     /// `true` once: a second click, or a click inside the LIVE delay, is nothing.
@@ -60,7 +74,7 @@ impl ConfirmGuard {
     }
 
     pub fn waiting(&self, now: Instant) -> bool {
-        self.live && !self.used && !self.ready(now)
+        !self.used && !self.ready(now)
     }
 }
 
@@ -88,6 +102,14 @@ pub fn account_label(m: &AccountMeta, saved: &[AccountMeta]) -> String {
         m.venue,
         m.product
     )
+}
+
+/// Where the order came from, when it is not the ticket the user filled in.
+pub fn source_line(source: OrderSource) -> Option<&'static str> {
+    match source {
+        OrderSource::Dom => Some("From the order book (DOM)"),
+        OrderSource::Ticket => None,
+    }
 }
 
 /// What the order does to the exposure, in words. `None` for a cancel or a read.
@@ -123,6 +145,7 @@ pub struct PendingConfirm {
     pub request: PrepareRequest,
     account_label: String,
     live: bool,
+    pub source: OrderSource,
     preview: OrderPreview,
     slot: IntentSlot,
     notes: Notes,
@@ -145,10 +168,11 @@ impl PendingConfirm {
             request: prepared.request,
             account_label: account_label(meta, saved),
             live,
+            source: prepared.source,
             preview: prepared.preview,
             slot: prepared.slot,
             notes: prepared.notes,
-            guard: ConfirmGuard::new(live, now),
+            guard: ConfirmGuard::new(live, prepared.source, now),
         }
     }
 
@@ -210,6 +234,9 @@ impl PendingConfirm {
         ]
         .spacing(10);
 
+        if let Some(line) = source_line(self.source) {
+            content = content.push(text(line).size(style::text_size::SMALL));
+        }
         if let Some(line) = exposure_line(&self.preview.exposure) {
             content = content.push(text(line).size(style::text_size::SMALL));
         }
@@ -218,6 +245,11 @@ impl PendingConfirm {
         }
         if let Some(line) = trigger_basis_line(&self.request.spec) {
             content = content.push(text(line).size(style::text_size::SMALL));
+        }
+        if self.notes.takes_liquidity {
+            content = content.push(warn(
+                "Takes liquidity: this limit price fills at once against the market.".to_string(),
+            ));
         }
         match self.notes.deviation {
             Deviation::Exceeds => {
@@ -231,10 +263,9 @@ impl PendingConfirm {
                 )));
             }
             Deviation::NoReference => {
-                content = content.push(
-                    text("No market price was available to compare the limit price with.")
-                        .size(style::text_size::SMALL),
-                );
+                content = content.push(warn(
+                    "No market price was available to compare the limit price with.".to_string(),
+                ));
             }
             Deviation::Within | Deviation::NotApplicable => {}
         }
@@ -304,15 +335,38 @@ mod tests {
     #[test]
     fn live_waits_out_the_delay_and_testnet_does_not() {
         let start = t0();
-        let mut live = ConfirmGuard::new(true, start);
+        let mut live = ConfirmGuard::new(true, OrderSource::Ticket, start);
         assert!(live.waiting(start));
         assert!(!live.try_confirm(start));
         assert!(!live.try_confirm(start + LIVE_DELAY - Duration::from_millis(1)));
         assert!(live.try_confirm(start + LIVE_DELAY));
 
-        let mut test = ConfirmGuard::new(false, start);
+        let mut test = ConfirmGuard::new(false, OrderSource::Ticket, start);
         assert!(!test.waiting(start));
         assert!(test.try_confirm(start));
+    }
+
+    #[test]
+    fn only_an_order_book_order_names_its_source() {
+        assert_eq!(
+            source_line(OrderSource::Dom),
+            Some("From the order book (DOM)")
+        );
+        assert_eq!(source_line(OrderSource::Ticket), None);
+    }
+
+    #[test]
+    fn an_order_book_confirmation_waits_on_testnet_and_live_keeps_the_longer_wait() {
+        let start = t0();
+        let mut test = ConfirmGuard::new(false, OrderSource::Dom, start);
+        assert!(test.waiting(start));
+        assert!(!test.try_confirm(start + DOM_DELAY - Duration::from_millis(1)));
+        assert!(test.try_confirm(start + DOM_DELAY));
+
+        let mut live = ConfirmGuard::new(true, OrderSource::Dom, start);
+        assert!(!live.try_confirm(start + DOM_DELAY));
+        assert!(live.try_confirm(start + LIVE_DELAY));
+        const { assert!(DOM_DELAY.as_millis() <= LIVE_DELAY.as_millis()) };
     }
 
     #[test]
@@ -337,7 +391,7 @@ mod tests {
     #[test]
     fn a_confirmation_works_once() {
         let start = t0();
-        let mut g = ConfirmGuard::new(false, start);
+        let mut g = ConfirmGuard::new(false, OrderSource::Ticket, start);
         assert!(g.try_confirm(start));
         assert!(!g.try_confirm(start));
         assert!(!g.ready(start + Duration::from_secs(10)));

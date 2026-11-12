@@ -80,6 +80,11 @@ impl WindowScaleFactors {
         self.factors.remove(&window);
     }
 
+    /// The window is open as far as the app knows (the main window always is).
+    pub fn contains(&self, window: Id) -> bool {
+        self.factors.contains_key(&window)
+    }
+
     pub fn pixel_ratio_for_window(&self, window: Id, ui_scale_factor: ScaleFactor) -> PixelRatio {
         let window_scale_factor = self.factors.get(&window).copied().unwrap_or_default();
 
@@ -106,6 +111,8 @@ pub enum Event {
     Resized(window::Id, Size),
     Rescaled(window::Id, WindowScaleFactor),
     CloseRequested(window::Id),
+    /// The window is gone, however it was closed (the user, a layout switch, a merge).
+    Closed(window::Id),
 }
 
 pub fn events() -> Subscription<Event> {
@@ -134,6 +141,7 @@ fn filtered_events(
         iced::Event::Window(iced::window::Event::CloseRequested) => {
             Some(Event::CloseRequested(window))
         }
+        iced::Event::Window(iced::window::Event::Closed) => Some(Event::Closed(window)),
         _ => None,
     }
 }

@@ -39,7 +39,7 @@ enum Direction {
     Down,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Side {
     Bid,
     Ask,

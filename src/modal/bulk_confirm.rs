@@ -74,7 +74,7 @@ impl PendingBulk {
             live,
             lines,
             can_confirm,
-            guard: ConfirmGuard::new(live, now),
+            guard: ConfirmGuard::new(live, crate::order_flow::OrderSource::Ticket, now),
         }
     }
 
