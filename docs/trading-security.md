@@ -394,7 +394,7 @@ M5 的安全審查（唯讀）找出的風險，依嚴重度排列：
 - [ ] 80：修飾鍵加點擊；取整到交易所 tick；保護單先下新再撤舊
 - [ ] 69：點價與拖曳在 LIVE 下都經過確認
 - [ ] 72：點價與拖曳經過同一個閘門（code review：f 不直接呼叫送單函式）
-- [ ] 78：訂單線不寫入 `Library` 與 `saved-state.json`
+- [ ] 78：訂單線不寫入 `Library` 與 `saved-state.json`（f2 已加測試 `order_lines_never_reach_the_saved_state`）
 - [ ] 手動：Windows 分支不受影響；popout 視窗中的確認視窗出現在正確的視窗
 
 ## M5 使用者決定（2026-11-10）
@@ -791,7 +791,7 @@ d 段最後一段。沒有新的送單路徑、沒有新的權杖來源，`LIVE_
 
 ## M5 f0：DOM 點價與拖曳改單的共用地基（沒有使用者可見的新功能）
 
-本段只鋪地基，不新增送單點，`LIVE_SENDING_ENABLED` 仍為 false，`exchange/` 沒有改動，`saved-state.json` 沒有新欄位。
+本段只鋪地基，不新增送單點，`LIVE_SENDING_ENABLED` 仍為 false，`saved-state.json` 沒有新欄位。`exchange/` 只在 f2-2 補了兩個唯讀欄位（見下），沒有碰送單、撤單、builder、閘門、grant、簽章、host 白名單、proxy、Keychain。
 
 ### 使用者決定（2026-11-12，後續段落依此實作）
 
@@ -838,3 +838,47 @@ d 段最後一段。沒有新的送單路徑、沒有新的權杖來源，`LIVE_
 - 點價列的暫時高亮（沒做，成本不低：ladder 的畫面是快取的，要另加一層）。
 - 不做市價與觸價單；不做 kline 上的點價。
 - f3 的拖曳改單與 EX 的 `ReplaceProtective` 不在本段。
+
+## M5 f2：圖表與 DOM 顯示掛單、持倉、保護單（唯讀）
+
+不新增送單點：`.submit(` 仍只在 `order_flow.rs`，`submit_auto(`／`AutoIntent::new(` 仍只在 `auto_flow.rs`，`LIVE_SENDING_ENABLED` 仍為 false，`saved-state.json` 沒有新欄位。`exchange/` 只新增兩個唯讀欄位 `OpenOrder.price`、`Position.entry_price`（見 f2-2），解析結果只用於顯示，沒有碰送單、撤單、builder、閘門、grant、簽章、host 白名單、proxy、Keychain。線不能被抓取、拖曳或點擊，這一段沒有任何會改動訂單的操作。
+
+### 做了什麼
+
+- **view model**（`src/order_lines.rs`）：`OrderLine { price, kind, side, qty, whole, stale }`、`LineKind`（Entry／Stop／Target／Trailing／Position）、`SymbolLine`。純函式 `lines_of(orders, positions, stale)` 由 `OpenOrder`／`HeldPosition` 產生；沒有 `Serialize`、不含訂單 id 與 client id。
+- **哪些列會畫**：帶 `role` 的條件單（algo），且 `side` 與正價位（trigger；追蹤止損才可用 `activation_price`）都讀得到才畫，缺欄位一律不畫、不猜。減倉判定（`closePosition`／`reduceOnly`，hedge 用 `positionSide` 的平倉邊）決定 Stop／Target／Trailing；不減倉的條件單畫成 Entry。OKX 帶 `attachAlgoOrds` 的進場單（`attached`）沒有 `role`，不畫、不當成保護中。只有 trigger 沒有數量的 algo 照畫（標籤寫 `all` 或不寫數量）。`StopAndTarget` 只有一個 trigger，畫成 Stop。一般限價單（`OpenKind::Plain`、沒有 `role`、讀得到 `OpenOrder.price` 與 `side`）畫在限價上：不減倉畫成 Entry；減倉（hedge 用平倉邊，one-way 用 `reduceOnly`／`closePosition`）畫成 Target，因為它是在指定價位出場的單；order list（`List`）與讀不到價格的列不畫。
+- **帳戶與 symbol**：`TradeOverlay.lines`（每帳戶一份，`refresh_trade_overlay` 由 `TradingState` 重算）；pane 以 `TradeOverlay::lines_for(market, symbol)` 取線，帳戶用 `resolve_pane_account`（解析失敗、多帳戶未選、未測試、LIVE 未開放都不畫），symbol 為 `ticker.to_full_symbol_and_type().0`。帳戶不存進 pane 設定。
+- **Kline**：`OverlayView::paint_order_lines`（`widget/chart/kline/overlay.rs`，在 Overlay 層）畫水平線與靠右的標籤（種類、數量）；顏色取自 theme palette（Stop＝danger、Target＝success、Trailing＝danger.weak、Entry＝primary、Position＝secondary.strong）。`KlineChart::set_order_lines` 比較後才 `render_invalidation.invalidate()`。
+- **Ladder**：`Ladder::set_order_lines`、`lines_on_row`、`draw_order_marks`：與深度相同的分組規則（bid 向下、ask 向上，`round_to_side_step`），價格以 `Price::from_units`（`OrderLine::price_units`，無浮點）換算，所以剛好落在 step 上的價不會被推到隔壁列。在價格欄左緣畫色條，標籤畫在該側數量欄的內側。
+- **條件 51**：`stale = TradingState::lists_stale(id)`（非 Connected、簿未受信、需重測、algo 事件後未重讀任一為真）。stale 的線改成虛線與淡色，標籤加 `· stale`；Ladder 標記同樣淡色並帶 stale。
+- **效能**：overlay 在每次 `update`（非行情）重算，包括 `Message::Tick` 也會觸發訂單線重算；但每個 pane 只在線的內容改變時才失效快取（`set_order_lines` 先比較）。行情事件本身不重算。
+- **`HeldPosition.entry_price`**：持倉快照（`Position.entry_price`）與持倉事件（`PositionUpdate.entry_price`）都會帶入；事件到達時覆寫快照的值，快照則整份取代。零、負值或讀不到都是 None，None 時不畫 Position 線。只用於顯示，不參與任何判定。
+
+### f2-2：限價掛單價格與快照持倉均價（`exchange/src/trade/client.rs`，唯讀解析）
+
+- `OpenOrder.price: Option<Decimal>`：Binance 一般單 `type` 為 `LIMIT`／`LIMIT_MAKER` 時讀 `price`（合約與現貨共用解析）；OKX 一般單 `ordType` 為 `limit`／`post_only` 時讀 `px`。市價、條件單（含 `STOP` 等的限價腳）、缺欄位、零、負值、無法解析一律 None，不讓整列失敗。`Debug` 不印此欄位，client id 仍遮蔽。
+- `Position.entry_price: Option<Decimal>`：Binance 合約 `positionRisk.entryPrice`、OKX `positions.avgPx`；現貨沒有，為 None；零或無法解析為 None，不讓整列失敗。
+- 測試：`plain_price_tests::{binance_futures_plain_limit_rows_carry_their_price, binance_spot_plain_limit_rows_carry_their_price, okx_plain_limit_rows_carry_their_price, position_snapshots_carry_the_average_entry_price, debug_of_an_open_order_still_hides_the_client_id}`；`order_lines::tests::{a_plain_limit_that_adds_is_an_entry_at_its_price, a_plain_limit_that_reduces_is_a_target, a_plain_row_without_a_usable_price_or_side_is_not_drawn}`；`trading::tests::a_snapshot_entry_price_is_held_and_an_event_can_replace_it`。
+- 這些欄位只用於顯示，不進入任何送單、風控或保護判定；沒有新增 `saved-state.json` 欄位。
+
+### 條件 78（擴充）
+
+`order_lines::tests::order_lines_never_reach_the_saved_state`：`OrderLine`／`SymbolLine`／`LineKind` 不可序列化（編譯期探針）；序列化整個 `data::State` 不含訂單 id、價位或 `stale`；`data/src` 沒有任何檔案提到 `OrderLine`／`order_lines`（所以也進不了 `layout::drawings::Library`）。
+
+### 已知限制
+
+- 現貨沒有持倉均價（也沒有持倉），不畫 Position 線。
+- 持倉事件若不帶入場價，會以 None 取代快照的值（不沿用舊值，因為加倉後舊均價可能已不對）；下一份快照會再補上。
+- 同一價位的多條線在 kline 上互相覆蓋，沒有避讓；Ladder 同列的標籤合併成一行。
+- 追蹤止損若只有啟用價，線畫在啟用價並寫 `trailing`。
+
+### f3 待辦（security-review-f2 非阻擋項）
+
+- saved-state 測試的 layout 沒有 pane，等於恆真；要改成含 pane 的 layout 再序列化。
+- OKX 數量的單位是張數，畫面沒有標示；要在標籤上註明單位或換算成幣本位。
+- 現貨的賣出限價單目前畫成 Entry；要依 side 與持倉狀態重新分類。
+
+### 給 security-review 的重點
+
+- `src/order_lines.rs`（全檔，純函式與測試）、`src/trading.rs` `HeldPosition.entry_price`／`apply_position_event`、`src/main.rs` `refresh_trade_overlay`、`src/screen/dashboard.rs` `lines_for`／`apply_trade_overlay`。
+- 沒有新的 `Serialize`、送單點或 `exchange/` 變動。

@@ -1,3 +1,4 @@
+use crate::order_lines::LineKind;
 use crate::style;
 use data::panel::ladder::{ChaseTracker, Config, GroupedDepth, Side, TradeStore};
 use exchange::Trade;
@@ -56,6 +57,14 @@ impl Ladder {
         self.ticker_info.ticker
     }
 
+    /// Takes the lines to mark; the order book is redrawn only when they changed.
+    pub fn set_order_lines(&mut self, lines: Vec<crate::order_lines::OrderLine>) {
+        if self.order_lines != lines {
+            self.order_lines = lines;
+            self.cache.clear();
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> Option<PriceClick> {
         match message {
             Message::Scrolled(delta) => self.scroll(delta),
@@ -111,6 +120,8 @@ pub struct Ladder {
     trades: TradeStore,
     pending_tick_size: Option<PriceStep>,
     raw_price_spread: Option<Price>,
+    /// The account's orders and position on this symbol, drawn beside their price rows.
+    order_lines: Vec<crate::order_lines::OrderLine>,
 }
 
 impl Ladder {
@@ -128,6 +139,7 @@ impl Ladder {
             orderbook: [GroupedDepth::new(), GroupedDepth::new()],
             raw_price_spread: None,
             pending_tick_size: None,
+            order_lines: Vec::new(),
         }
     }
 
@@ -455,6 +467,8 @@ impl canvas::Program<Message> for Ladder {
                     }
                 }
 
+                self.draw_order_marks(frame, &visible_rows, &cols, palette);
+
                 if self.config.show_chase_tracker {
                     let left_gap_mid_x = cols.sell.1 + (layout.inside_pad_px + COL_PADDING) * 0.5;
                     let right_gap_mid_x = cols.buy.0 - (layout.inside_pad_px + COL_PADDING) * 0.5;
@@ -550,6 +564,23 @@ impl canvas::Program<Message> for Ladder {
 struct Maxima {
     vis_max_order_qty: f32,
     vis_max_trade_qty: f32,
+}
+
+/// The lines that sit on a row: the row groups prices the way the depth does (bids down, asks
+/// up), so a line is on the row its price would be grouped into.
+fn lines_on_row(
+    lines: &[crate::order_lines::OrderLine],
+    row_price: Price,
+    is_bid: bool,
+    step: PriceStep,
+) -> Vec<&crate::order_lines::OrderLine> {
+    lines
+        .iter()
+        .filter(|l| {
+            l.price_units()
+                .is_some_and(|u| Price::from_units(u).round_to_side_step(is_bid, step) == row_price)
+        })
+        .collect()
 }
 
 struct VisibleRow {
@@ -774,6 +805,55 @@ impl Ladder {
             side_color,
             Alignment::Center,
         );
+    }
+
+    /// Marks the rows that hold one of the account's orders or its position: a bar at the
+    /// edge of the price column in the line's colour and a short tag (kind, size). A line whose
+    /// lists may be out of date is faded and says "stale" (condition 51).
+    fn draw_order_marks(
+        &self,
+        frame: &mut iced::widget::canvas::Frame,
+        rows: &[VisibleRow],
+        cols: &ColumnRanges,
+        palette: &iced::theme::palette::Extended,
+    ) {
+        if self.order_lines.is_empty() {
+            return;
+        }
+        for visible in rows {
+            let (price, is_bid) = match visible.row {
+                DomRow::Ask { price, .. } => (price, false),
+                DomRow::Bid { price, .. } => (price, true),
+                _ => continue,
+            };
+            let marked = lines_on_row(&self.order_lines, price, is_bid, self.step);
+            let tags: Vec<String> = marked.iter().map(|l| l.label()).collect();
+            let stale = marked.iter().all(|l| l.stale);
+            let color = marked.first().map(|line| match line.kind {
+                LineKind::Stop => palette.danger.base.color,
+                LineKind::Target => palette.success.base.color,
+                LineKind::Trailing => palette.danger.weak.color,
+                LineKind::Entry => palette.primary.base.color,
+                LineKind::Position => palette.secondary.strong.color,
+            });
+            let Some(color) = color else {
+                continue;
+            };
+            let color = color.scale_alpha(if stale { 0.45 } else { 0.95 });
+            frame.fill_rectangle(
+                Point::new(cols.price.0, visible.y),
+                Size::new(3.0, ROW_HEIGHT),
+                color,
+            );
+            // The tag goes at the inner end of the order-size column of its side (the size
+            // itself is at the outer end), so it does not cover the price.
+            let (x, align) = if is_bid {
+                (cols.bid_order.1 - 4.0, Alignment::End)
+            } else {
+                (cols.ask_order.0 + 4.0, Alignment::Start)
+            };
+            Self::draw_cell_text(frame, &tags.join(" "), x, visible.y, color, align);
+        }
     }
 
     fn fill_bar(
@@ -1046,6 +1126,34 @@ mod tests {
 
     fn price(v: f32) -> Price {
         Price::from_f32(v)
+    }
+
+    /// A line sits on the row its price is grouped into: a bid row takes it down, an ask row up;
+    /// a price on a row's step is on that row, whichever side.
+    #[test]
+    fn a_line_is_on_the_row_its_price_groups_into() {
+        use crate::order_lines::{LineKind, OrderLine};
+        use exchange::trade::{Decimal, Side as TradeSide};
+        let step = PriceStep {
+            units: Price::from_f32(0.5).units,
+        };
+        let line = |p: &str| OrderLine {
+            price: Decimal::parse(p).unwrap(),
+            kind: LineKind::Stop,
+            side: TradeSide::Sell,
+            qty: None,
+            whole: true,
+            stale: false,
+        };
+        let lines = [line("99.75"), line("100.5")];
+        // 99.75 groups down to 99.5 on a bid row and up to 100.0 on an ask row.
+        assert_eq!(lines_on_row(&lines, price(99.5), true, step).len(), 1);
+        assert!(lines_on_row(&lines, price(99.5), false, step).is_empty());
+        assert_eq!(lines_on_row(&lines, price(100.0), false, step).len(), 1);
+        // On a step it is on that row, exactly.
+        assert_eq!(lines_on_row(&lines, price(100.5), false, step).len(), 1);
+        assert_eq!(lines_on_row(&lines, price(100.5), true, step).len(), 1);
+        assert!(lines_on_row(&lines, price(101.0), false, step).is_empty());
     }
 
     /// Rows are 16 px; with a 200 px canvas the middle is 100, row 0 spans 92..108.

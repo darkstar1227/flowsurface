@@ -107,6 +107,15 @@ pub struct TradeOverlay {
     /// The account the order ticket shows now.
     pub ticket_account: Option<uuid::Uuid>,
     pub live_open: bool,
+    /// The order and position lines of each account (read-only; see `order_lines`).
+    pub lines: Vec<AccountLines>,
+}
+
+/// The lines one account has on its symbols.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLines {
+    pub account: uuid::Uuid,
+    pub lines: Vec<crate::order_lines::SymbolLine>,
 }
 
 /// What the title bar says about a pane's trading account.
@@ -118,6 +127,31 @@ pub struct AccountTag {
 }
 
 impl TradeOverlay {
+    /// The lines a pane of this market and symbol draws: those of the account a click in it
+    /// would order with. Nothing when there is no such account (never a guess among several).
+    pub fn lines_for(
+        &self,
+        market: exchange::adapter::Exchange,
+        symbol: &str,
+    ) -> Vec<crate::order_lines::OrderLine> {
+        let choices: Vec<_> = self.accounts.iter().map(|(c, _)| *c).collect();
+        let Ok(pick) = crate::order_flow::resolve_pane_account(
+            market,
+            self.ticket_account,
+            &choices,
+            self.live_open,
+        ) else {
+            return Vec::new();
+        };
+        self.lines
+            .iter()
+            .filter(|a| a.account == pick.id)
+            .flat_map(|a| a.lines.iter())
+            .filter(|l| l.symbol == symbol)
+            .map(|l| l.line.clone())
+            .collect()
+    }
+
     /// The account a click in a pane of this market would order with, by the same rule the click
     /// uses (`resolve_pane_account`), or the short reason there is none. `None` when no account
     /// is saved or the market cannot be traded at all (nothing to say there).
@@ -658,6 +692,14 @@ impl Dashboard {
             .chain(self.popout.iter().flat_map(|(window_id, (panes, _))| {
                 panes.iter().map(|(pane, state)| (*window_id, *pane, state))
             }))
+    }
+
+    /// Gives every chart and order book of this dashboard its order lines. Cheap when nothing
+    /// changed: a pane compares and redraws only for a change.
+    pub fn apply_trade_overlay(&mut self, main_window: window::Id, overlay: &TradeOverlay) {
+        for (_, _, state) in self.iter_all_panes_mut(main_window) {
+            state.content.set_order_lines(overlay);
+        }
     }
 
     fn iter_all_panes_mut(
@@ -1604,5 +1646,70 @@ mod overlay_tests {
         assert_eq!(closed.account_tag_of(m).unwrap().text, "LIVE closed");
         // Another venue's market: nothing to say.
         assert_eq!(one.account_tag_of(Exchange::HyperliquidLinear), None);
+    }
+
+    fn line(symbol: &str, price: &str) -> crate::order_lines::SymbolLine {
+        use exchange::trade::{Decimal, Side};
+        crate::order_lines::SymbolLine {
+            symbol: symbol.to_string(),
+            line: crate::order_lines::OrderLine {
+                price: Decimal::parse(price).unwrap(),
+                kind: crate::order_lines::LineKind::Stop,
+                side: Side::Sell,
+                qty: None,
+                whole: true,
+                stale: false,
+            },
+        }
+    }
+
+    /// A pane draws the lines of its own symbol and of the account a click would use; with
+    /// several accounts and none picked it draws none.
+    #[test]
+    fn a_pane_draws_only_its_symbol_and_its_account() {
+        let m = Exchange::BinanceLinear;
+        let lines = vec![
+            AccountLines {
+                account: uuid::Uuid::from_u128(1),
+                lines: vec![line("BTCUSDT", "58000"), line("ETHUSDT", "3000")],
+            },
+            AccountLines {
+                account: uuid::Uuid::from_u128(2),
+                lines: vec![line("BTCUSDT", "57000")],
+            },
+        ];
+        let one = TradeOverlay {
+            accounts: vec![acc(1, AccountEnv::Testnet, true)],
+            lines: lines.clone(),
+            ..Default::default()
+        };
+        let got = one.lines_for(m, "BTCUSDT");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].price.to_plain_string(), "58000");
+        assert!(one.lines_for(m, "SOLUSDT").is_empty());
+        let many = TradeOverlay {
+            accounts: vec![
+                acc(1, AccountEnv::Testnet, true),
+                acc(2, AccountEnv::Testnet, true),
+            ],
+            lines,
+            ..Default::default()
+        };
+        assert!(many.lines_for(m, "BTCUSDT").is_empty());
+        let picked = TradeOverlay {
+            ticket_account: Some(uuid::Uuid::from_u128(2)),
+            ..many
+        };
+        assert_eq!(
+            picked.lines_for(m, "BTCUSDT")[0].price.to_plain_string(),
+            "57000"
+        );
+        // An account that was not tested is not drawn either.
+        let untested = TradeOverlay {
+            accounts: vec![acc(1, AccountEnv::Testnet, false)],
+            lines: picked.lines.clone(),
+            ..Default::default()
+        };
+        assert!(untested.lines_for(m, "BTCUSDT").is_empty());
     }
 }
