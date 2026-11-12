@@ -754,7 +754,7 @@ impl<'a> KlineWidget<'a> {
     }
 
     fn is_command_modifier(modifiers: keyboard::Modifiers) -> bool {
-        modifiers.intersects(keyboard::Modifiers::COMMAND)
+        crate::widget::is_command_modifier(modifiers)
     }
 
     fn drawing_magnet_enabled(&self, modifiers: keyboard::Modifiers) -> bool {

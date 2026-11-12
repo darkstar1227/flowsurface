@@ -114,7 +114,14 @@ struct Flowsurface {
     /// The request being sent, kept so an expired preview can be made again.
     /// The request of each send in flight and the window its review started in (a review made
     /// again after the rules expired opens its confirmation in the same window).
-    order_requests: HashMap<(uuid::Uuid, String), (order_flow::PrepareRequest, window::Id)>,
+    order_requests: HashMap<
+        (uuid::Uuid, String),
+        (
+            order_flow::PrepareRequest,
+            window::Id,
+            order_flow::OrderSource,
+        ),
+    >,
     /// When the ticker list of each venue was last fetched successfully. The list keeps its old
     /// prices when a fetch fails; this stamp is what tells a kept price from a fresh one (see
     /// `auto_flow::reference_price`).
@@ -255,12 +262,21 @@ impl Flowsurface {
 
     /// Drops the pending preview and the confirmation (the ticket was left, or Escape).
     fn discard_order(&mut self) {
+        // Only the sends of the confirmation that goes away: another order may be in flight and
+        // needs its request when it comes back (a resend after expired rules, the bare position
+        // warning cleared by an accepted whole-position stop).
+        if let Some(conf) = self.order_confirm.as_ref() {
+            order_flow::forget_request(
+                &mut self.order_requests,
+                conf.request.account,
+                &conf.request.symbol,
+            );
+        }
         self.order_confirm = None;
         self.trading.clear_stray_marks();
         self.bulk_confirm = None;
         self.account_panel.reset_form();
         self.account_panel.finish_bulk_prepare();
-        self.order_requests.clear();
         // Makes any preview still on its way stale.
         self.order_ticket.finish_prepare();
     }
@@ -299,15 +315,92 @@ impl Flowsurface {
         })
     }
 
-    /// An order a pane asked for opens the ordinary review in the pane's own window (main,
-    /// popout or detached layout). Nothing is sent from here: the confirmation does that, and
-    /// only after the user confirms.
+    /// A window went away: its scale factor goes, and so does a confirmation that was open in
+    /// it (nobody could press it, and it would block every other review). It is dropped like
+    /// Escape does.
+    fn forget_window(&mut self, window: window::Id) {
+        self.window_scale_factors.remove(window);
+        if order_flow::confirm_lost_with(
+            self.order_confirm.as_ref().map(|c| c.window),
+            self.bulk_confirm.as_ref().map(|c| c.window),
+            window,
+        ) {
+            self.discard_order();
+        }
+    }
+
+    /// The window a confirmation opens in: the one that asked, or the main window when that one
+    /// is gone.
+    fn live_origin(&self, origin: window::Id) -> window::Id {
+        order_flow::live_origin(origin, self.main_window.id, |w| {
+            self.window_scale_factors.contains(w)
+        })
+    }
+
+    /// Rebuilds what the panes say about the trading account (the ladder title bar).
+    fn refresh_trade_overlay(&mut self) {
+        let accounts = self.exchange_accounts.persisted().accounts;
+        self.trade_overlay = dashboard::TradeOverlay {
+            accounts: accounts
+                .iter()
+                .map(|m| (self.account_choice(m), m.alias.clone()))
+                .collect(),
+            ticket_account: self.order_ticket.account(),
+            live_open: data::config::trade_gate::live_sending_enabled(),
+        };
+    }
+
+    fn account_choice(
+        &self,
+        m: &data::config::exchange_accounts::AccountMeta,
+    ) -> order_flow::AccountChoice {
+        order_flow::AccountChoice {
+            id: m.id,
+            venue: m.venue,
+            product: m.product,
+            env: m.env,
+            tested: self.trade_session.get(m.id).is_some(),
+        }
+    }
+
+    /// A limit order a pane asked for (a command click on the ladder) opens the ordinary review
+    /// in the pane's own window (main, popout or detached layout). The account is the ticket's,
+    /// or the only one that fits; the quantity is the ticket's. A refusal is a toast. Nothing is
+    /// sent from here: the confirmation does that, and only after the user confirms.
     fn start_trade_request(
         &mut self,
-        request: order_flow::PrepareRequest,
+        order: order_flow::PaneOrder,
         window: window::Id,
     ) -> Task<Message> {
-        self.start_review(request, window)
+        let accounts: Vec<_> = self
+            .exchange_accounts
+            .persisted()
+            .accounts
+            .iter()
+            .map(|m| self.account_choice(m))
+            .collect();
+        match order_flow::pane_request(
+            &order,
+            self.order_ticket.account(),
+            &accounts,
+            data::config::trade_gate::live_sending_enabled(),
+            self.order_ticket.quantity(),
+        ) {
+            Ok((request, _)) => {
+                // The click takes over the preview the ticket was making (one review at a
+                // time): say so, the ticket may not be on screen.
+                if self.order_ticket.is_preparing() {
+                    self.notifications.push(Toast::warn(
+                        "This price replaces the order the ticket was preparing.".to_string(),
+                    ));
+                }
+                self.start_review(request, window, order_flow::OrderSource::Dom)
+            }
+            Err(text) => {
+                self.review_refused(text, BannerKind::Warning);
+                Task::none()
+            }
+        }
     }
 
     /// Why a review did not start: on the ticket, and in a toast when the ticket is closed (a
@@ -328,6 +421,7 @@ impl Flowsurface {
         &mut self,
         request: order_flow::PrepareRequest,
         origin: window::Id,
+        source: order_flow::OrderSource,
     ) -> Task<Message> {
         use modal::order_ticket as ticket;
         if self.trading.bulk_running(request.account) || self.account_panel.is_bulk_preparing() {
@@ -409,6 +503,7 @@ impl Flowsurface {
             auto_active,
             request,
             origin,
+            source,
             ref_price,
             signed,
             proxy: self.trading.proxy_reader(),
@@ -434,7 +529,9 @@ impl Flowsurface {
                     // Never replace a confirmation that is open: the user may be about to
                     // press its Confirm (M2). The new preview is dropped.
                     if self.confirm_open() {
-                        self.order_ticket.set_status(
+                        // Also a toast when the ticket is closed (a click in a pane started
+                        // this review).
+                        self.review_refused(
                             "Another order is waiting for confirmation. Review again after it."
                                 .to_string(),
                             BannerKind::Warning,
@@ -443,8 +540,9 @@ impl Flowsurface {
                     }
                     // The account of the preview itself, not the one the ticket shows now.
                     let accounts = self.exchange_accounts.persisted().accounts;
-                    // Opens in the window the review was started in.
-                    let origin = prepared.origin;
+                    // Opens in the window the review was started in, or in the main window
+                    // when that one was closed meanwhile.
+                    let origin = self.live_origin(prepared.origin);
                     match modal::order_confirm::account_of(&accounts, &prepared.request) {
                         Some(meta) => {
                             self.order_confirm = Some(modal::order_confirm::PendingConfirm::new(
@@ -473,7 +571,11 @@ impl Flowsurface {
         }
         match action {
             // The ticket is a sidebar menu: it only exists in the main window.
-            Some(Action::Review(request)) => self.start_review(*request, self.main_window.id),
+            Some(Action::Review(request)) => self.start_review(
+                *request,
+                self.main_window.id,
+                order_flow::OrderSource::Ticket,
+            ),
             Some(Action::Exit) => {
                 self.discard_order();
                 self.sidebar.set_menu(None);
@@ -703,6 +805,7 @@ impl Flowsurface {
                     },
                     // Started from the account panel, a sidebar menu of the main window.
                     self.main_window.id,
+                    order_flow::OrderSource::Ticket,
                 );
                 if self.order_ticket.is_preparing() {
                     self.account_panel.set_status(
@@ -769,6 +872,7 @@ impl Flowsurface {
             },
             // Started from the account panel, a sidebar menu of the main window.
             self.main_window.id,
+            order_flow::OrderSource::Ticket,
         );
         if self.order_ticket.is_preparing() {
             self.trading.mark_stray_cancel(meta.id, order_id);
@@ -1240,6 +1344,7 @@ impl Flowsurface {
         };
         let request = conf.request.clone();
         let origin = conf.window;
+        let source = conf.source;
         if self.trading.bulk_running(request.account) {
             self.order_confirm = None;
             self.order_ticket.set_status(
@@ -1411,8 +1516,10 @@ impl Flowsurface {
             token,
             intent,
         };
-        self.order_requests
-            .insert((request.account, request.symbol.clone()), (request, origin));
+        self.order_requests.insert(
+            (request.account, request.symbol.clone()),
+            (request, origin, source),
+        );
         Task::perform(order_flow::send(input), Message::OrderSent)
     }
 
@@ -1530,10 +1637,10 @@ impl Flowsurface {
         self.trading
             .settle_attach(summary.account, &summary.symbol, &summary.result);
         // The request of this very send (account and symbol), never another one's.
-        let (request, origin) = self
+        let (request, origin, source) = self
             .order_requests
             .remove(&(summary.account, summary.symbol.clone()))
-            .unzip();
+            .map_or((None, None, None), |(r, o, s)| (Some(r), Some(o), Some(s)));
         // A whole-position stop was accepted: the entry's failures that left the position bare
         // are cleared and its own stop is never sent. Other results keep the warning.
         if let (
@@ -1553,13 +1660,13 @@ impl Flowsurface {
                 .protection_added(summary.account, &summary.symbol, *dir);
         }
         if summary.result == order_flow::SendResult::RulesExpired
-            && let (Some(request), Some(origin)) = (request, origin)
+            && let (Some(request), Some(origin), Some(source)) = (request, origin, source)
         {
             // Not a failure: the data aged between the preview and the click. A new preview
             // is made only when nothing else is open or being prepared; it would replace or
             // outdate that other order (M2). Otherwise the user is told to review again.
             if order_flow::may_review_again(self.confirm_open(), self.order_ticket.is_preparing()) {
-                let task = self.start_review(request, origin);
+                let task = self.start_review(request, self.live_origin(origin), source);
                 if self.order_ticket.is_preparing() {
                     self.order_ticket.set_status(
                         "The trading data expired. Review the order again.".to_string(),
@@ -1733,6 +1840,17 @@ impl Flowsurface {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Market data cannot change an account, and it is the hot path: no refresh for it.
+        let market = matches!(message, Message::MarketWsEvent(_));
+        let task = self.update_message(message);
+        // The panes read accounts, session and the ticket's account from here.
+        if !market {
+            self.refresh_trade_overlay();
+        }
+        task
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::MarketWsEvent(event) => {
                 // Detached layouts keep running, so every visible layout gets the event.
@@ -1984,8 +2102,8 @@ impl Flowsurface {
                     Some(dashboard::Event::IndicatorCatalog(message)) => {
                         self.update_shared_chart_resources(message)
                     }
-                    Some(dashboard::Event::TradeRequest { window, request }) => {
-                        self.start_trade_request(*request, window)
+                    Some(dashboard::Event::TradeRequest { window, order }) => {
+                        self.start_trade_request(order, window)
                     }
                     None => Task::none(),
                 };
@@ -2028,6 +2146,17 @@ impl Flowsurface {
                             .keys()
                             .copied()
                             .collect::<Vec<_>>();
+
+                        // The popouts close below: a confirmation open in one of them goes with
+                        // them now, so it cannot block anything while the windows are closing.
+                        // Their scale factors are removed by the `Closed` events.
+                        if order_flow::confirm_lost_with_any(
+                            self.order_confirm.as_ref().map(|c| c.window),
+                            self.bulk_confirm.as_ref().map(|c| c.window),
+                            &active_popout_keys,
+                        ) {
+                            self.discard_order();
+                        }
 
                         let window_tasks = Task::batch(
                             active_popout_keys
@@ -2082,7 +2211,7 @@ impl Flowsurface {
                             .copied()
                             .collect::<Vec<_>>();
                         for popout in &popouts {
-                            self.window_scale_factors.remove(*popout);
+                            self.forget_window(*popout);
                         }
                         let close_popouts = Task::batch(
                             popouts
@@ -2114,7 +2243,7 @@ impl Flowsurface {
                         ));
                     }
                     Some(modal::layout_manager::Action::CloseWindow(window_id)) => {
-                        self.window_scale_factors.remove(window_id);
+                        self.forget_window(window_id);
                         return window::close(window_id);
                     }
                     None => {}
@@ -2996,11 +3125,19 @@ impl Flowsurface {
                 self.window_scale_factors.set(window_id, scale_factor);
                 Task::none()
             }
+            window::Event::Closed(window_id) => {
+                // The window is really gone, whichever path closed it (a layout switch and a
+                // popout merge close windows without a close request). Safe to repeat.
+                if window_id != self.main_window.id {
+                    self.forget_window(window_id);
+                }
+                Task::none()
+            }
             window::Event::CloseRequested(window_id) => {
                 let main_window = self.main_window.id;
 
                 if window_id != main_window {
-                    self.window_scale_factors.remove(window_id);
+                    self.forget_window(window_id);
                     self.restoring_windows.remove(&window_id);
 
                     // Closing a detached window returns its layout to the tab bar.
@@ -3111,7 +3248,7 @@ impl Flowsurface {
         };
         let mut tasks = vec![self.map_dashboard_task(merge_task, Some(id))];
         for popout in merged_windows {
-            self.window_scale_factors.remove(popout);
+            self.forget_window(popout);
             if was_active {
                 tasks.push(window::close::<window::Id>(popout).discard());
             }

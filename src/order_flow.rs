@@ -151,10 +151,6 @@ pub enum AccountRefusal {
 }
 
 impl AccountRefusal {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "shown by the pane order entry of the next step")
-    )]
     pub fn message(self) -> &'static str {
         match self {
             Self::NotTradable => "Orders cannot be placed on this market.",
@@ -171,13 +167,6 @@ impl AccountRefusal {
 /// The account a pane orders with: the ticket's account when it trades the pane's market;
 /// otherwise the only account that does; never a guess among several. The pick must have been
 /// tested, and a Live one needs Live sending open. Nothing here is stored in a pane.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the pane order entry that calls it comes with the next step"
-    )
-)]
 pub fn resolve_pane_account(
     pane_market: Exchange,
     ticket_account: Option<Uuid>,
@@ -209,6 +198,114 @@ pub fn resolve_pane_account(
     Ok(pick)
 }
 
+/// A click on a pane's price ladder, before an account and a quantity are known. The price is
+/// the row's price as an exact decimal; the exchange builder rounds it to the symbol's tick
+/// (a buy down, a sell up) when the preview is made, so the confirmation shows the rounded one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneOrder {
+    pub market: Exchange,
+    pub symbol: String,
+    /// A bid row buys (long), an ask row sells (short).
+    pub dir: Dir,
+    pub price: Decimal,
+}
+
+impl PaneOrder {
+    /// `None` when the row has no usable price.
+    pub fn from_row(ticker: exchange::Ticker, bid_side: bool, price: Price) -> Option<Self> {
+        Some(Self {
+            market: ticker.exchange,
+            symbol: ticker.to_full_symbol_and_type().0,
+            dir: if bid_side { Dir::Long } else { Dir::Short },
+            price: price_to_decimal(price)?,
+        })
+    }
+}
+
+/// The limit order a ladder click asks for: the account by [`resolve_pane_account`], the
+/// quantity the ticket holds now (nothing is stored in a pane). A refusal is said in words and
+/// opens nothing. It only builds a request: the review and the confirmation send nothing until
+/// the user confirms.
+pub fn pane_request(
+    order: &PaneOrder,
+    ticket_account: Option<Uuid>,
+    accounts: &[AccountChoice],
+    live_open: bool,
+    ticket_qty: Result<Decimal, String>,
+) -> Result<(PrepareRequest, AccountChoice), String> {
+    let account = resolve_pane_account(order.market, ticket_account, accounts, live_open)
+        .map_err(|e| e.message().to_string())?;
+    let qty = ticket_qty?;
+    Ok((
+        PrepareRequest {
+            account: account.id,
+            symbol: order.symbol.clone(),
+            spec: ManualSpec::Limit {
+                dir: order.dir,
+                qty,
+                price: order.price,
+            },
+            protect: None,
+        },
+        account,
+    ))
+}
+
+/// The window a confirmation opens in: the one that asked while it is still open, else the main
+/// window (a popout that was closed while its preview was being made).
+pub fn live_origin(
+    origin: window::Id,
+    main: window::Id,
+    is_open: impl Fn(window::Id) -> bool,
+) -> window::Id {
+    if origin == main || is_open(origin) {
+        origin
+    } else {
+        main
+    }
+}
+
+/// A closed window takes the confirmation that was open in it: nobody could press it.
+pub fn confirm_lost_with(
+    order: Option<window::Id>,
+    bulk: Option<window::Id>,
+    closed: window::Id,
+) -> bool {
+    order == Some(closed) || bulk == Some(closed)
+}
+
+/// Drops the in-flight request of one (account, symbol) only: other orders still need theirs
+/// when their results come back.
+pub fn forget_request<V>(
+    requests: &mut std::collections::HashMap<(Uuid, String), V>,
+    account: Uuid,
+    symbol: &str,
+) {
+    requests.remove(&(account, symbol.to_string()));
+}
+
+/// `confirm_lost_with` for several windows closed together.
+pub fn confirm_lost_with_any(
+    order: Option<window::Id>,
+    bulk: Option<window::Id>,
+    closed: &[window::Id],
+) -> bool {
+    closed.iter().any(|&w| confirm_lost_with(order, bulk, w))
+}
+
+/// A limit order that would fill at once against the quote (a buy at or above it, a sell at or
+/// below it). `false` when there is no quote to tell.
+pub fn takes_liquidity(dir: Dir, price: Option<&Decimal>, quote: Option<&Decimal>) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let (Some(price), Some(quote)) = (price, quote) else {
+        return false;
+    };
+    matches!(
+        (dir, price.checked_cmp(quote)),
+        (Dir::Long, Ok(Greater | Equal)) | (Dir::Short, Ok(Less | Equal))
+    )
+}
+
 /// A quote from the ticker table, as the exact decimal (no float).
 pub fn price_to_decimal(price: Price) -> Option<Decimal> {
     const SCALE: i64 = 100_000_000_000;
@@ -224,6 +321,16 @@ pub fn price_to_decimal(price: Price) -> Option<Decimal> {
 }
 
 // ── Prepare ─────────────────────────────────────────────────────────────
+
+/// Where a review was asked for. A click in the order book can land twice by accident (a double
+/// click), so its confirmation also waits a short while before it takes a click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OrderSource {
+    #[default]
+    Ticket,
+    /// A command click on the ladder.
+    Dom,
+}
 
 /// What the user asked for, kept so a preview can be made again (rules expired).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +399,8 @@ pub struct Notes {
     pub base_amount: Option<String>,
     /// What the confirmation says about protection; `None` when the request is not an entry.
     pub attach: Option<AttachNote>,
+    /// The limit price would fill at once against the market (the confirmation says so).
+    pub takes_liquidity: bool,
 }
 
 /// The direction, quantity and limit price of an entry request.
@@ -316,6 +425,7 @@ pub struct Prepared {
     pub notes: Notes,
     /// The window the review was started in: the confirmation opens there.
     pub origin: window::Id,
+    pub source: OrderSource,
 }
 
 pub struct PrepareInput {
@@ -329,6 +439,8 @@ pub struct PrepareInput {
     pub request: PrepareRequest,
     /// Carried to `Prepared` unchanged.
     pub origin: window::Id,
+    /// Carried to `Prepared` unchanged.
+    pub source: OrderSource,
     pub ref_price: Option<Decimal>,
     pub signed: SignedHttp,
     pub proxy: Arc<dyn Fn() -> ProxyState + Send + Sync>,
@@ -370,6 +482,7 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
         auto_active,
         request,
         origin,
+        source,
         ref_price,
         signed,
         proxy,
@@ -495,7 +608,11 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
             None => AttachNote::Nothing,
         },
     });
+    let takes = entry
+        .map(|(dir, _, _)| takes_liquidity(dir, limit_price.as_ref(), ref_price.as_ref()))
+        .unwrap_or(false);
     let notes = Notes {
+        takes_liquidity: takes,
         deviation: deviation_of(limit_price.as_ref(), ref_price.as_ref()),
         reference: ref_price.as_ref().map(Decimal::to_plain_string),
         base_amount,
@@ -507,6 +624,7 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
         slot: IntentSlot::new(intent),
         notes,
         origin,
+        source,
     })
 }
 
@@ -851,6 +969,178 @@ mod tests {
             env: AccountEnv::Testnet,
             tested: true,
         }
+    }
+
+    fn order(dir: Dir) -> PaneOrder {
+        PaneOrder {
+            market: Exchange::BinanceLinear,
+            symbol: "BTCUSDT".to_string(),
+            dir,
+            price: d("100.1"),
+        }
+    }
+
+    /// A ladder row price reaches the request exactly, and the side of the row is the direction.
+    #[test]
+    fn a_row_becomes_an_exact_limit_request() {
+        let ticker = exchange::Ticker::new("BTCUSDT", Exchange::BinanceLinear);
+        let o = PaneOrder::from_row(ticker, true, Price::from_f32(100.25)).unwrap();
+        assert_eq!(o.symbol, "BTCUSDT");
+        assert_eq!(o.market, Exchange::BinanceLinear);
+        assert_eq!(o.dir, Dir::Long);
+        assert_eq!(o.price, d("100.25"));
+        let o = PaneOrder::from_row(ticker, false, Price::from_f32(0.5)).unwrap();
+        assert_eq!(o.dir, Dir::Short);
+        assert_eq!(o.price, d("0.5"));
+        // A row with no positive price asks for nothing.
+        assert!(PaneOrder::from_row(ticker, true, Price::from_f32(0.0)).is_none());
+    }
+
+    /// The pane price is rounded by the exchange builder (`round_limit_price`), not here and not
+    /// by the display grouping: a buy goes down and a sell goes up, for ticks of 0.25, 0.5, 0.1.
+    #[test]
+    fn the_limit_price_is_rounded_to_the_tick_a_buy_down_and_a_sell_up() {
+        let cases = [
+            // (tick, price, buy, sell)
+            ("0.25", "100.30", "100.25", "100.50"),
+            ("0.5", "100.30", "100.00", "100.50"),
+            ("0.1", "100.35", "100.3", "100.4"),
+            ("0.25", "100.25", "100.25", "100.25"),
+        ];
+        for (tick, price, buy, sell) in cases {
+            let (tick, price) = (d(tick), d(price));
+            assert_eq!(price.floor_to_step(&tick).unwrap(), d(buy), "buy {price:?}");
+            assert_eq!(
+                price.ceil_to_step(&tick).unwrap(),
+                d(sell),
+                "sell {price:?}"
+            );
+        }
+    }
+
+    /// No quantity in the ticket, or no account: refused with a reason, nothing is built.
+    #[test]
+    fn a_pane_order_without_quantity_or_account_is_refused() {
+        let a = choice(1, AccountVenue::Binance, AccountProduct::UsdM);
+        let o = order(Dir::Long);
+        let qty = || Ok(d("0.5"));
+        let (req, who) = pane_request(&o, None, &[a], true, qty()).unwrap();
+        assert_eq!(who.id, a.id);
+        assert_eq!(req.account, a.id);
+        assert_eq!(req.symbol, "BTCUSDT");
+        assert_eq!(req.protect, None);
+        assert_eq!(
+            req.spec,
+            ManualSpec::Limit {
+                dir: Dir::Long,
+                qty: d("0.5"),
+                price: d("100.1")
+            }
+        );
+        // The sell side of the book is a sale.
+        let (req, _) = pane_request(&order(Dir::Short), None, &[a], true, qty()).unwrap();
+        assert!(matches!(
+            req.spec,
+            ManualSpec::Limit {
+                dir: Dir::Short,
+                ..
+            }
+        ));
+        let no_qty = Err("Enter a quantity in the order ticket first.".to_string());
+        assert_eq!(
+            pane_request(&o, None, &[a], true, no_qty).unwrap_err(),
+            "Enter a quantity in the order ticket first."
+        );
+        assert_eq!(
+            pane_request(&o, None, &[], true, qty()).unwrap_err(),
+            AccountRefusal::NoAccount.message()
+        );
+        let b = choice(2, AccountVenue::Binance, AccountProduct::UsdM);
+        assert_eq!(
+            pane_request(&o, None, &[a, b], true, qty()).unwrap_err(),
+            AccountRefusal::PickInTicket.message()
+        );
+        let untested = AccountChoice { tested: false, ..a };
+        assert_eq!(
+            pane_request(&o, None, &[untested], true, qty()).unwrap_err(),
+            AccountRefusal::NotTested.message()
+        );
+    }
+
+    #[test]
+    fn a_limit_that_fills_at_once_takes_liquidity() {
+        let q = d("100");
+        let t = |dir, p: &str| takes_liquidity(dir, Some(&d(p)), Some(&q));
+        assert!(t(Dir::Long, "100"));
+        assert!(t(Dir::Long, "101"));
+        assert!(!t(Dir::Long, "99.9"));
+        assert!(t(Dir::Short, "100"));
+        assert!(t(Dir::Short, "99"));
+        assert!(!t(Dir::Short, "100.1"));
+        // No quote: it cannot be told, and is not claimed.
+        assert!(!takes_liquidity(Dir::Long, Some(&q), None));
+        assert!(!takes_liquidity(Dir::Long, None, Some(&q)));
+    }
+
+    /// A confirmation goes with its window; one for another window stays.
+    #[test]
+    fn closing_a_window_takes_its_confirmation_and_reroutes_a_resend() {
+        let (main, pop, other) = (
+            window::Id::unique(),
+            window::Id::unique(),
+            window::Id::unique(),
+        );
+        assert!(confirm_lost_with(Some(pop), None, pop));
+        assert!(confirm_lost_with(None, Some(pop), pop));
+        assert!(!confirm_lost_with(Some(other), Some(main), pop));
+        assert!(!confirm_lost_with(None, None, pop));
+        // A resend goes back to the window it came from while that is open, else the main one.
+        assert_eq!(live_origin(pop, main, |w| w == pop), pop);
+        assert_eq!(live_origin(pop, main, |_| false), main);
+        assert_eq!(live_origin(main, main, |_| false), main);
+    }
+
+    /// Discarding a confirmation leaves the other orders' requests alone (S4).
+    #[test]
+    fn forgetting_a_request_keeps_the_other_in_flight_ones() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut requests = std::collections::HashMap::new();
+        requests.insert((a, "BTCUSDT".to_string()), 1);
+        requests.insert((a, "ETHUSDT".to_string()), 2);
+        requests.insert((b, "BTCUSDT".to_string()), 3);
+        forget_request(&mut requests, a, "BTCUSDT");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.contains_key(&(a, "ETHUSDT".to_string())));
+        assert!(requests.contains_key(&(b, "BTCUSDT".to_string())));
+    }
+
+    /// A popout closed by a layout switch or a merge (no close request) is still forgotten:
+    /// the `Closed` event reaches `forget_window`, so a resend no longer opens in it.
+    #[test]
+    fn every_way_of_closing_a_window_ends_in_forget_window() {
+        let main = include_str!("main.rs");
+        let compact: String = main.split_whitespace().collect();
+        let arm = compact
+            .split("window::Event::Closed(window_id)=>")
+            .nth(1)
+            .expect("the Closed event is handled");
+        // The comment in the arm is part of the compacted text: look at the arm's start only.
+        assert!(arm[..arm.find("Task::none()").unwrap()].contains("self.forget_window(window_id)"));
+        let win: String = include_str!("window.rs").split_whitespace().collect();
+        assert!(win.contains(
+            "iced::Event::Window(iced::window::Event::Closed)=>Some(Event::Closed(window))"
+        ));
+        // A layout switch drops the confirmation of a popout it is about to close.
+        assert!(compact.contains("confirm_lost_with_any("));
+
+        let (main_id, pop) = (window::Id::unique(), window::Id::unique());
+        let mut factors = crate::window::WindowScaleFactors::new(main_id);
+        factors.set(pop, crate::window::WindowScaleFactor::new(2.0));
+        assert_eq!(live_origin(pop, main_id, |w| factors.contains(w)), pop);
+        factors.remove(pop);
+        assert_eq!(live_origin(pop, main_id, |w| factors.contains(w)), main_id);
+        assert!(confirm_lost_with_any(Some(pop), None, &[main_id, pop]));
+        assert!(!confirm_lost_with_any(Some(pop), None, &[main_id]));
     }
 
     /// The pane account is the ticket's when it fits, else the only fitting one, never a guess.
@@ -1389,8 +1679,8 @@ mod tests {
         );
         assert!(!compact.contains("PendingConfirm::new(self.main_window.id"));
         // The send keeps the window with its request; the new review takes it from there.
-        assert!(compact.contains("(request,origin)"));
-        assert!(compact.contains("self.start_review(request,origin)"));
+        assert!(compact.contains("(request,origin,source)"));
+        assert!(compact.contains("self.start_review(request,self.live_origin(origin),source)"));
     }
 
     /// "Retry protection" only opens the review: the order is sent by the confirmation handler

@@ -483,6 +483,15 @@ impl OrderTicket {
         self.account
     }
 
+    /// The quantity typed in the form, for an order a pane asks for. Nothing is kept in a pane:
+    /// with no quantity there the order is refused and the user says what to order here.
+    pub fn quantity(&self) -> Result<exchange::trade::Decimal, String> {
+        if self.qty.trim().is_empty() {
+            return Err("Enter a quantity in the order ticket first.".to_string());
+        }
+        parse("Quantity", &self.qty)
+    }
+
     pub fn is_preparing(&self) -> bool {
         self.preparing
     }

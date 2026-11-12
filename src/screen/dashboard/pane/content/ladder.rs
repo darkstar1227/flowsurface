@@ -37,14 +37,32 @@ const CHASE_MIN_INTERVAL: Duration = Duration::from_millis(200);
 pub enum Message {
     Scrolled(f32),
     ResetScroll,
+    /// Command (Ctrl) + left click on a price row. Only asks for a review: a plain click never
+    /// does (it resets the scroll).
+    PriceClicked(PriceClick),
+}
+
+/// The row a command click landed on, as the pane sees it (before the price is rounded to the
+/// symbol's tick, which the exchange builder does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriceClick {
+    pub side: Side,
+    pub price: Price,
 }
 
 impl Ladder {
-    pub fn update(&mut self, message: Message) {
+    /// The ticker of the pane (the order's symbol and market).
+    pub fn ticker(&self) -> exchange::Ticker {
+        self.ticker_info.ticker
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<PriceClick> {
         match message {
             Message::Scrolled(delta) => self.scroll(delta),
             Message::ResetScroll => self.reset_scroll(),
+            Message::PriceClicked(click) => return Some(click),
         }
+        None
     }
 
     fn scroll(&mut self, delta: f32) {
@@ -84,6 +102,8 @@ pub struct Ladder {
     pub config: Config,
     cache: canvas::Cache,
     last_tick: Instant,
+    /// When the order book was last updated (unlike `last_tick`, a redraw does not move it).
+    last_depth_at: Option<Instant>,
     step: PriceStep,
     scroll_px: f32,
     last_exchange_ts_ms: Option<UnixMs>,
@@ -101,6 +121,7 @@ impl Ladder {
             ticker_info,
             cache: canvas::Cache::default(),
             last_tick: Instant::now(),
+            last_depth_at: None,
             step,
             scroll_px: 0.0,
             last_exchange_ts_ms: None,
@@ -147,6 +168,7 @@ impl Ladder {
 
         self.regroup_from_depth(depth);
         self.last_exchange_ts_ms = Some(update_t);
+        self.last_depth_at = Some(Instant::now());
     }
 
     fn trade_qty_at(&self, price: Price) -> (Qty, Qty) {
@@ -226,22 +248,86 @@ impl Ladder {
     }
 }
 
+/// What the canvas remembers between events: the modifier keys held now.
+#[derive(Debug, Default)]
+pub struct Interaction {
+    modifiers: iced::keyboard::Modifiers,
+}
+
+/// The row under a y position (relative to the canvas), with its side and price. Row 0 is the
+/// spread / divider row and has no price. `scroll` and `height` are the ones the rows are drawn
+/// with, so the click lands on the row the user sees; a moved best price is in `grid`.
+fn row_at(y: f32, scroll: f32, height: f32, grid: &PriceGrid) -> Option<(Side, Price)> {
+    if !(0.0..height).contains(&y) {
+        return None;
+    }
+    let mid = height * 0.5;
+    // Inverse of `mid + top_y(idx) - scroll`, the top edge of a row.
+    let idx = ((y - mid + scroll + ROW_HEIGHT * 0.5) / ROW_HEIGHT).floor() as i32;
+    let price = grid.index_to_price(idx)?;
+    let side = if idx > 0 { Side::Bid } else { Side::Ask };
+    Some((side, price))
+}
+
+/// How old the order book may be for a click to ask for an order. A quiet book still updates
+/// within seconds; older than this, the rows may not be where the market is.
+const DEPTH_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// A click may ask for an order only on a book that has both sides and was updated recently.
+/// Without a book the grid is made from trade prices, and its bid/ask split is a guess.
+fn depth_is_usable(has_bid: bool, has_ask: bool, age: Option<Duration>) -> bool {
+    has_bid && has_ask && age.is_some_and(|a| a <= DEPTH_MAX_AGE)
+}
+
+/// What a mouse press does. Command (Ctrl) + left on a price row asks for a limit order; on a
+/// row with no price it does nothing; every other press keeps its old effect (reset scroll). A
+/// plain click never asks for an order.
+fn press_message(
+    button: mouse::Button,
+    modifiers: iced::keyboard::Modifiers,
+    row: Option<(Side, Price)>,
+) -> Option<Message> {
+    if button == mouse::Button::Left && crate::widget::is_command_modifier(modifiers) {
+        return row.map(|(side, price)| Message::PriceClicked(PriceClick { side, price }));
+    }
+    Some(Message::ResetScroll)
+}
+
 impl canvas::Program<Message> for Ladder {
-    type State = ();
+    type State = Interaction;
 
     fn update(
         &self,
-        _state: &mut Self::State,
+        state: &mut Self::State,
         event: &iced::Event,
         bounds: iced::Rectangle,
         cursor: iced_core::mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
-        let _cursor_position = cursor.position_in(bounds)?;
+        // Followed wherever the cursor is, so the key is known when the click comes.
+        if let Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
+            state.modifiers = *modifiers;
+            return None;
+        }
+
+        let cursor_position = cursor.position_in(bounds)?;
 
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(
-                mouse::Button::Middle | mouse::Button::Left | mouse::Button::Right,
-            )) => Some(canvas::Action::publish(Message::ResetScroll).and_capture()),
+                button @ (mouse::Button::Middle | mouse::Button::Left | mouse::Button::Right),
+            )) => {
+                let usable = depth_is_usable(
+                    self.best_price(Side::Bid).is_some(),
+                    self.best_price(Side::Ask).is_some(),
+                    self.last_depth_at.map(|t| t.elapsed()),
+                );
+                let row = self.build_price_grid().filter(|_| usable).and_then(|grid| {
+                    row_at(cursor_position.y, self.scroll_px, bounds.height, &grid)
+                });
+                match press_message(*button, state.modifiers, row) {
+                    Some(message) => Some(canvas::Action::publish(message).and_capture()),
+                    None => Some(canvas::Action::capture()),
+                }
+            }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let scroll_amount = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => -(*y) * ROW_HEIGHT,
@@ -938,5 +1024,133 @@ impl PriceGrid {
 
     fn top_y(idx: i32) -> f32 {
         (idx as f32) * ROW_HEIGHT - ROW_HEIGHT * 0.5
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::keyboard::Modifiers;
+
+    fn grid(best_bid: f32) -> PriceGrid {
+        let step = PriceStep {
+            units: Price::from_f32(0.5).units,
+        };
+        let best_bid = Price::from_f32(best_bid).round_to_step(step);
+        PriceGrid {
+            best_bid,
+            best_ask: best_bid.checked_add_steps(1, step).unwrap(),
+            tick: step,
+        }
+    }
+
+    fn price(v: f32) -> Price {
+        Price::from_f32(v)
+    }
+
+    /// Rows are 16 px; with a 200 px canvas the middle is 100, row 0 spans 92..108.
+    #[test]
+    fn a_row_is_found_from_its_y_with_the_scroll() {
+        let g = grid(100.0);
+        // Row 0 (the spread) has no price.
+        assert_eq!(row_at(100.0, 0.0, 200.0, &g), None);
+        assert_eq!(row_at(92.5, 0.0, 200.0, &g), None);
+        // Just below it: row 1 is the best bid; just above: row -1 is the best ask.
+        assert_eq!(
+            row_at(108.5, 0.0, 200.0, &g),
+            Some((Side::Bid, price(100.0)))
+        );
+        assert_eq!(
+            row_at(91.5, 0.0, 200.0, &g),
+            Some((Side::Ask, price(100.5)))
+        );
+        // One row further out.
+        assert_eq!(
+            row_at(124.5, 0.0, 200.0, &g),
+            Some((Side::Bid, price(99.5)))
+        );
+        assert_eq!(
+            row_at(75.5, 0.0, 200.0, &g),
+            Some((Side::Ask, price(101.0)))
+        );
+        // Scrolled down by one row: the content moves up, so the same y is one row deeper.
+        assert_eq!(
+            row_at(108.5, ROW_HEIGHT, 200.0, &g),
+            Some((Side::Bid, price(99.5)))
+        );
+        // Scrolled so the spread row sits where row 1 was.
+        assert_eq!(row_at(108.5, -ROW_HEIGHT, 200.0, &g), None);
+        // Outside the canvas.
+        assert_eq!(row_at(-1.0, 0.0, 200.0, &g), None);
+        assert_eq!(row_at(200.0, 0.0, 200.0, &g), None);
+    }
+
+    /// The row follows the best price: the same y gives the new price after the book moves.
+    #[test]
+    fn a_moved_best_price_moves_the_row_price() {
+        assert_eq!(
+            row_at(108.5, 0.0, 200.0, &grid(100.0)),
+            Some((Side::Bid, price(100.0)))
+        );
+        assert_eq!(
+            row_at(108.5, 0.0, 200.0, &grid(100.5)),
+            Some((Side::Bid, price(100.5)))
+        );
+    }
+
+    /// Command (Ctrl) + left asks for an order; a plain click, Shift and the other buttons never
+    /// do.
+    #[test]
+    fn a_click_needs_a_fresh_book_with_both_sides() {
+        let fresh = Some(Duration::from_secs(1));
+        assert!(depth_is_usable(true, true, fresh));
+        assert!(depth_is_usable(true, true, Some(DEPTH_MAX_AGE)));
+        assert!(!depth_is_usable(false, false, fresh));
+        assert!(!depth_is_usable(true, false, fresh));
+        assert!(!depth_is_usable(false, true, fresh));
+        assert!(!depth_is_usable(
+            true,
+            true,
+            Some(DEPTH_MAX_AGE + Duration::from_millis(1))
+        ));
+        assert!(!depth_is_usable(true, true, None));
+    }
+
+    #[test]
+    fn only_command_and_left_ask_for_an_order() {
+        let row = Some((Side::Bid, price(100.0)));
+        let is_order = |m: Option<Message>| matches!(m, Some(Message::PriceClicked(_)));
+        assert!(is_order(press_message(
+            mouse::Button::Left,
+            Modifiers::COMMAND,
+            row
+        )));
+        assert!(!is_order(press_message(
+            mouse::Button::Left,
+            Modifiers::empty(),
+            row
+        )));
+        assert!(!is_order(press_message(
+            mouse::Button::Left,
+            Modifiers::SHIFT,
+            row
+        )));
+        assert!(!is_order(press_message(
+            mouse::Button::Right,
+            Modifiers::COMMAND,
+            row
+        )));
+        assert!(!is_order(press_message(
+            mouse::Button::Middle,
+            Modifiers::COMMAND,
+            row
+        )));
+        // A plain click keeps its old effect.
+        assert!(matches!(
+            press_message(mouse::Button::Left, Modifiers::empty(), row),
+            Some(Message::ResetScroll)
+        ));
+        // Command on a row with no price does nothing at all.
+        assert!(press_message(mouse::Button::Left, Modifiers::COMMAND, None).is_none());
     }
 }

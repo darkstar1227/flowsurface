@@ -93,14 +93,91 @@ pub enum Event {
     /// window (main, popout or detached layout).
     TradeRequest {
         window: window::Id,
-        request: Box<crate::order_flow::PrepareRequest>,
+        order: crate::order_flow::PaneOrder,
     },
 }
 
-/// What the panes draw of the account's orders and positions (a view model, rebuilt on every
-/// view). It is never saved and never serialized. Empty until the panes draw anything.
+/// What the panes draw of the account's orders and positions (a view model, rebuilt when the
+/// app state changes). It is never saved and never serialized. For now it holds what the ladder
+/// title bar says about the account a command click would order with.
 #[derive(Debug, Clone, Default)]
-pub struct TradeOverlay {}
+pub struct TradeOverlay {
+    /// The saved accounts, with their alias (the alias is for display only).
+    pub accounts: Vec<(crate::order_flow::AccountChoice, String)>,
+    /// The account the order ticket shows now.
+    pub ticket_account: Option<uuid::Uuid>,
+    pub live_open: bool,
+}
+
+/// What the title bar says about a pane's trading account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountTag {
+    pub text: String,
+    /// A Live account, or a reason there is none: drawn in the warning colour.
+    pub alert: bool,
+}
+
+impl TradeOverlay {
+    /// The account a click in a pane of this market would order with, by the same rule the click
+    /// uses (`resolve_pane_account`), or the short reason there is none. `None` when no account
+    /// is saved or the market cannot be traded at all (nothing to say there).
+    pub fn account_tag_of(&self, market: exchange::adapter::Exchange) -> Option<AccountTag> {
+        use crate::order_flow::{AccountRefusal as R, resolve_pane_account};
+        use exchange::account::AccountEnv;
+        if self.accounts.is_empty() {
+            return None;
+        }
+        let choices: Vec<_> = self.accounts.iter().map(|(c, _)| *c).collect();
+        Some(
+            match resolve_pane_account(market, self.ticket_account, &choices, self.live_open) {
+                Ok(pick) => {
+                    let alias = self
+                        .accounts
+                        .iter()
+                        .find(|(c, _)| c.id == pick.id)
+                        .map(|(_, a)| a.as_str())
+                        .unwrap_or_default();
+                    let live = pick.env == AccountEnv::Live;
+                    AccountTag {
+                        text: format!("{alias} · {}", if live { "LIVE" } else { "TESTNET" }),
+                        alert: live,
+                    }
+                }
+                Err(R::NotTradable) => return None,
+                Err(R::NoAccount) => AccountTag {
+                    text: "No account".to_string(),
+                    alert: false,
+                },
+                Err(R::PickInTicket) => AccountTag {
+                    text: "Pick account in ticket".to_string(),
+                    alert: true,
+                },
+                Err(R::NotTested) => AccountTag {
+                    text: "Account not tested".to_string(),
+                    alert: true,
+                },
+                Err(R::LiveClosed) => AccountTag {
+                    text: "LIVE closed".to_string(),
+                    alert: true,
+                },
+            },
+        )
+    }
+
+    /// The title-bar label for a pane of this market.
+    pub fn account_tag<'a, M: 'a>(
+        &self,
+        market: exchange::adapter::Exchange,
+    ) -> Option<Element<'a, M>> {
+        let tag = self.account_tag_of(market)?;
+        let label = iced::widget::text(tag.text).size(style::text_size::SMALL);
+        Some(if tag.alert {
+            label.style(iced::widget::text::danger).into()
+        } else {
+            label.into()
+        })
+    }
+}
 
 impl Dashboard {
     pub fn from_config(
@@ -605,7 +682,7 @@ impl Dashboard {
         pixel_ratio: PixelRatio,
         theme: &'a ThemeState,
         chart_resources: &'a SharedChartResources,
-        _overlay: &'a TradeOverlay,
+        overlay: &'a TradeOverlay,
     ) -> Element<'a, Message> {
         let pane_grid: Element<_> = PaneGrid::new(&self.panes, |id, pane, maximized| {
             let is_focused = self.focus == Some((main_window.id, id));
@@ -621,6 +698,7 @@ impl Dashboard {
                 tickers_table,
                 theme,
                 chart_resources,
+                overlay,
             )
         })
         .min_size(240)
@@ -643,7 +721,7 @@ impl Dashboard {
         pixel_ratio: PixelRatio,
         theme: &'a ThemeState,
         chart_resources: &'a SharedChartResources,
-        _overlay: &'a TradeOverlay,
+        overlay: &'a TradeOverlay,
     ) -> Element<'a, Message> {
         if let Some((state, _)) = self.popout.get(&window) {
             let content = container(
@@ -661,6 +739,7 @@ impl Dashboard {
                         tickers_table,
                         theme,
                         chart_resources,
+                        overlay,
                     )
                 })
                 .on_click(pane::Message::PaneClicked),
@@ -1395,8 +1474,8 @@ impl Dashboard {
                     (Task::none(), Some(Event::IndicatorCatalog(message)))
                 }
             },
-            Some(pane::Effect::TradeRequest(request)) => {
-                (Task::none(), Some(Event::TradeRequest { window, request }))
+            Some(pane::Effect::TradeRequest(order)) => {
+                (Task::none(), Some(Event::TradeRequest { window, order }))
             }
             None => (Task::none(), None),
         }
@@ -1457,5 +1536,73 @@ impl From<fetcher::FetchUpdate> for Message {
                 req_id,
             } => Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(error, req_id)),
         }
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use crate::order_flow::AccountChoice;
+    use exchange::account::{AccountEnv, AccountProduct, AccountVenue};
+    use exchange::adapter::Exchange;
+
+    fn acc(n: u128, env: AccountEnv, tested: bool) -> (AccountChoice, String) {
+        (
+            AccountChoice {
+                id: uuid::Uuid::from_u128(n),
+                venue: AccountVenue::Binance,
+                product: AccountProduct::UsdM,
+                env,
+                tested,
+            },
+            format!("acct{n}"),
+        )
+    }
+
+    /// The title bar follows the click's own rule: the name and TESTNET / LIVE, or the reason.
+    #[test]
+    fn the_title_tag_names_the_account_or_says_why_not() {
+        let m = Exchange::BinanceLinear;
+        let none = TradeOverlay::default();
+        assert_eq!(none.account_tag_of(m), None);
+        let one = TradeOverlay {
+            accounts: vec![acc(1, AccountEnv::Testnet, true)],
+            live_open: false,
+            ..Default::default()
+        };
+        let tag = one.account_tag_of(m).unwrap();
+        assert_eq!(tag.text, "acct1 · TESTNET");
+        assert!(!tag.alert);
+        let many = TradeOverlay {
+            accounts: vec![
+                acc(1, AccountEnv::Testnet, true),
+                acc(2, AccountEnv::Testnet, true),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            many.account_tag_of(m).unwrap().text,
+            "Pick account in ticket"
+        );
+        let picked = TradeOverlay {
+            ticket_account: Some(uuid::Uuid::from_u128(2)),
+            ..many
+        };
+        assert_eq!(picked.account_tag_of(m).unwrap().text, "acct2 · TESTNET");
+        let live = TradeOverlay {
+            accounts: vec![acc(3, AccountEnv::Live, true)],
+            live_open: true,
+            ..Default::default()
+        };
+        let tag = live.account_tag_of(m).unwrap();
+        assert_eq!(tag.text, "acct3 · LIVE");
+        assert!(tag.alert);
+        let closed = TradeOverlay {
+            live_open: false,
+            ..live
+        };
+        assert_eq!(closed.account_tag_of(m).unwrap().text, "LIVE closed");
+        // Another venue's market: nothing to say.
+        assert_eq!(one.account_tag_of(Exchange::HyperliquidLinear), None);
     }
 }

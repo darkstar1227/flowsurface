@@ -69,9 +69,10 @@ pub enum Effect {
     OpenUrl(String),
     OpenNetworkSettings,
     SharedChartResources(Box<ChartResourcesMessage>),
-    /// An order asked for in the pane (a click on the ladder or the chart). Only opens the
-    /// review: the confirmation window sends nothing until the user confirms.
-    TradeRequest(Box<crate::order_flow::PrepareRequest>),
+    /// A limit order asked for with a command click on the ladder. Only opens the review (main
+    /// adds the account and the quantity): the confirmation window sends nothing until the user
+    /// confirms.
+    TradeRequest(crate::order_flow::PaneOrder),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,6 +419,7 @@ impl State {
         tickers_table: &'a TickersTable,
         theme: &'a ThemeState,
         chart_resources: &'a SharedChartResources,
+        overlay: &'a crate::screen::dashboard::TradeOverlay,
     ) -> pane_grid::Content<'a, Message, Theme, Renderer> {
         let mut top_left_buttons = if Content::Starter == self.content {
             row![]
@@ -619,6 +621,9 @@ impl State {
                     );
 
                     top_left_buttons = top_left_buttons.push(modifiers);
+                    if let Some(tag) = overlay.account_tag(panel.ticker().exchange) {
+                        top_left_buttons = top_left_buttons.push(tag);
+                    }
 
                     panel.view(timezone).map(move |message| {
                         Message::PaneEvent(id, Event::LadderInteraction(message))
@@ -825,8 +830,15 @@ impl State {
             }
             Event::Settings(message) => return self.update_settings(message),
             Event::LadderInteraction(message) => {
-                if let Content::Ladder(Some(panel)) = &mut self.content {
-                    panel.update(message);
+                if let Content::Ladder(Some(panel)) = &mut self.content
+                    && let Some(click) = panel.update(message)
+                {
+                    let order = crate::order_flow::PaneOrder::from_row(
+                        panel.ticker(),
+                        matches!(click.side, data::panel::ladder::Side::Bid),
+                        click.price,
+                    );
+                    return order.map(Effect::TradeRequest);
                 }
             }
             Event::TimeAndSalesInteraction(message) => {
