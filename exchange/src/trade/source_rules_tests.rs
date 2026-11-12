@@ -148,14 +148,35 @@ fn a_granted_request_is_made_by_the_grant_only_and_the_unbound_send_is_for_bulk_
     let g = hits(&crate_src(), "GrantedAuto { auto");
     assert_eq!(g.len(), 1, "{g:?}");
     assert!(g[0].contains("grant.rs"), "{g:?}");
-    // The send without a grant: defined in client.rs, called from bulk.rs only.
+    // The send without a grant: defined in client.rs, called from bulk.rs only. (`submit_auto`
+    // used to reach it too; it now sends under a confirmation bound to the grant's request, so
+    // this is stricter than before.)
     let u = hits(&crate_src(), "submit_auto_unbound(");
-    assert_eq!(u.len(), 2, "{u:?}");
+    assert_eq!(u.len(), 1, "{u:?}");
+    assert!(u[0].contains("bulk.rs"), "{u:?}");
+}
+
+#[test]
+fn a_replace_confirmation_is_made_in_the_replace_module_only() {
+    // The replace legs' confirmations and the grant that holds their hashes: only replace.rs
+    // (the grant and `submit_replace`) makes them, after its checks.
+    let s = hits(&crate_src(), "Spent::replace(");
+    assert_eq!(s.len(), 2, "{s:?}");
+    assert!(s.iter().all(|x| x.contains("replace.rs")), "{s:?}");
+    let g = hits(&crate_src(), "spend_for_replace(");
+    assert_eq!(g.len(), 2, "{g:?}");
     assert!(
-        u.iter()
-            .all(|x| x.contains("client.rs") || x.contains("bulk.rs")),
-        "{u:?}"
+        g.iter()
+            .all(|x| x.contains("replace.rs") || x.contains("gate.rs")),
+        "{g:?}"
     );
+    // The grant is made by `TradeClient::replace_grant` (the client's clock) only, and a replace
+    // confirmation is spent in one place.
+    let n = hits(&crate_src(), "ReplaceGrant::new(");
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert!(n[0].contains("replace.rs"), "{n:?}");
+    let r = hits(&crate_src(), "ReplaceGrant {");
+    assert!(r.iter().all(|x| x.contains("replace.rs")), "{r:?}");
 }
 
 #[test]

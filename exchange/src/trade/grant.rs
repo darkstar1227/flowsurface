@@ -36,6 +36,7 @@ use super::binance_futures;
 use super::client_id::{ClientId, Role};
 use super::decimal::Decimal;
 use super::gate::{AutoIntent, AutoPath, OrderIntent, Prepared};
+use super::preview::PreviewHash;
 use super::protect::{ProtectSpec, SpecFingerprint};
 use super::request::{BinanceRequest, Exposure, Method};
 use super::rules::FreshRules;
@@ -195,6 +196,9 @@ impl fmt::Debug for AutoGrant {
 #[derive(Debug)]
 pub struct GrantedAuto {
     pub(crate) auto: AutoIntent,
+    /// The hash of the request as the grant checked it: the send's confirmation covers only
+    /// this request.
+    pub(crate) bound: PreviewHash,
 }
 
 impl GrantedAuto {
@@ -388,7 +392,8 @@ impl AutoGrant {
                 None => self.reduce_authorised.push((role, total)),
             }
         }
-        Ok(GrantedAuto { auto })
+        let bound = auto.intent.preview().hash;
+        Ok(GrantedAuto { auto, bound })
     }
 
     fn check(&self, auto: &AutoIntent, now_ms: i64) -> Result<Checked, GrantRefusal> {

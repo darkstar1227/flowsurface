@@ -882,3 +882,61 @@ d 段最後一段。沒有新的送單路徑、沒有新的權杖來源，`LIVE_
 
 - `src/order_lines.rs`（全檔，純函式與測試）、`src/trading.rs` `HeldPosition.entry_price`／`apply_position_event`、`src/main.rs` `refresh_trade_overlay`、`src/screen/dashboard.rs` `lines_for`／`apply_trade_overlay`。
 - 沒有新的 `Serialize`、送單點或 `exchange/` 變動。
+
+## M5 f3a：改保護單的授權路徑（`exchange/src/trade/replace.rs`，只有 exchange，GUI 在 f3a2）
+
+本段只做 exchange 端的授權與閘門：不改 builder 的取整與簽章、host 白名單、https_only、redirect、proxy、Keychain，不新增 GUI 送單點（`src/` 沒有改動），不新增 `saved-state.json` 欄位，`LIVE_SENDING_ENABLED` 仍為 false。
+
+### 使用者決定（沿用 f0）
+一個確認涵蓋撤舊與下新；一律先撤後下，撤單被交易所確認後才下新單；中間有裸倉，GUI 要警示。「先下新後撤舊」是 f3b 的每交易所旗標，本段不做。
+
+### 授權綁定（`ReplaceGrant`）
+- 由**使用者對「撤舊單、下新單」的那一次確認**產生：`TradeClient::replace_grant(token, account, &old_row, &fresh)`（到期時間用 client 自己的時鐘，呼叫端不能傳時間；`ReplaceGrant::new` 只有 crate 內可見）。`token` 必須是 `ConfirmToken::for_replace(&new_preview, &old_row)`，它同時綁新單的 preview 雜湊與舊單的交易所 order id（`Binding::Replace`）。一般下單確認（`for_preview`）與批次確認都不是改單確認（`NotAnOrderConfirmation`），反過來改單確認也不能走 `submit`（`ConfirmationMismatch`）。`replace_grant` 會比對傳入的舊單列與 token 內的 id，不符回 `OldOrderMismatch`。
+- 綁定：帳戶、symbol、舊單的交易所 order id、種類（Stop 或 Target）、side、position side、數量或「全平」，以及新單 preview 雜湊。舊單必須是 `OpenKind::Algo` 且 `role` 為 `Stop` 或 `Target`；追蹤止損、`StopAndTarget`、一般單、現貨一律 `NotReplaceable`；side 或數量讀不到、id 不是純數字則 `OldOrderUnreadable`。範圍：Binance USDⓈ-M 與 OKX 永續（OKX 只限 `conditional` 型）。
+- **撤單由 grant 自己建**（Binance `DELETE /fapi/v1/algoOrder`、OKX `cancel-algos` 單筆），GUI 不傳撤單請求。要撤哪一張由使用者確認綁定的舊單 id 決定：grant 只能撤 token 所指的那一張，傳入別張的 `OpenOrder` 會被 `OldOrderMismatch` 拒絕。（舊版這裡寫「不可能撤到別的單」並不精確：當時舊單 id 不在確認範圍內。）
+- 到期：`REPLACE_GRANT_VALID_MS = 30_000`（確認視窗按下確認後立刻交給 `submit_replace`，半分鐘只容納慢的 gate 或限流）。只在撤單送出**前**檢查；撤單成功後不再因 grant 到期而放棄下新單（那會造成裸倉），新單仍受自己的規則年齡（`valid_until_ms`）限制。
+- 單次使用：`submit_replace` 以值取走 grant（不能 `Clone`，有 `compile_fail` doctest）；送出過程中即使 future 被丟棄也不能再用。
+
+### 順序與閘門（`TradeClient::submit_replace`）
+1. grant 檢查（到期、帳戶、symbol、新單雜湊、新單為 `Reduces`、撤單仍是 grant 建的那一筆）與新單形狀檢查（見下）。
+2. **兩個 leg 先全部通過 `approve`**（`Spent::replace(Cancel|Place, hash)` 只涵蓋各自雜湊的請求；F2 gate、風控、規則年齡、串流狀態）才送出任何請求。所以「可預見的」拒絕（gate、風控、串流、規則過期）不會發生在舊單已被撤之後。兩個 leg 都以 `GateClass::Reduce` 問 F2 gate。
+3. 送撤單。只有 `Outcome::Accepted` **且回傳的 id 含舊單 id** 才算撤單成功（OKX 缺 `algoId` 的 `sCode 0` 不算）。`Rejected`（含交易所回找不到單，也就是舊單已觸發或已成交）、`Unknown`、`Partial`、`NotSent` 一律作廢，**不送新單**。
+4. 才送新單。新單被拒或 Unknown 時舊單已不在。
+
+### 拒絕條件與錯誤（`ReplaceError<R>`）
+- `Refused(ReplaceRefusal)`：沒送任何請求，舊單還在。新單雜湊不符（`NewOrderMismatch`）、種類不同（`WrongKind`）、side 不同（`WrongSide`）、position side 不同（`WrongPositionSide`）、不是只減倉（`NotReducing`）、大小改變（`SizeChanged`：全平換成部分、部分換成全平，或數量大於舊單）、沿用舊單 client id（`SameClientId`）、過期（`Expired`）、帳戶或 symbol 不符、撤單被換掉（`CancelMismatch`）、確認的舊單與傳入的舊單列不同（`OldOrderMismatch`）。新單是進場單（加倉）或方向相反的保護單都落在這一類。
+- `NotSent(SubmitError<R>)`：gate、風控、串流、規則過期、帳戶不符等，沒送任何請求，舊單還在。
+- `CancelNotConfirmed(Submitted)`：撤單已送出但沒被確認；沒有新單被送出。若 outcome 是 `Unknown`，舊單可能已不在，GUI 要重讀掛單；撤單沒有 lookup（`pending` 為 `None`）。
+- `NewNotPlaced { cancel, new }`：**舊單已撤、新單沒下成**。這是 GUI 必須大聲警示的狀態（裸倉）。`new` 為 `Some` 時帶新單的 outcome，Unknown 時 `new.pending` 交給 `resolve_unknown`；為 `None` 表示新單沒有離開本機（`Locked` 或 `JournalUnavailable`）。
+- 不重試：任何一步都不會自動重送。
+- Debug：`Outcome::Unknown` 的 client id 在 `Debug` 輸出中遮蔽（Display 與邏輯不變），所以 `{:?}` 印 `ReplaceError`／`ReplaceDone`／`Submitted` 不會帶出 client id；GUI 仍不應把它們寫進 log。
+
+### 條件 51（拖曳改單在非 Connected 時由 exchange 拒絕）
+`approve` 對 `Spent::replace` 多檢查 `allows(stream, TradeAction::DragModify)`（原本就存在，只在 `Connected` 為真），兩個 leg 都檢查，所以 `Reconnecting`／`Resyncing`／`Unavailable` 連撤單都不會送。**沒有新增 `GateClass` 變體**：`data/src/config/trade_gate.rs` 對它做窮舉比對，改它超出本段授權；兩個 leg 對 F2 gate 都是 `Reduce`，F2 gate 對 Live 在 `LIVE_SENDING_ENABLED` 為 false 時一律拒絕（`data` 的 `can_send_with` 表格測試涵蓋 Live＋`Reduce`），因此新 path 對 Live 帳戶同樣被拒；exchange 測試只用一個拒絕的 gate 驗證「gate 拒絕時連撤單都不送」，不宣稱測了那個常數。
+
+### `Spent::covers` 收緊（d 段既有缺口）
+原本 `Kind::Auto => true`。現在：
+- `AttachProtective`／`CancelSibling` 經 grant 授權的請求，確認綁定 grant 檢查當下的請求雜湊（`GrantedAuto.bound`），並限制該 path 的種類（attach 只能 `Reduces`、撤兄弟只能 `Neutral`），永不涵蓋加倉。
+- 風控平倉（無 grant）與批次確認一樣只涵蓋非加倉請求（`Kind::Unbound`）。
+- `submit_auto` 不再經過 `submit_auto_unbound`；`submit_auto_unbound(` 的掃描測試因此由 2 處收緊為只有 `bulk.rs` 1 處（更嚴格，不是放寬）。
+
+### 給 f3a2（GUI）的介面
+1. 拖曳放開後用既有 `build_intent` 路徑組新單（同種類、同 side、同大小，只改價）→ `OrderIntent`，產生 preview 給確認視窗；視窗另外列出被撤的舊單：`ReplaceGrant::cancel_preview_for(account, &old_row, &fresh)` 不需要 token，確認前就能取得撤單請求的 preview（與 grant 之後送出的那一筆雜湊相同）。
+2. 使用者確認時：`client.replace_grant(ConfirmToken::for_replace(&new.preview(), &old_row), account, &old_row, &fresh)`，再 `client.submit_replace(&gate, &risk, &journal, grant, new).await`。建 grant 失敗（`ReplaceRefusal`）時沒有送任何請求。
+3. 結果對應 d4 的 `FailReason`：`Refused`／`NotSent` → 沒動，舊單還在；`CancelNotConfirmed` → 撤單失敗（`Rejected` 多半是舊單已觸發或成交）或未知（`Unknown`，要重讀掛單）；`NewNotPlaced` → 裸倉警示，並走保護失敗狀態。
+4. GUI 仍要在拖曳開始就停用非 Connected 的線（exchange 的檢查是最後一道，不是唯一一道）。
+5. 給 f3a2 的待辦（GUI 端必做）：
+   - GUI 送單點的掃描（`src/order_flow.rs`、`src/trading.rs` 的清單）要加入 `submit_replace(` 與 grant 建立點（`replace_grant(`、`ConfirmToken::for_replace(`）。
+   - d3 job 進行中的保護單不可拖曳（或讓 job 得知新 id）：`AutoGrant` 以 client id 追蹤自己發出的保護單，改單後新單的 id 不在 grant 內，止盈成交後撤兄弟會撤到舊單（not found），新單成為孤兒單。
+   - `NewNotPlaced` 要大聲警示（舊單已撤、倉位缺這一道保護）。
+   - `submit_replace` 的 future 不可隨視窗關閉被丟棄：撤單 leg 沒有 write-ahead 記錄，撤成功後被丟棄會留下裸倉，要用不隨視窗取消的 task。
+   - GUI 手動下單紀錄要記改單的兩個 leg（撤單、新單）的結果；風控記錄目前只記自動路徑。
+   - Binance hedge 模式的部分數量保護單（無 reduceOnly）會被 exchange 以 `NotReducing` 拒絕，GUI 要提早停用這類線，不要讓使用者拖了才被拒。
+   - 拖曳開始時就停用非 Connected 或 `lists_stale` 的線。
+6. `src/` 與 `data/` 沒有對 `AutoPath`、`GrantRefusal` 新增變體，既有的窮舉比對不受影響。
+
+### 需要 testnet／手動
+Binance 與 OKX 對「撤單 not found」的實際錯誤碼與時序、撤單成功但新單因「立即觸發」被拒的實際行為，都還沒在 testnet 核對；測試用本機假伺服器。
+
+### 給 security-review 的重點
+`exchange/src/trade/replace.rs`（全檔）、`gate.rs` 的 `Kind`／`Spent::covers`／`approve` 的 `is_replace` 檢查、`grant.rs` 的 `GrantedAuto.bound`、`client.rs` 的 `submit_auto`、`gate.rs` 的 `Binding::Replace`／`for_replace`／`spend_for_replace`、`outcome.rs` 的手寫 `Debug`、`source_rules_tests.rs` 的新掃描。

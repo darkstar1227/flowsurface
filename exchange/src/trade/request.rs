@@ -314,6 +314,22 @@ impl OkxRequest {
         }
     }
 
+    /// The body of a `order-algo` request.
+    pub(crate) fn algo_body(&self) -> Option<&OkxAlgoBody> {
+        match self.body.as_ref()? {
+            OkxBody::Algo(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// The items of a `cancel-algos` request.
+    pub(crate) fn cancel_algo_items(&self) -> Option<&[OkxCancelAlgo]> {
+        match self.body.as_ref()? {
+            OkxBody::CancelAlgos(v) => Some(v),
+            _ => None,
+        }
+    }
+
     pub(crate) fn lookup(&self) -> Option<Lookup> {
         match self.body.as_ref()? {
             OkxBody::Order(b) => Some(Lookup {
