@@ -33,6 +33,7 @@ use exchange::trade::{
     SubmitError, TradeClient, TradeProduct, build_intent, deviation_exceeds,
 };
 use exchange::unit::Price;
+use iced::window;
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -122,6 +123,90 @@ pub fn market_of(venue: AccountVenue, product: AccountProduct) -> Exchange {
         (AccountVenue::Okx, AccountProduct::UsdM) => Exchange::OkexLinear,
         (AccountVenue::Okx, AccountProduct::Spot) => Exchange::OkexSpot,
     }
+}
+
+/// One saved account as the pane account choice sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountChoice {
+    pub id: Uuid,
+    pub venue: AccountVenue,
+    pub product: AccountProduct,
+    pub env: AccountEnv,
+    /// The account passed its connection test in this session.
+    pub tested: bool,
+}
+
+/// Why a pane has no account to order with. Nothing is guessed: each one is said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountRefusal {
+    /// The pane's market cannot be traded here (other venue, or an inverse market).
+    NotTradable,
+    /// No saved account trades the pane's market.
+    NoAccount,
+    /// Several accounts trade it and the ticket's one is not among them: the user picks.
+    PickInTicket,
+    NotTested,
+    /// A Live account while Live sending is closed.
+    LiveClosed,
+}
+
+impl AccountRefusal {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "shown by the pane order entry of the next step")
+    )]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotTradable => "Orders cannot be placed on this market.",
+            Self::NoAccount => "No saved account trades this market.",
+            Self::PickInTicket => {
+                "Several accounts trade this market. Pick one in the order ticket first."
+            }
+            Self::NotTested => "The account has not been tested yet. Test it first.",
+            Self::LiveClosed => "Live order sending is closed in this build.",
+        }
+    }
+}
+
+/// The account a pane orders with: the ticket's account when it trades the pane's market;
+/// otherwise the only account that does; never a guess among several. The pick must have been
+/// tested, and a Live one needs Live sending open. Nothing here is stored in a pane.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the pane order entry that calls it comes with the next step"
+    )
+)]
+pub fn resolve_pane_account(
+    pane_market: Exchange,
+    ticket_account: Option<Uuid>,
+    accounts: &[AccountChoice],
+    live_open: bool,
+) -> Result<AccountChoice, AccountRefusal> {
+    let market = trade_market(pane_market).ok_or(AccountRefusal::NotTradable)?;
+    let fits = |a: &&AccountChoice| a.venue == market.venue && a.product == market.product;
+    let from_ticket = ticket_account
+        .and_then(|id| accounts.iter().find(|a| a.id == id))
+        .filter(|a| fits(a));
+    let pick = match from_ticket {
+        Some(a) => *a,
+        None => {
+            let mut matching = accounts.iter().filter(fits);
+            match (matching.next(), matching.next()) {
+                (None, _) => return Err(AccountRefusal::NoAccount),
+                (Some(a), None) => *a,
+                (Some(_), Some(_)) => return Err(AccountRefusal::PickInTicket),
+            }
+        }
+    };
+    if !pick.tested {
+        return Err(AccountRefusal::NotTested);
+    }
+    if pick.env == AccountEnv::Live && !live_open {
+        return Err(AccountRefusal::LiveClosed);
+    }
+    Ok(pick)
 }
 
 /// A quote from the ticker table, as the exact decimal (no float).
@@ -229,6 +314,8 @@ pub struct Prepared {
     pub preview: OrderPreview,
     pub slot: IntentSlot,
     pub notes: Notes,
+    /// The window the review was started in: the confirmation opens there.
+    pub origin: window::Id,
 }
 
 pub struct PrepareInput {
@@ -240,6 +327,8 @@ pub struct PrepareInput {
     /// Automatic protection is still at work for an earlier entry on the symbol (M3).
     pub auto_active: bool,
     pub request: PrepareRequest,
+    /// Carried to `Prepared` unchanged.
+    pub origin: window::Id,
     pub ref_price: Option<Decimal>,
     pub signed: SignedHttp,
     pub proxy: Arc<dyn Fn() -> ProxyState + Send + Sync>,
@@ -280,6 +369,7 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
         held,
         auto_active,
         request,
+        origin,
         ref_price,
         signed,
         proxy,
@@ -416,6 +506,7 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
         preview,
         slot: IntentSlot::new(intent),
         notes,
+        origin,
     })
 }
 
@@ -751,6 +842,161 @@ pub fn env_is_live(env: AccountEnv) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn choice(n: u128, venue: AccountVenue, product: AccountProduct) -> AccountChoice {
+        AccountChoice {
+            id: Uuid::from_u128(n),
+            venue,
+            product,
+            env: AccountEnv::Testnet,
+            tested: true,
+        }
+    }
+
+    /// The pane account is the ticket's when it fits, else the only fitting one, never a guess.
+    #[test]
+    fn the_pane_account_is_picked_by_rule_and_never_guessed() {
+        use AccountProduct::{Spot, UsdM};
+        use AccountRefusal as R;
+        use AccountVenue::{Binance, Okx};
+        let a = choice(1, Binance, UsdM);
+        let b = choice(2, Binance, UsdM);
+        let o = choice(3, Okx, UsdM);
+        let live = AccountChoice {
+            env: AccountEnv::Live,
+            ..choice(4, Binance, UsdM)
+        };
+        let untested = AccountChoice {
+            tested: false,
+            ..choice(5, Binance, UsdM)
+        };
+        let id = |c: &AccountChoice| Some(c.id);
+        let fut = Exchange::BinanceLinear;
+        // (name, market, ticket account, accounts, live open, expected id or refusal)
+        type Case = (
+            &'static str,
+            Exchange,
+            Option<Uuid>,
+            Vec<AccountChoice>,
+            bool,
+            Result<Uuid, AccountRefusal>,
+        );
+        let cases: Vec<Case> = vec![
+            ("no account", fut, None, vec![], true, Err(R::NoAccount)),
+            ("one, no ticket pick", fut, None, vec![a], true, Ok(a.id)),
+            (
+                "one, ticket picked it",
+                fut,
+                id(&a),
+                vec![a],
+                true,
+                Ok(a.id),
+            ),
+            (
+                "many, no ticket pick",
+                fut,
+                None,
+                vec![a, b],
+                true,
+                Err(R::PickInTicket),
+            ),
+            (
+                "many, ticket picked",
+                fut,
+                id(&b),
+                vec![a, b],
+                true,
+                Ok(b.id),
+            ),
+            (
+                "ticket account is another venue, one fits",
+                fut,
+                id(&o),
+                vec![o, a],
+                true,
+                Ok(a.id),
+            ),
+            (
+                "ticket account is another venue, many fit",
+                fut,
+                id(&o),
+                vec![o, a, b],
+                true,
+                Err(R::PickInTicket),
+            ),
+            (
+                "venue mismatch only",
+                fut,
+                id(&o),
+                vec![o],
+                true,
+                Err(R::NoAccount),
+            ),
+            (
+                "product mismatch only",
+                Exchange::BinanceSpot,
+                None,
+                vec![a],
+                true,
+                Err(R::NoAccount),
+            ),
+            (
+                "ticket account unknown",
+                fut,
+                Some(Uuid::from_u128(99)),
+                vec![a],
+                true,
+                Ok(a.id),
+            ),
+            (
+                "not tested",
+                fut,
+                None,
+                vec![untested],
+                true,
+                Err(R::NotTested),
+            ),
+            (
+                "live closed",
+                fut,
+                id(&live),
+                vec![live],
+                false,
+                Err(R::LiveClosed),
+            ),
+            ("live open", fut, id(&live), vec![live], true, Ok(live.id)),
+            (
+                "not tradable market",
+                Exchange::BybitLinear,
+                None,
+                vec![a],
+                true,
+                Err(R::NotTradable),
+            ),
+            (
+                "okx spot is tradable",
+                Exchange::OkexSpot,
+                None,
+                vec![choice(6, Okx, Spot)],
+                true,
+                Ok(Uuid::from_u128(6)),
+            ),
+        ];
+        for (name, market, ticket, accounts, live_open, want) in cases {
+            let got = resolve_pane_account(market, ticket, &accounts, live_open).map(|c| c.id);
+            assert_eq!(got, want, "{name}");
+        }
+        // Every refusal has words for the user.
+        for r in [
+            R::NotTradable,
+            R::NoAccount,
+            R::PickInTicket,
+            R::NotTested,
+            R::LiveClosed,
+        ] {
+            assert!(!r.message().is_empty());
+        }
+    }
 
     #[test]
     fn an_expired_send_never_touches_an_open_or_pending_review() {
@@ -1130,6 +1376,23 @@ mod tests {
         assert_eq!(mint_files, vec!["main.rs".to_string()]);
     }
 
+    /// A confirmation opens in the window the request came from, never a fixed main window,
+    /// and a review made again after the rules expired keeps that window.
+    #[test]
+    fn the_confirmation_opens_in_the_window_of_the_request() {
+        let main = include_str!("main.rs");
+        let compact: String = main.split_whitespace().collect();
+        assert!(compact.contains("PendingConfirm::new(origin,"));
+        assert!(
+            compact.contains("PendingBulk::new(origin,Kind::Bulk")
+                || compact.contains("PendingBulk::new(origin,modal::bulk_confirm::Kind::Bulk")
+        );
+        assert!(!compact.contains("PendingConfirm::new(self.main_window.id"));
+        // The send keeps the window with its request; the new review takes it from there.
+        assert!(compact.contains("(request,origin)"));
+        assert!(compact.contains("self.start_review(request,origin)"));
+    }
+
     /// "Retry protection" only opens the review: the order is sent by the confirmation handler
     /// after the user confirms (new client id, new token), never from the retry itself, and it
     /// makes no automatic order (so no grant).
@@ -1143,6 +1406,7 @@ mod tests {
             ("fn start_add_stop(", "self.open_stop_review("),
             ("fn open_stop_review(", "self.start_review("),
             ("fn start_stray_cancel(", "self.start_review("),
+            ("fn start_trade_request(", "self.start_review("),
         ] {
             let start = main.find(name).unwrap_or_else(|| panic!("{name} exists"));
             let rest = &main[start..];

@@ -69,6 +69,9 @@ pub enum Effect {
     OpenUrl(String),
     OpenNetworkSettings,
     SharedChartResources(Box<ChartResourcesMessage>),
+    /// An order asked for in the pane (a click on the ladder or the chart). Only opens the
+    /// review: the confirmation window sends nothing until the user confirms.
+    TradeRequest(Box<crate::order_flow::PrepareRequest>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

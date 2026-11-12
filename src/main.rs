@@ -101,6 +101,9 @@ struct Flowsurface {
     exchange_accounts: modal::exchange_accounts::ExchangeAccounts,
     /// The manual order form (memory only; nothing of it is saved).
     order_ticket: modal::order_ticket::OrderTicket,
+    /// What the panes draw of the orders and positions; rebuilt from the trading state when a
+    /// pane draws any. Never saved.
+    trade_overlay: dashboard::TradeOverlay,
     /// The confirmation window of one prepared order, while it is open.
     order_confirm: Option<modal::order_confirm::PendingConfirm>,
     /// The account section of the ticket (unknown results, cancel all, close all).
@@ -109,7 +112,9 @@ struct Flowsurface {
     /// Never open together with `order_confirm`: one confirmation at a time.
     bulk_confirm: Option<modal::bulk_confirm::PendingBulk>,
     /// The request being sent, kept so an expired preview can be made again.
-    order_requests: HashMap<(uuid::Uuid, String), order_flow::PrepareRequest>,
+    /// The request of each send in flight and the window its review started in (a review made
+    /// again after the rules expired opens its confirmation in the same window).
+    order_requests: HashMap<(uuid::Uuid, String), (order_flow::PrepareRequest, window::Id)>,
     /// When the ticker list of each venue was last fetched successfully. The list keeps its old
     /// prices when a fetch fails; this stamp is what tells a kept price from a fresh one (see
     /// `auto_flow::reference_price`).
@@ -294,11 +299,39 @@ impl Flowsurface {
         })
     }
 
-    /// Checks the gate again and starts the background preview of a request.
-    fn start_review(&mut self, request: order_flow::PrepareRequest) -> Task<Message> {
+    /// An order a pane asked for opens the ordinary review in the pane's own window (main,
+    /// popout or detached layout). Nothing is sent from here: the confirmation does that, and
+    /// only after the user confirms.
+    fn start_trade_request(
+        &mut self,
+        request: order_flow::PrepareRequest,
+        window: window::Id,
+    ) -> Task<Message> {
+        self.start_review(request, window)
+    }
+
+    /// Why a review did not start: on the ticket, and in a toast when the ticket is closed (a
+    /// click in a pane has no ticket to show it).
+    fn review_refused(&mut self, text: String, kind: BannerKind) {
+        if self.sidebar.active_menu() != Some(sidebar::Menu::OrderTicket) {
+            self.notifications.push(match kind {
+                BannerKind::Error => Toast::error(text.clone()),
+                _ => Toast::warn(text.clone()),
+            });
+        }
+        self.order_ticket.set_status(text, kind);
+    }
+
+    /// Checks the gate again and starts the background preview of a request. The confirmation
+    /// opens in `origin`, the window the request came from.
+    fn start_review(
+        &mut self,
+        request: order_flow::PrepareRequest,
+        origin: window::Id,
+    ) -> Task<Message> {
         use modal::order_ticket as ticket;
         if self.trading.bulk_running(request.account) || self.account_panel.is_bulk_preparing() {
-            self.order_ticket.set_status(
+            self.review_refused(
                 "A cancel all or close all is being prepared or sent. Wait for it.".to_string(),
                 BannerKind::Warning,
             );
@@ -306,7 +339,7 @@ impl Flowsurface {
         }
         let accounts = self.exchange_accounts.persisted().accounts;
         let Some(meta) = accounts.iter().find(|m| m.id == request.account).cloned() else {
-            self.order_ticket.set_status(
+            self.review_refused(
                 "The account no longer exists.".to_string(),
                 BannerKind::Error,
             );
@@ -318,7 +351,7 @@ impl Flowsurface {
         if !matches!(request.spec, exchange::trade::ManualSpec::Cancel { .. })
             && self.trading.margin_conflict(meta.id, &request.symbol)
         {
-            self.order_ticket.set_status(
+            self.review_refused(
                 "This position is held in isolated margin, but this app sends OKX orders in \
                  cross margin, so the order would not match it. Nothing was sent. Change the \
                  position on the exchange or use its own screen."
@@ -329,7 +362,7 @@ impl Flowsurface {
         }
         // `Ticker::new` asserts on odd text: never let typed text reach it unchecked.
         if !ticket::valid_symbol(&request.symbol) {
-            self.order_ticket.set_status(
+            self.review_refused(
                 "The symbol may hold up to 28 letters, digits, '-' or '_'.".to_string(),
                 BannerKind::Error,
             );
@@ -346,12 +379,11 @@ impl Flowsurface {
             false,
         );
         if let Some(why) = ticket::blocked_reason(&gate) {
-            self.order_ticket
-                .set_status(why.to_string(), BannerKind::Error);
+            self.review_refused(why.to_string(), BannerKind::Error);
             return Task::none();
         }
         let Ok(signed) = signed else {
-            self.order_ticket.set_status(
+            self.review_refused(
                 "No usable connection to the exchange.".to_string(),
                 BannerKind::Error,
             );
@@ -376,6 +408,7 @@ impl Flowsurface {
             held,
             auto_active,
             request,
+            origin,
             ref_price,
             signed,
             proxy: self.trading.proxy_reader(),
@@ -410,10 +443,12 @@ impl Flowsurface {
                     }
                     // The account of the preview itself, not the one the ticket shows now.
                     let accounts = self.exchange_accounts.persisted().accounts;
+                    // Opens in the window the review was started in.
+                    let origin = prepared.origin;
                     match modal::order_confirm::account_of(&accounts, &prepared.request) {
                         Some(meta) => {
                             self.order_confirm = Some(modal::order_confirm::PendingConfirm::new(
-                                self.main_window.id,
+                                origin,
                                 meta,
                                 &accounts,
                                 *prepared,
@@ -437,7 +472,8 @@ impl Flowsurface {
             self.account_panel.reset_form();
         }
         match action {
-            Some(Action::Review(request)) => self.start_review(*request),
+            // The ticket is a sidebar menu: it only exists in the main window.
+            Some(Action::Review(request)) => self.start_review(*request, self.main_window.id),
             Some(Action::Exit) => {
                 self.discard_order();
                 self.sidebar.set_menu(None);
@@ -658,12 +694,16 @@ impl Flowsurface {
             Ok(spec) => {
                 // `start_review` may refuse (it says why on the ticket): only claim a preview
                 // when one is really being prepared.
-                let task = self.start_review(order_flow::PrepareRequest {
-                    account: meta.id,
-                    symbol,
-                    spec,
-                    protect: None,
-                });
+                let task = self.start_review(
+                    order_flow::PrepareRequest {
+                        account: meta.id,
+                        symbol,
+                        spec,
+                        protect: None,
+                    },
+                    // Started from the account panel, a sidebar menu of the main window.
+                    self.main_window.id,
+                );
                 if self.order_ticket.is_preparing() {
                     self.account_panel.set_status(
                         "Preparing the stop. Check it in the confirmation window.".to_string(),
@@ -717,15 +757,19 @@ impl Flowsurface {
             );
             return Task::none();
         };
-        let task = self.start_review(order_flow::PrepareRequest {
-            account: meta.id,
-            symbol,
-            spec: exchange::trade::ManualSpec::Cancel {
-                id: order_id.to_string(),
-                kind,
+        let task = self.start_review(
+            order_flow::PrepareRequest {
+                account: meta.id,
+                symbol,
+                spec: exchange::trade::ManualSpec::Cancel {
+                    id: order_id.to_string(),
+                    kind,
+                },
+                protect: None,
             },
-            protect: None,
-        });
+            // Started from the account panel, a sidebar menu of the main window.
+            self.main_window.id,
+        );
         if self.order_ticket.is_preparing() {
             self.trading.mark_stray_cancel(meta.id, order_id);
             self.account_panel.set_status(
@@ -860,6 +904,8 @@ impl Flowsurface {
             }
         };
         let nonce = self.account_panel.start_bulk();
+        // The account panel is a sidebar menu: the confirmation opens in the main window.
+        let origin = self.main_window.id;
         let request = account_flow::BulkRequest {
             account: meta.id,
             action,
@@ -873,7 +919,11 @@ impl Flowsurface {
             request,
         };
         Task::perform(account_flow::prepare_bulk(input), move |r| {
-            Message::Account(account_flow::Event::BulkPrepared(nonce, r.map(Box::new)))
+            Message::Account(account_flow::Event::BulkPrepared(
+                nonce,
+                origin,
+                r.map(Box::new),
+            ))
         })
     }
 
@@ -1043,7 +1093,7 @@ impl Flowsurface {
     fn on_account_event(&mut self, event: account_flow::Event) -> Task<Message> {
         use account_flow::Event as E;
         match event {
-            E::BulkPrepared(nonce, result) => {
+            E::BulkPrepared(nonce, origin, result) => {
                 // An answer for a request that was replaced or discarded is dropped.
                 if !self.account_panel.is_bulk_current(nonce) {
                     return Task::none();
@@ -1066,7 +1116,7 @@ impl Flowsurface {
                         match accounts.iter().find(|m| m.id == preview.request.account) {
                             Some(meta) => {
                                 self.bulk_confirm = Some(modal::bulk_confirm::PendingBulk::new(
-                                    self.main_window.id,
+                                    origin,
                                     modal::bulk_confirm::Kind::Bulk(preview.request.action),
                                     meta,
                                     &accounts,
@@ -1189,6 +1239,7 @@ impl Flowsurface {
             return Task::none();
         };
         let request = conf.request.clone();
+        let origin = conf.window;
         if self.trading.bulk_running(request.account) {
             self.order_confirm = None;
             self.order_ticket.set_status(
@@ -1361,7 +1412,7 @@ impl Flowsurface {
             intent,
         };
         self.order_requests
-            .insert((request.account, request.symbol.clone()), request);
+            .insert((request.account, request.symbol.clone()), (request, origin));
         Task::perform(order_flow::send(input), Message::OrderSent)
     }
 
@@ -1479,9 +1530,10 @@ impl Flowsurface {
         self.trading
             .settle_attach(summary.account, &summary.symbol, &summary.result);
         // The request of this very send (account and symbol), never another one's.
-        let request = self
+        let (request, origin) = self
             .order_requests
-            .remove(&(summary.account, summary.symbol.clone()));
+            .remove(&(summary.account, summary.symbol.clone()))
+            .unzip();
         // A whole-position stop was accepted: the entry's failures that left the position bare
         // are cleared and its own stop is never sent. Other results keep the warning.
         if let (
@@ -1501,13 +1553,13 @@ impl Flowsurface {
                 .protection_added(summary.account, &summary.symbol, *dir);
         }
         if summary.result == order_flow::SendResult::RulesExpired
-            && let Some(request) = request
+            && let (Some(request), Some(origin)) = (request, origin)
         {
             // Not a failure: the data aged between the preview and the click. A new preview
             // is made only when nothing else is open or being prepared; it would replace or
             // outdate that other order (M2). Otherwise the user is told to review again.
             if order_flow::may_review_again(self.confirm_open(), self.order_ticket.is_preparing()) {
-                let task = self.start_review(request);
+                let task = self.start_review(request, origin);
                 if self.order_ticket.is_preparing() {
                     self.order_ticket.set_status(
                         "The trading data expired. Review the order again.".to_string(),
@@ -1602,6 +1654,7 @@ impl Flowsurface {
                 &saved_state.exchange_accounts,
             ),
             order_ticket: modal::order_ticket::OrderTicket::default(),
+            trade_overlay: dashboard::TradeOverlay::default(),
             order_confirm: None,
             account_panel: modal::account_panel::AccountPanel::default(),
             bulk_confirm: None,
@@ -1930,6 +1983,9 @@ impl Flowsurface {
                     }
                     Some(dashboard::Event::IndicatorCatalog(message)) => {
                         self.update_shared_chart_resources(message)
+                    }
+                    Some(dashboard::Event::TradeRequest { window, request }) => {
+                        self.start_trade_request(*request, window)
                     }
                     None => Task::none(),
                 };
@@ -2471,6 +2527,7 @@ impl Flowsurface {
                     pixel_ratio,
                     &self.theme,
                     self.layout_manager.chart_resources(),
+                    &self.trade_overlay,
                 )
                 .map(move |msg| Message::Dashboard {
                     layout_id: None,
@@ -2524,6 +2581,7 @@ impl Flowsurface {
                         pixel_ratio,
                         &self.theme,
                         self.layout_manager.chart_resources(),
+                        &self.trade_overlay,
                     )
                     .map(move |msg| Message::Dashboard {
                         layout_id: None,
@@ -2612,6 +2670,7 @@ impl Flowsurface {
                         pixel_ratio,
                         &self.theme,
                         self.layout_manager.chart_resources(),
+                        &self.trade_overlay,
                     )
                     .map(move |event| Message::Dashboard {
                         layout_id: Some(layout_id),

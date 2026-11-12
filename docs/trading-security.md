@@ -788,3 +788,28 @@ d 段最後一段。沒有新的送單路徑、沒有新的權杖來源，`LIVE_
 - **S7（只記錄）**：OKX `slOrdPx = -1` 搭配限價 `tpOrdPx` 的組合不會標成限價，只影響顯示文案。
 - **Flatten**：`bulk.rs` 對每個持倉用該持倉自己的 margin，不經 `margin_conflict`；該檢查只擋非撤單的 `start_review`。
 - **OKX「Add a stop-loss」**：OKX 永續（swap）以 `closeFraction=1` 的 order-algo 全平止損；OKX 現貨沒有手動保護單（`Unsupported`），按下後由 `retry_stop`／`build_intent` 顯示拒絕原因，不送單。
+
+## M5 f0：DOM 點價與拖曳改單的共用地基（沒有使用者可見的新功能）
+
+本段只鋪地基，不新增送單點，`LIVE_SENDING_ENABLED` 仍為 false，`exchange/` 沒有改動，`saved-state.json` 沒有新欄位。
+
+### 使用者決定（2026-11-12，後續段落依此實作）
+
+- **DOM 點價**：Cmd（macOS）／Ctrl＋左鍵下**限價單**（bid 側買、ask 側賣）。數量取下單票據目前的數量，沒有就拒絕。單擊永不下單。不做市價與觸價（f1 處理）。
+- **帳戶**：沿用下單票據目前選的帳戶。venue／product 與 pane 市場不符時，符合的帳戶只有一個就自動用，多個就請使用者先在票據選，**不自動猜**。pane 標題列顯示帳戶名與 TESTNET／LIVE。帳戶不存進 pane 設定或 `saved-state.json`。
+- **拖曳改保護單（f3）**：一個確認涵蓋「撤舊＋下新」（exchange 新增 `ReplaceProtective` path 與 grant，需 security-review）。一律先撤後下並顯示裸倉警示；「先下新」做成每交易所旗標、預設關閉。只拖止損／止盈，不拖追蹤與進場單。Escape 取消拖曳。百分比／對數刻度不允許拖曳。
+
+### f0 做了什麼
+
+1. **確認視窗開在發起視窗。** `PrepareInput.origin` → `Prepared.origin`，`PendingConfirm::new` 用它；`BulkPrepared` 事件帶 window，`PendingBulk::new` 用它。送出時 `order_requests` 連同視窗一起記，`RulesExpired` 重新預覽沿用同一個視窗。票據與帳戶面板是主視窗的側欄選單，所以由它們發起的一律是主視窗；pane 發起的用 pane 自己的視窗（主視窗、popout、detached layout 三種）。`PrepareRequest` 本身沒變，所以請求相等性與既有簽章不受影響。
+2. **路由。** `pane::Effect::TradeRequest` → `dashboard::Event::TradeRequest { window, request }` → `Flowsurface::start_trade_request`，只呼叫 `start_review`（開 review，不送單）。目前沒有 pane 會產生它。
+3. **拒絕要讓使用者看到。** `start_review` 的所有拒絕改走 `review_refused`：照舊寫在票據上，票據沒開時另外跳 toast。
+4. **帳戶解析純函式** `order_flow::resolve_pane_account`：只依規則選，不猜。選到的帳戶必須已測試，Live 帳戶還要 Live 開放。拒絕原因為 `AccountRefusal`（不可交易、沒有帳戶、需在票據選、未測試、Live 未開放），各有英文說明。
+5. **`TradeOverlay`** view-model 空殼接進 `Dashboard::view`／`view_window`（三個呼叫處）。不 `Serialize`，由 `Flowsurface.trade_overlay` 持有。
+6. 新發起函式 `start_trade_request` 加進掃描測試清單：只開 review，不得出現 `.submit(`、`submit_auto(`、`AutoIntent::new(`、`auto_flow::mint(`、`confirm_order` 等。
+
+### 給 security-review 的重點
+
+- 送單點未增加：`.submit(` 仍只在 `order_flow.rs`，`submit_auto(`／`AutoIntent::new(` 仍只在 `auto_flow.rs`。
+- 條件 51 仍只擋進場；拖曳改單的「非 Connected 禁止」判定留給 f3（含 EX 端旗標）。
+- 兩處 `#[expect(dead_code)]`（解析函式與其訊息文字）只在非測試建置生效，f1 開始使用時編譯器會要求移除。
