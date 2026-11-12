@@ -197,7 +197,8 @@ impl OverlayView<'_> {
     }
 
     /// The account's orders and position as horizontal lines with a label at the right edge of
-    /// the plot (kind, size). Read-only: nothing here can be grabbed. A line whose lists may be
+    /// the plot (kind, size). Painting only: grabbing a stop or target line is `order_drag`. A line
+    /// whose lists may be
     /// out of date (condition 51) is dashed and faded and its label says "stale".
     fn paint_order_lines(&self, frame: &mut PaintInputs, scene: &Scene, palette: &Extended) {
         let plot = scene.layout.regions.plot;

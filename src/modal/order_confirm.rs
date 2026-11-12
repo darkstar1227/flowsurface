@@ -6,7 +6,9 @@
 //! `main`). The token is made from the stored preview, never from a fresh one.
 
 use crate::{
-    order_flow::{Deviation, IntentSlot, Notes, OrderSource, PrepareRequest, Prepared},
+    order_flow::{
+        Deviation, IntentSlot, Notes, OrderSource, PrepareRequest, Prepared, ReplaceInfo,
+    },
     protect_attach::{AttachNote, AttachPlan, confirmation_lines},
     style,
 };
@@ -48,7 +50,9 @@ pub struct ConfirmGuard {
 impl ConfirmGuard {
     pub fn new(live: bool, source: OrderSource, now: Instant) -> Self {
         let live_delay = if live { LIVE_DELAY } else { Duration::ZERO };
-        let dom_delay = if source == OrderSource::Dom {
+        // A click in the order book and the release of a drag on the chart both end in a gesture
+        // that can double: the first moments of the confirmation take no click.
+        let dom_delay = if matches!(source, OrderSource::Dom | OrderSource::Replace) {
             DOM_DELAY
         } else {
             Duration::ZERO
@@ -108,6 +112,7 @@ pub fn account_label(m: &AccountMeta, saved: &[AccountMeta]) -> String {
 pub fn source_line(source: OrderSource) -> Option<&'static str> {
     match source {
         OrderSource::Dom => Some("From the order book (DOM)"),
+        OrderSource::Replace => Some("Dragged on the chart"),
         OrderSource::Ticket => None,
     }
 }
@@ -140,6 +145,50 @@ pub fn trigger_basis_line(spec: &exchange::trade::ManualSpec) -> Option<&'static
     }
 }
 
+/// The lines a replace confirmation adds: the cancel and the new order in words, and what to
+/// watch for. The `bool` is a warning. The cancel's own fields are listed by the view.
+pub fn replace_lines(info: &ReplaceInfo) -> Vec<(String, bool)> {
+    use exchange::trade::ReplaceKind;
+    let name = match info.kind {
+        ReplaceKind::Stop => "stop-loss",
+        ReplaceKind::Target => "take-profit",
+    };
+    let mut lines = vec![
+        (
+            format!(
+                "Cancel the old {name} (trigger {}) → add the new {name} (trigger {}).",
+                info.old_trigger.to_plain_string(),
+                info.new_trigger.to_plain_string()
+            ),
+            false,
+        ),
+        (
+            format!(
+                "The old order is cancelled first. Until the new one is accepted the position is \
+                 briefly without this {name}. If the new order is refused it stays without it, \
+                 and a red warning says so."
+            ),
+            true,
+        ),
+    ];
+    if info.immediate == Some(true) {
+        lines.push((
+            format!(
+                "The new trigger is at or beyond the ticker price: the {name} may fire at once."
+            ),
+            true,
+        ));
+    }
+    if info.immediate.is_none() {
+        lines.push((
+            "No ticker price was available to check whether the new trigger fires at once."
+                .to_string(),
+            false,
+        ));
+    }
+    lines
+}
+
 pub struct PendingConfirm {
     pub window: iced::window::Id,
     pub request: PrepareRequest,
@@ -150,6 +199,9 @@ pub struct PendingConfirm {
     slot: IntentSlot,
     notes: Notes,
     guard: ConfirmGuard,
+    /// Only for a replace: the old order, the cancel that goes with the new order and the
+    /// triggers.
+    replace: Option<ReplaceInfo>,
 }
 
 impl PendingConfirm {
@@ -173,7 +225,13 @@ impl PendingConfirm {
             slot: prepared.slot,
             notes: prepared.notes,
             guard: ConfirmGuard::new(live, prepared.source, now),
+            replace: prepared.replace,
         }
+    }
+
+    /// The old order this confirmation would replace, as the review read it.
+    pub fn replace_info(&self) -> Option<&ReplaceInfo> {
+        self.replace.as_ref()
     }
 
     pub fn waiting(&self, now: Instant) -> bool {
@@ -191,7 +249,8 @@ impl PendingConfirm {
 
     /// The token and the intent, once. The token is for the preview that was shown.
     pub fn confirm(&mut self, now: Instant) -> Option<(ConfirmToken, OrderIntent)> {
-        if !self.guard.try_confirm(now) {
+        // A replace is confirmed by `confirm_replace` only: its token binds the old order too.
+        if self.replace.is_some() || !self.guard.try_confirm(now) {
             return None;
         }
         let intent = self.slot.take()?;
@@ -199,10 +258,32 @@ impl PendingConfirm {
         Some((token, intent))
     }
 
+    /// The replace's token, the new order's intent and the old row, once. The token is for the
+    /// new order's stored preview and the old row the user saw.
+    pub fn confirm_replace(
+        &mut self,
+        now: Instant,
+    ) -> Option<(ConfirmToken, OrderIntent, ReplaceInfo)> {
+        let info = self.replace.clone()?;
+        if !self.guard.try_confirm(now) {
+            return None;
+        }
+        let intent = self.slot.take()?;
+        let token = ConfirmToken::for_replace(&self.preview, &info.old);
+        Some((token, intent, info))
+    }
+
     pub fn view(&self, now: Instant) -> Element<'_, Message> {
-        let mut title = row![text("Confirm order").size(style::text_size::SECTION)]
-            .spacing(8)
-            .align_y(iced::Alignment::Center);
+        let mut title = row![
+            text(if self.replace.is_some() {
+                "Confirm replace"
+            } else {
+                "Confirm order"
+            })
+            .size(style::text_size::SECTION)
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
         if self.live {
             title = title.push(live_tag());
         } else {
@@ -236,6 +317,32 @@ impl PendingConfirm {
 
         if let Some(line) = source_line(self.source) {
             content = content.push(text(line).size(style::text_size::SMALL));
+        }
+        if let Some(info) = &self.replace {
+            // The cancel first, then what replaces it; the fields below are the new order's.
+            let mut block = column![
+                text(format!(
+                    "Cancelled first: {:?} {}",
+                    info.cancel.method, info.cancel.path
+                ))
+                .size(style::text_size::SMALL)
+            ]
+            .spacing(2);
+            for f in &info.cancel.fields {
+                block = block
+                    .push(text(format!("   {} {}", f.name, f.value)).size(style::text_size::SMALL));
+            }
+            block = block.push(
+                text("Then the new order listed above is placed.").size(style::text_size::SMALL),
+            );
+            for (line, is_warn) in replace_lines(info) {
+                block = block.push(if is_warn {
+                    warn(line)
+                } else {
+                    text(line).size(style::text_size::SMALL).into()
+                });
+            }
+            content = content.push(block);
         }
         if let Some(line) = exposure_line(&self.preview.exposure) {
             content = content.push(text(line).size(style::text_size::SMALL));
@@ -450,6 +557,15 @@ mod tests {
                         p.display()
                     );
                 }
+                // A replace token binds the stored preview and the old row the user saw.
+                for line in code.lines().filter(|l| l.contains("for_replace(")) {
+                    assert!(
+                        p.ends_with("order_confirm.rs")
+                            && line.contains("for_replace(&self.preview, &info.old)"),
+                        "{}: {line}",
+                        p.display()
+                    );
+                }
                 for line in code.lines().filter(|l| l.contains("for_bulk(")) {
                     assert!(
                         p.ends_with("bulk_confirm.rs")
@@ -563,5 +679,21 @@ mod tests {
                 .contains("Reduces")
         );
         assert!(exposure_line(&Exposure::Neutral).is_none());
+    }
+
+    #[test]
+    fn a_replace_names_its_source_and_waits_like_the_order_book() {
+        assert_eq!(
+            source_line(OrderSource::Replace),
+            Some("Dragged on the chart")
+        );
+        let start = t0();
+        let mut test = ConfirmGuard::new(false, OrderSource::Replace, start);
+        assert!(test.waiting(start));
+        assert!(!test.try_confirm(start + DOM_DELAY - Duration::from_millis(1)));
+        assert!(test.try_confirm(start + DOM_DELAY));
+        let mut live = ConfirmGuard::new(true, OrderSource::Replace, start);
+        assert!(!live.try_confirm(start + DOM_DELAY));
+        assert!(live.try_confirm(start + LIVE_DELAY));
     }
 }

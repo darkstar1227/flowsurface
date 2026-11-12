@@ -74,6 +74,8 @@ pub enum Action {
     OpenNetworkSettings,
     FocusWidget(iced::widget::Id),
     SharedChartResources(Box<ChartResourcesMessage>),
+    /// A stop or target line was dragged (f3a2).
+    ReplaceRequest(crate::replace_flow::PaneReplace),
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +342,17 @@ impl KlineChart {
                     }
                     KlineWidgetEvent::StudiesRemove => {
                         let _ = self.apply_command(ChartCommand::Study(StudyCommand::RemoveAll));
+                    }
+                    KlineWidgetEvent::OrderLineMoved { order_id, price } => {
+                        let ticker = self.base_ticker_info().ticker;
+                        return crate::replace_flow::decimal_of_price(price).map(|price| {
+                            Action::ReplaceRequest(crate::replace_flow::PaneReplace {
+                                market: ticker.exchange,
+                                symbol: ticker.to_full_symbol_and_type().0,
+                                order_id,
+                                price,
+                            })
+                        });
                     }
                     KlineWidgetEvent::UndoRequested => return self.undo_edit(),
                     KlineWidgetEvent::RedoRequested => return self.redo_edit(),

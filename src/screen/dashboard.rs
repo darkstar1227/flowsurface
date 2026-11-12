@@ -95,6 +95,12 @@ pub enum Event {
         window: window::Id,
         order: crate::order_flow::PaneOrder,
     },
+    /// A pane's stop or target line was dragged to a price (f3a2). `window` is where the
+    /// confirmation opens.
+    ReplaceRequest {
+        window: window::Id,
+        request: crate::replace_flow::PaneReplace,
+    },
 }
 
 /// What the panes draw of the account's orders and positions (a view model, rebuilt when the
@@ -1519,6 +1525,10 @@ impl Dashboard {
             Some(pane::Effect::TradeRequest(order)) => {
                 (Task::none(), Some(Event::TradeRequest { window, order }))
             }
+            Some(pane::Effect::ReplaceRequest(request)) => (
+                Task::none(),
+                Some(Event::ReplaceRequest { window, request }),
+            ),
             None => (Task::none(), None),
         }
     }
@@ -1659,6 +1669,8 @@ mod overlay_tests {
                 qty: None,
                 whole: true,
                 stale: false,
+                grab: crate::order_lines::Grab::No,
+                contracts: false,
             },
         }
     }

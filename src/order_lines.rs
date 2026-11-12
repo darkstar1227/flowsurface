@@ -1,11 +1,26 @@
 //! What the charts and the order book draw of an account's orders and position: a read-only
-//! view model made from the account's last lists. It is never saved (no `Serialize`), holds no
-//! order id and is not part of the drawings library (conditions 51 and 78 in
-//! `docs/trading-security.md`).
+//! view model made from the account's last lists. It is never saved (no `Serialize`) and is not
+//! part of the drawings library (conditions 51 and 78 in `docs/trading-security.md`). Since f3a2
+//! a stop or target line that can be dragged carries the exchange id of its order (`Grab::Yes`),
+//! so a drag names the order it moves; that id is memory-only like the rest of the line, and it is
+//! never a client id.
 
 use exchange::trade::{Decimal, Dir, OpenKind, OpenOrder, ProtectRole, Side};
 
+use crate::replace_flow::DragBlock;
 use crate::trading::HeldPosition;
+
+/// Whether the line may be dragged to another price (f3a2).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Grab {
+    /// Not a stop or a target of the replace path (entry, trailing, position, plain limit…).
+    #[default]
+    No,
+    /// A stop or target that cannot be dragged now, with the reason the chart shows.
+    Blocked(DragBlock),
+    /// Draggable; the exchange id of the order the line is drawn from.
+    Yes(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -43,6 +58,10 @@ pub struct OrderLine {
     /// The lists may not match the exchange (condition 51): not connected, not synchronised or
     /// an algo event arrived after the snapshot. The line is drawn as "may be out of date".
     pub stale: bool,
+    /// Draggable, blocked or neither (f3a2).
+    pub grab: Grab,
+    /// The size is in OKX contracts, not base units: the label and the tooltip say so.
+    pub contracts: bool,
 }
 
 impl OrderLine {
@@ -55,6 +74,9 @@ impl OrderLine {
         } else if let Some(q) = &self.qty {
             text.push(' ');
             text.push_str(&q.to_plain_string());
+            if self.contracts {
+                text.push_str(" ct");
+            }
         }
         if self.kind == LineKind::Trailing {
             text.push_str(" trailing");
@@ -96,11 +118,49 @@ pub struct SymbolLine {
     pub line: OrderLine,
 }
 
+/// What the lines of one account need to know besides its rows (f3a2).
+pub struct Ctx<'a> {
+    /// A spot account: a sell of what is held reduces, there are no reduce-only flags.
+    pub spot: bool,
+    /// OKX swap: sizes are contracts.
+    pub contracts: bool,
+    /// Whether a row's line may be dragged; called for stop and target rows only.
+    pub grab: &'a dyn Fn(&OpenOrder) -> Grab,
+}
+
 /// The lines of one account, from its open orders and held positions. A row that lacks a field
-/// (side, price) is not drawn: nothing is guessed.
+/// (side, price) is not drawn: nothing is guessed. Nothing is draggable here.
+#[cfg(test)]
 pub fn lines_of(orders: &[OpenOrder], positions: &[HeldPosition], stale: bool) -> Vec<SymbolLine> {
-    let mut out: Vec<SymbolLine> = orders.iter().filter_map(|o| order_line(o, stale)).collect();
-    out.extend(positions.iter().filter_map(|p| position_line(p, stale)));
+    lines_with(
+        orders,
+        positions,
+        stale,
+        &Ctx {
+            spot: false,
+            contracts: false,
+            grab: &|_| Grab::No,
+        },
+    )
+}
+
+/// [`lines_of`] with the account's context: spot sells, contract sizes and which lines can be
+/// grabbed.
+pub fn lines_with(
+    orders: &[OpenOrder],
+    positions: &[HeldPosition],
+    stale: bool,
+    ctx: &Ctx<'_>,
+) -> Vec<SymbolLine> {
+    let mut out: Vec<SymbolLine> = orders
+        .iter()
+        .filter_map(|o| order_line(o, stale, ctx))
+        .collect();
+    out.extend(
+        positions
+            .iter()
+            .filter_map(|p| position_line(p, stale, ctx)),
+    );
     out
 }
 
@@ -108,12 +168,12 @@ fn positive(d: Option<Decimal>) -> Option<Decimal> {
     d.filter(Decimal::is_positive)
 }
 
-fn order_line(o: &OpenOrder, stale: bool) -> Option<SymbolLine> {
+fn order_line(o: &OpenOrder, stale: bool, ctx: &Ctx<'_>) -> Option<SymbolLine> {
     // A plain resting limit order has no role. It is an entry unless it reduces the position,
     // and a reducing limit (a manual take-profit style close) is drawn as a target: it exits
     // at a chosen price, which is what a target line says. Nothing else is guessed.
     let Some(role) = o.role else {
-        return plain_limit_line(o, stale);
+        return plain_limit_line(o, stale, ctx);
     };
     // Only a conditional (algo) row has a role. An OKX entry that merely carries attached
     // take-profit / stop-loss has none (`attached`): they are not in force, so nothing is drawn.
@@ -134,6 +194,13 @@ fn order_line(o: &OpenOrder, stale: bool) -> Option<SymbolLine> {
         (true, ProtectRole::Target) => LineKind::Target,
         (true, ProtectRole::Trailing) => LineKind::Trailing,
     };
+    // Only a stop or a target of one trigger can be moved (the exchange layer decides again).
+    let grab = match (kind, role) {
+        (LineKind::Stop, ProtectRole::Stop) | (LineKind::Target, ProtectRole::Target) => {
+            (ctx.grab)(o)
+        }
+        _ => Grab::No,
+    };
     Some(SymbolLine {
         symbol: o.symbol.clone(),
         line: OrderLine {
@@ -143,19 +210,27 @@ fn order_line(o: &OpenOrder, stale: bool) -> Option<SymbolLine> {
             qty: if o.close_position { None } else { o.qty },
             whole: o.close_position,
             stale,
+            grab,
+            contracts: ctx.contracts,
         },
     })
 }
 
-fn plain_limit_line(o: &OpenOrder, stale: bool) -> Option<SymbolLine> {
+fn plain_limit_line(o: &OpenOrder, stale: bool, ctx: &Ctx<'_>) -> Option<SymbolLine> {
     if o.kind != OpenKind::Plain {
         return None;
     }
     let price = positive(o.price)?;
     let side = o.side?;
-    let reduces = match o.position_side {
-        Some(leg) => side == leg.closing_side(),
-        None => o.close_position || o.reduce_only,
+    // A spot sell is a sale of what is held: it never opens anything, so it is a target (an exit
+    // at a chosen price), not an entry. A spot buy adds.
+    let reduces = if ctx.spot {
+        side == Side::Sell
+    } else {
+        match o.position_side {
+            Some(leg) => side == leg.closing_side(),
+            None => o.close_position || o.reduce_only,
+        }
     };
     Some(SymbolLine {
         symbol: o.symbol.clone(),
@@ -170,11 +245,13 @@ fn plain_limit_line(o: &OpenOrder, stale: bool) -> Option<SymbolLine> {
             qty: o.qty,
             whole: false,
             stale,
+            grab: Grab::No,
+            contracts: ctx.contracts,
         },
     })
 }
 
-fn position_line(p: &HeldPosition, stale: bool) -> Option<SymbolLine> {
+fn position_line(p: &HeldPosition, stale: bool, ctx: &Ctx<'_>) -> Option<SymbolLine> {
     let price = positive(p.entry_price)?;
     Some(SymbolLine {
         symbol: p.symbol.clone(),
@@ -188,6 +265,9 @@ fn position_line(p: &HeldPosition, stale: bool) -> Option<SymbolLine> {
             qty: Some(p.qty),
             whole: false,
             stale,
+            grab: Grab::No,
+            // An OKX position's size (`pos`) is in contracts as well.
+            contracts: ctx.contracts,
         },
     })
 }
@@ -457,5 +537,70 @@ mod tests {
             false,
         );
         assert_eq!(l[0].line.price_f32(), Some(58000.5));
+    }
+
+    fn with_ctx(orders: &[OpenOrder], spot: bool, contracts: bool, yes: bool) -> Vec<SymbolLine> {
+        let grab = move |o: &OpenOrder| {
+            if yes {
+                Grab::Yes(o.id.clone())
+            } else {
+                Grab::No
+            }
+        };
+        lines_with(
+            orders,
+            &[held("BTCUSDT", Dir::Long, Some("60000"))],
+            false,
+            &Ctx {
+                spot,
+                contracts,
+                grab: &grab,
+            },
+        )
+    }
+
+    #[test]
+    fn only_stop_and_target_rows_ask_for_a_grab() {
+        let v = with_ctx(
+            &[
+                algo(ProtectRole::Stop, Side::Sell, Some("58000")),
+                algo(ProtectRole::Target, Side::Sell, Some("65000")),
+                limit(Side::Buy, Some("59000")),
+            ],
+            false,
+            false,
+            true,
+        );
+        let by_kind = |k: LineKind| v.iter().find(|l| l.line.kind == k).unwrap();
+        assert_eq!(by_kind(LineKind::Stop).line.grab, Grab::Yes("1".into()));
+        assert_eq!(by_kind(LineKind::Target).line.grab, Grab::Yes("1".into()));
+        assert_eq!(by_kind(LineKind::Entry).line.grab, Grab::No);
+        assert_eq!(by_kind(LineKind::Position).line.grab, Grab::No);
+    }
+
+    #[test]
+    fn a_spot_sell_limit_is_a_target_and_a_spot_buy_limit_an_entry() {
+        let sell = with_ctx(&[limit(Side::Sell, Some("70000"))], true, false, false);
+        assert!(sell.iter().any(|l| l.line.kind == LineKind::Target));
+        let buy = with_ctx(&[limit(Side::Buy, Some("50000"))], true, false, false);
+        assert!(buy.iter().any(|l| l.line.kind == LineKind::Entry));
+    }
+
+    #[test]
+    fn contract_sizes_are_labelled_with_their_unit() {
+        let v = with_ctx(
+            &[algo(ProtectRole::Stop, Side::Sell, Some("58000"))],
+            false,
+            true,
+            false,
+        );
+        assert_eq!(v[0].line.label(), "SL 0.5 ct");
+        let v = with_ctx(
+            &[algo(ProtectRole::Stop, Side::Sell, Some("58000"))],
+            false,
+            false,
+            false,
+        );
+        assert_eq!(v[0].line.label(), "SL 0.5");
     }
 }

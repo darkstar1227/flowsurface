@@ -618,6 +618,9 @@ pub struct TradingState {
     sent_ids: VecDeque<String>,
     /// Cancels opened from a stray-order button: checked again when the user confirms.
     stray_cancels: HashSet<(Uuid, String)>,
+    /// Stop and target replaces in flight, and the failures of those that left a position
+    /// without its order (f3a2).
+    replace: crate::replace_flow::ReplaceFlow,
 }
 
 /// How long a position has to stay without a stop on fresh lists before it is called bare. The
@@ -798,6 +801,7 @@ impl TradingState {
             watch: BareWatch::default(),
             sent_ids: VecDeque::new(),
             stray_cancels: HashSet::new(),
+            replace: crate::replace_flow::ReplaceFlow::default(),
         }
     }
 
@@ -873,6 +877,39 @@ impl TradingState {
         self.accounts
             .get(&id)
             .map_or(&[], |rt| rt.positions.as_slice())
+    }
+
+    /// A replace of a protective order of the account is being sent (f3a2).
+    pub fn replace_busy(&self, id: Uuid) -> bool {
+        self.replace.is_busy(id)
+    }
+
+    pub fn replace_flow_mut(&mut self) -> &mut crate::replace_flow::ReplaceFlow {
+        &mut self.replace
+    }
+
+    /// What decides whether a stop or target line of the account can be dragged (f3a2), from the
+    /// account's own state. `None` for an account the app has no runtime for.
+    pub fn replace_guard(&self, id: Uuid, live_open: bool) -> Option<crate::replace_flow::Guard> {
+        let rt = self.accounts.get(&id)?;
+        Some(crate::replace_flow::Guard {
+            venue: rt.meta.venue,
+            product: rt.meta.product,
+            live: rt.meta.env == exchange::account::AccountEnv::Live,
+            live_open,
+            stream: rt.state,
+            lists_stale: self.lists_stale(id),
+            busy: self.replace.is_busy(id),
+        })
+    }
+
+    /// An automatic protection job of the app works on this order (d3). The order is known by its
+    /// client id; a row that carries none is judged by the symbol having a job at work.
+    pub fn is_auto_order(&self, id: Uuid, row: &OpenOrder) -> bool {
+        match row.client_id.as_deref() {
+            Some(client_id) => self.auto.knows_client_id(client_id),
+            None => self.auto.is_active(id, &row.symbol),
+        }
     }
 
     /// The order and position lists may not match the exchange: no stream, one that is not
@@ -1251,6 +1288,18 @@ impl TradingState {
         }
     }
 
+    /// A replace ended: its send ends, and only a result that stayed unknown keeps the symbol
+    /// blocked. Returns whether it does (the unknown list is then read again). The order lists
+    /// are never marked here: only an exchange event marks them, and a snapshot clears the mark.
+    pub fn on_replace_result(&mut self, summary: &crate::replace_flow::ReplaceSummary) -> bool {
+        let unresolved = crate::replace_flow::keeps_symbol_blocked(&summary.result);
+        self.finish_send(summary.account, &summary.symbol, unresolved);
+        if summary.journal_failed {
+            self.set_journal_failed();
+        }
+        unresolved
+    }
+
     /// The closer of the account's running stream, for deleting the account.
     pub fn closer_for(&self, id: Uuid) -> Option<StreamCloser> {
         match &self.accounts.get(&id)?.phase {
@@ -1381,12 +1430,18 @@ impl TradingState {
 
     /// The entries of the account whose protection needs the user (condition 65).
     pub fn auto_failures(&self, id: Uuid) -> Vec<FailureView> {
-        self.auto.failures_for(id)
+        let mut all = self.auto.failures_for(id);
+        // The new order of a replace that did not come out (f3a2) is a banner of the same kind.
+        all.extend(self.replace.failure_views(id));
+        all
     }
 
     /// The user says an entry's protection is handled: it leaves the book and no longer blocks
     /// its symbol. Only the book is touched, never an unknown result's record or lock.
     pub fn dismiss_failure(&mut self, id: Uuid, key: &str) -> Result<String, DismissError> {
+        if crate::replace_flow::ReplaceFlow::owns_key(key) {
+            return self.replace.dismiss(id, key).ok_or(DismissError::NotFound);
+        }
         let symbol = self.auto.dismiss(id, key)?;
         self.forget_finished();
         Ok(symbol)
@@ -1396,13 +1451,16 @@ impl TradingState {
     /// cleared and the entry's own stop is never sent.
     pub fn protection_added(&mut self, id: Uuid, symbol: &str, dir: exchange::trade::Dir) {
         self.auto.protection_added(id, symbol, dir);
+        self.replace.protection_added(id, symbol, dir);
         self.forget_finished();
     }
 
     /// The accounts that have a protection failure the user has not been told about by a system
     /// notification, once per entry.
     pub fn take_failure_notices(&mut self) -> Vec<Uuid> {
-        self.auto.take_to_notify()
+        let mut all = self.auto.take_to_notify();
+        all.extend(self.replace.take_notices());
+        all
     }
 
     /// Symbols with protection listed for an entry that has no position yet (a resting limit
@@ -1986,12 +2044,24 @@ pub fn standing_alerts(
                 .find(|m| m.id == *id)
                 .or_else(|| state.accounts.get(id).map(|rt| &rt.meta))
                 .map_or_else(|| "an account".to_string(), |m| display_name(saved, m));
+            // Without a saved record there is nothing to release in the Order ticket (a task
+            // that ended with no answer leaves none): only a restart lifts the block.
+            let account = account_key(*id);
+            let has_record = state.boot.as_ref().is_some_and(|b| {
+                b.records
+                    .iter()
+                    .any(|r| r.account == account && r.symbol == *symbol)
+            });
+            let how = if has_record {
+                "until you release it by hand (Order ticket) or the app restarts"
+            } else {
+                "until the app restarts"
+            };
             out.push(alert(
                 Severity::Error,
                 format!(
                     "{who}: the result of an order on {symbol} is unknown. New entries on this \
-                     symbol stay blocked until you release it by hand (Order ticket) or the app \
-                     restarts; check the exchange."
+                     symbol stay blocked {how}; check the exchange."
                 ),
             ));
         }
@@ -2887,6 +2957,25 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_pair_alert_only_offers_the_release_when_a_record_exists() {
+        let (mut t, m, _) = running();
+        t.pairs
+            .insert((m.id, "BTCUSDT".into()), PairState::Unresolved);
+        let all = texts(&standing_alerts(&t, &TradeSession::default(), &[]));
+        assert!(all.contains("until the app restarts"), "{all}");
+        assert!(!all.contains("release it by hand"), "{all}");
+
+        let mut rec = RecordView::new(record(9, "BTCUSDT", SECRET_CID), None);
+        rec.account = account_key(m.id);
+        t.on_booted(BootReport {
+            journal_unreadable: false,
+            records: vec![rec],
+        });
+        let all = texts(&standing_alerts(&t, &TradeSession::default(), &[]));
+        assert!(all.contains("release it by hand (Order ticket)"), "{all}");
+    }
+
+    #[test]
     fn alert_for_a_damaged_order_journal() {
         let mut t = booted();
         assert!(!texts(&standing_alerts(&t, &TradeSession::default(), &[])).contains("journal"));
@@ -3013,7 +3102,15 @@ mod tests {
         let src = include_str!("trading.rs");
         // The tests module only: single `#[cfg(test)]` items come before it and stay scanned.
         let code = src.split("#[cfg(test)]\nmod tests").next().unwrap();
-        for call in [".submit(", ".cancel_all(", ".auto_close(", "submit_auto("] {
+        for call in [
+            ".submit(",
+            ".cancel_all(",
+            ".auto_close(",
+            "submit_auto(",
+            "submit_replace(",
+            "replace_grant(",
+            "for_replace(",
+        ] {
             assert!(!code.contains(call), "{call} must not appear in trading.rs");
         }
         // `.flatten()` without arguments is `Stream::flatten`; an order flatten takes arguments.
@@ -3320,6 +3417,60 @@ mod tests {
         let stale = t.holdings(m.id, "BTCUSDT");
         assert!(stale.stale);
         assert!(check_new_entry(usdm, one_way, held_dir, &stale).is_err());
+    }
+
+    #[test]
+    fn a_finished_replace_never_leaves_the_lists_stale_so_retry_protection_stays_usable() {
+        use crate::replace_flow::{CancelEnd, NewLeg, ReplaceResult};
+        // A replace that changed nothing on the exchange (cancel refused or not sent), or whose
+        // new order failed after the stream already read the cancel, sends no further event.
+        // Nothing in the app may mark the lists then: no event would ever clear the mark.
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        let results = [
+            ReplaceResult::CancelNotConfirmed(CancelEnd::NotSent),
+            ReplaceResult::CancelNotConfirmed(CancelEnd::Rejected {
+                code: "-2011".into(),
+                msg: "Unknown order".into(),
+            }),
+            ReplaceResult::NewNotPlaced(NewLeg::NotPlacedPresumed),
+            ReplaceResult::NewNotPlaced(NewLeg::Unresolved),
+            ReplaceResult::Lost,
+        ];
+        let mut sticky = false;
+        for result in results {
+            let mut s = crate::replace_flow::tests::summary_of(result);
+            s.account = m.id;
+            t.begin_send(m.id, &s.symbol);
+            let blocked = t.on_replace_result(&s);
+            let _ = crate::replace_flow::handle(&s);
+            let tag = s.result.tag();
+            assert!(!t.lists_stale(m.id), "{tag}");
+            assert!(
+                !t.holdings(m.id, "BTCUSDT").stale,
+                "{tag}: Retry needs a fresh list"
+            );
+            let expect = matches!(
+                s.result,
+                ReplaceResult::Lost | ReplaceResult::NewNotPlaced(NewLeg::Unresolved)
+            );
+            assert_eq!(blocked, expect, "{tag}");
+            // An unknown result stays until restart; a later one that ended well never clears it.
+            sticky |= expect;
+            let ps = t.pair_state(m.id, "BTCUSDT");
+            assert_eq!(ps == Some(PairState::Unresolved), sticky, "{tag}");
+        }
+        // The handler of the result does not mark the lists (the algo event does, in `update`).
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn on_replace_sent(")
+            .nth(1)
+            .and_then(|r| r.split("fn on_order_sent(").next())
+            .unwrap();
+        assert!(
+            !body.contains("orders_dirty"),
+            "on_replace_sent must not mark the lists"
+        );
     }
 
     #[test]

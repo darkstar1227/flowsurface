@@ -12,6 +12,7 @@ mod notify_os;
 mod order_flow;
 mod order_lines;
 mod protect_attach;
+mod replace_flow;
 mod screen;
 mod style;
 mod theme;
@@ -123,6 +124,9 @@ struct Flowsurface {
             order_flow::OrderSource,
         ),
     >,
+    /// The review being prepared was started by a drag on the chart (f3a2): a refusal of it is
+    /// said in a toast, since the ticket the other refusals show on may be closed.
+    replace_review: bool,
     /// When the ticker list of each venue was last fetched successfully. The list keeps its old
     /// prices when a fetch fails; this stamp is what tells a kept price from a fresh one (see
     /// `auto_flow::reference_price`).
@@ -217,6 +221,8 @@ enum Message {
     OrderTicket(modal::order_ticket::Message),
     OrderConfirm(modal::order_confirm::Message),
     OrderSent(order_flow::SendSummary),
+    /// A stop or target replace ended (f3a2).
+    ReplaceSent(replace_flow::ReplaceSummary),
     /// The result of the orders sent by the app itself after an entry filled (M5 d3).
     AutoDone(Box<auto_flow::AutoSummary>),
     /// A slow timer so the bare-position grace time runs out on a quiet account too.
@@ -341,22 +347,19 @@ impl Flowsurface {
     /// Rebuilds what the panes say about the trading account (the ladder title bar).
     fn refresh_trade_overlay(&mut self) {
         let accounts = self.exchange_accounts.persisted().accounts;
+        let live_open = data::config::trade_gate::live_sending_enabled();
         self.trade_overlay = dashboard::TradeOverlay {
             accounts: accounts
                 .iter()
                 .map(|m| (self.account_choice(m), m.alias.clone()))
                 .collect(),
             ticket_account: self.order_ticket.account(),
-            live_open: data::config::trade_gate::live_sending_enabled(),
+            live_open,
             lines: accounts
                 .iter()
                 .map(|m| dashboard::AccountLines {
                     account: m.id,
-                    lines: order_lines::lines_of(
-                        self.trading.open_orders(m.id),
-                        self.trading.positions(m.id),
-                        self.trading.lists_stale(m.id),
-                    ),
+                    lines: self.lines_of_account(m, live_open),
                 })
                 .filter(|a| !a.lines.is_empty())
                 .collect(),
@@ -369,6 +372,37 @@ impl Flowsurface {
                 dashboard.apply_trade_overlay(main_window, &self.trade_overlay);
             }
         }
+    }
+
+    /// The lines of one account. A stop or target line says whether it can be dragged and, when
+    /// it cannot, why (f3a2); the chart adds its own reason (a percent or log scale).
+    fn lines_of_account(
+        &self,
+        m: &data::config::exchange_accounts::AccountMeta,
+        live_open: bool,
+    ) -> Vec<order_lines::SymbolLine> {
+        use order_lines::Grab;
+        let guard = self.trading.replace_guard(m.id, live_open);
+        let grab = |row: &exchange::trade::OpenOrder| match &guard {
+            None => Grab::Blocked(replace_flow::DragBlock::Stream),
+            Some(g) => {
+                match replace_flow::drag_block(row, g, self.trading.is_auto_order(m.id, row)) {
+                    Some(why) => Grab::Blocked(why),
+                    None => Grab::Yes(row.id.clone()),
+                }
+            }
+        };
+        order_lines::lines_with(
+            self.trading.open_orders(m.id),
+            self.trading.positions(m.id),
+            self.trading.lists_stale(m.id),
+            &order_lines::Ctx {
+                spot: m.product == exchange::account::AccountProduct::Spot,
+                contracts: m.venue == exchange::account::AccountVenue::Okx
+                    && m.product == exchange::account::AccountProduct::UsdM,
+                grab: &grab,
+            },
+        )
     }
 
     fn account_choice(
@@ -443,6 +477,17 @@ impl Flowsurface {
         request: order_flow::PrepareRequest,
         origin: window::Id,
         source: order_flow::OrderSource,
+    ) -> Task<Message> {
+        self.start_review_of(request, origin, source, None)
+    }
+
+    /// [`Self::start_review`] with the old order of a replace (f3a2).
+    fn start_review_of(
+        &mut self,
+        request: order_flow::PrepareRequest,
+        origin: window::Id,
+        source: order_flow::OrderSource,
+        old: Option<exchange::trade::OpenOrder>,
     ) -> Task<Message> {
         use modal::order_ticket as ticket;
         if self.trading.bulk_running(request.account) || self.account_panel.is_bulk_preparing() {
@@ -526,9 +571,11 @@ impl Flowsurface {
             origin,
             source,
             ref_price,
+            old,
             signed,
             proxy: self.trading.proxy_reader(),
         };
+        self.replace_review = source == order_flow::OrderSource::Replace;
         Task::perform(order_flow::prepare(input), move |result| {
             Message::OrderTicket(modal::order_ticket::Message::Prepared(
                 nonce,
@@ -580,8 +627,14 @@ impl Flowsurface {
                         ),
                     }
                 }
-                Err(e) => self.order_ticket.set_status(e, BannerKind::Error),
+                Err(e) => {
+                    if std::mem::take(&mut self.replace_review) {
+                        self.notifications.push(Toast::error(e.clone()));
+                    }
+                    self.order_ticket.set_status(e, BannerKind::Error);
+                }
             }
+            self.replace_review = false;
             return Task::none();
         }
         let account_before = self.order_ticket.account();
@@ -615,7 +668,17 @@ impl Flowsurface {
                 self.trading.clear_stray_marks();
                 Task::none()
             }
-            C::Confirm => self.confirm_order(),
+            C::Confirm => {
+                if self
+                    .order_confirm
+                    .as_ref()
+                    .is_some_and(|c| c.replace_info().is_some())
+                {
+                    self.confirm_replace()
+                } else {
+                    self.confirm_order()
+                }
+            }
         }
     }
 
@@ -1009,6 +1072,7 @@ impl Flowsurface {
             &gate,
             self.exchange_accounts.is_deleting(meta.id),
             self.trading.bulk_running(meta.id),
+            self.trading.replace_busy(meta.id),
             self.confirm_open(),
         )
         .or_else(|| {
@@ -1129,6 +1193,7 @@ impl Flowsurface {
                 &gate,
                 self.exchange_accounts.is_deleting(id),
                 self.trading.bulk_running(id),
+                self.trading.replace_busy(id),
                 false,
             )
             .or_else(|| {
@@ -1639,6 +1704,249 @@ impl Flowsurface {
         Task::batch(tasks)
     }
 
+    /// A stop or target line was dragged to a price (f3a2). The account is the pane's, by the
+    /// same rule as a click on the ladder; the order is read again from the account's list, and
+    /// the new order is built from that row. Only the review opens here: nothing is sent before
+    /// the confirmation, and a confirmation checks everything again.
+    fn start_replace_request(
+        &mut self,
+        req: replace_flow::PaneReplace,
+        window: window::Id,
+    ) -> Task<Message> {
+        let warn = |this: &mut Self, text: String| this.notifications.push(Toast::warn(text));
+        if self.confirm_open() || self.order_ticket.is_preparing() {
+            warn(
+                self,
+                "Another order is open or being prepared. Finish it first.".to_string(),
+            );
+            return Task::none();
+        }
+        let live_open = data::config::trade_gate::live_sending_enabled();
+        let saved = self.exchange_accounts.persisted().accounts;
+        let choices: Vec<_> = saved.iter().map(|m| self.account_choice(m)).collect();
+        let pick = match order_flow::resolve_pane_account(
+            req.market,
+            self.order_ticket.account(),
+            &choices,
+            live_open,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                warn(self, e.message().to_string());
+                return Task::none();
+            }
+        };
+        let Some(meta) = saved.iter().find(|m| m.id == pick.id) else {
+            warn(self, "The account no longer exists.".to_string());
+            return Task::none();
+        };
+        let Some(guard) = self.trading.replace_guard(meta.id, live_open) else {
+            warn(
+                self,
+                "The account has no running trading state.".to_string(),
+            );
+            return Task::none();
+        };
+        // The latest read of the order, never the line's own copy.
+        let Some(row) = self
+            .trading
+            .open_orders(meta.id)
+            .iter()
+            .find(|o| o.id == req.order_id && o.symbol == req.symbol)
+            .cloned()
+        else {
+            warn(self, "That order is no longer open.".to_string());
+            return Task::none();
+        };
+        let auto = self.trading.is_auto_order(meta.id, &row);
+        let plan = match replace_flow::plan(&row, req.price, &guard, auto) {
+            Ok(plan) => plan,
+            // The same price as the order's own: no action.
+            Err(replace_flow::PlanRefusal::Unchanged) => return Task::none(),
+            Err(why) => {
+                warn(self, why.text().to_string());
+                return Task::none();
+            }
+        };
+        let task = self.start_review_of(
+            order_flow::PrepareRequest {
+                account: meta.id,
+                symbol: req.symbol,
+                spec: plan.spec,
+                protect: None,
+            },
+            window,
+            order_flow::OrderSource::Replace,
+            Some(row),
+        );
+        if !self.order_ticket.is_preparing() {
+            // `start_review_of` refused and said why on the ticket: the drag needs a toast too.
+            self.replace_review = false;
+            warn(
+                self,
+                "The replace could not be prepared. See the order ticket for the reason."
+                    .to_string(),
+            );
+        }
+        task
+    }
+
+    /// Confirm of a replace (f3a2): the conditions are judged again on the latest lists, the
+    /// grant is made from the row read now, and one detached task cancels the old order and
+    /// places the new one (`order_flow::run_replace`).
+    fn confirm_replace(&mut self) -> Task<Message> {
+        use modal::order_ticket as ticket;
+        let Some(conf) = self.order_confirm.as_ref() else {
+            return Task::none();
+        };
+        let Some(info) = conf.replace_info().cloned() else {
+            return Task::none();
+        };
+        let request = conf.request.clone();
+        // Judged on the latest lists: the order must still be there and unchanged, and every
+        // condition that made it draggable must still hold.
+        let stop = |this: &mut Self, text: String| {
+            this.order_confirm = None;
+            this.notifications.push(Toast::warn(text.clone()));
+            this.order_ticket.set_status(text, BannerKind::Warning);
+        };
+        if self.trading.bulk_running(request.account) {
+            stop(
+                self,
+                "A cancel all or close all of this account is running. Nothing was sent."
+                    .to_string(),
+            );
+            return Task::none();
+        }
+        let accounts = self.exchange_accounts.persisted().accounts;
+        let meta = accounts.iter().find(|m| m.id == request.account).cloned();
+        let signed = self.signed_client_for_current_proxy();
+        let gate = ticket::gate_for(
+            meta.as_ref(),
+            ticket::kind_of(&request.spec),
+            &request.symbol,
+            &self.trading,
+            &self.trade_session,
+            signed.is_ok(),
+            false,
+        );
+        let risk = self.trading.risk_for(request.account);
+        let (Some(meta), Ok(signed), Some(risk), None) =
+            (meta, signed, risk, ticket::blocked_reason(&gate))
+        else {
+            let why = ticket::blocked_reason(&gate)
+                .unwrap_or("The order can no longer be sent.")
+                .to_string();
+            stop(self, format!("{why} Nothing was sent."));
+            return Task::none();
+        };
+        let live_open = data::config::trade_gate::live_sending_enabled();
+        let Some(guard) = self.trading.replace_guard(meta.id, live_open) else {
+            stop(
+                self,
+                "The account has no running trading state. Nothing was sent.".to_string(),
+            );
+            return Task::none();
+        };
+        let latest = replace_flow::recheck(
+            &info.old,
+            self.trading.open_orders(meta.id),
+            &guard,
+            |row| self.trading.is_auto_order(meta.id, row),
+        )
+        .cloned();
+        let old = match latest {
+            Ok(row) => row,
+            Err(why) => {
+                stop(self, why.text().to_string());
+                return Task::none();
+            }
+        };
+        let Some(conf) = self.order_confirm.as_mut() else {
+            return Task::none();
+        };
+        // The delay of a fresh confirmation and the single use: a click that does not count
+        // leaves the window as it is.
+        let Some((token, intent, info)) = conf.confirm_replace(std::time::Instant::now()) else {
+            return Task::none();
+        };
+        self.order_confirm = None;
+        if !self.trading.replace_flow_mut().begin_send(meta.id, &old.id) {
+            self.notifications.push(Toast::warn(
+                "Another replace of this account is running. Nothing was sent.".to_string(),
+            ));
+            return Task::none();
+        }
+        // The symbol is in flight like any send: no other order is prepared on it meanwhile.
+        self.trading.begin_send(request.account, &request.symbol);
+        self.trading.note_sent_ids(&intent.client_ids());
+        let input = order_flow::ReplaceSendInput {
+            session: self.trade_session.get(meta.id).cloned(),
+            symbol: request.symbol,
+            meta,
+            signed,
+            proxy: self.trading.proxy_reader(),
+            risk,
+            token,
+            intent,
+            old,
+            kind: info.kind,
+            dir: info.dir,
+            old_trigger: info.old_trigger,
+            new_trigger: info.new_trigger,
+        };
+        Task::perform(order_flow::run_replace(input), Message::ReplaceSent)
+    }
+
+    /// The end of a replace: the line moves (the lists are read again), or the old line stays,
+    /// or a red banner says the position may have lost the order.
+    fn on_replace_sent(&mut self, summary: replace_flow::ReplaceSummary) -> Task<Message> {
+        use replace_flow::Level;
+        self.trading
+            .replace_flow_mut()
+            .finish_send(summary.account, &summary.old_id);
+        // Only a result that stayed unknown after the lookups keeps the symbol blocked: a new
+        // order of unknown fate, or a task that ended with no answer (either leg may have gone
+        // out), as `Unresolved` does for a plain send.
+        let unresolved = self.trading.on_replace_result(&summary);
+        let handling = replace_flow::handle(&summary);
+        // Both legs go to the log, in fixed words (no order id, no exchange text).
+        log::info!("replace protective order ended: {}", summary.result.tag());
+        // The order lists are not marked here. While the stream is connected every algo order
+        // change arrives as an event, and the event marks the lists and reads them again; a
+        // result that changed nothing (cancel refused or not sent) sends no event, so a mark
+        // set here would stay and switch off the bare-position watch and Retry protection.
+        let toast = match handling.level {
+            Level::Info => Toast::info(handling.text.clone()),
+            Level::Warn => Toast::warn(handling.text.clone()),
+            Level::Error => Toast::error(handling.text.clone()),
+        };
+        self.notifications.push(toast);
+        self.order_ticket.set_status(
+            handling.text.clone(),
+            match handling.level {
+                Level::Info => BannerKind::Normal,
+                Level::Warn => BannerKind::Warning,
+                Level::Error => BannerKind::Error,
+            },
+        );
+        if let Some(reason) = handling.failure {
+            self.trading
+                .replace_flow_mut()
+                .record_failure(&summary, reason);
+        }
+        if handling.notify_os {
+            self.notify_failures();
+        }
+        // An unknown new order was saved: the unknown list is read again.
+        let task = if unresolved {
+            Self::reload_records()
+        } else {
+            Task::none()
+        };
+        Task::batch([task, self.run_auto_jobs()])
+    }
+
     fn on_order_sent(&mut self, summary: order_flow::SendSummary) -> Task<Message> {
         let task = self.on_order_sent_inner(summary);
         Task::batch([task, self.run_auto_jobs()])
@@ -1787,6 +2095,7 @@ impl Flowsurface {
             account_panel: modal::account_panel::AccountPanel::default(),
             bulk_confirm: None,
             order_requests: HashMap::new(),
+            replace_review: false,
             quote_stamps: HashMap::new(),
             started: std::time::Instant::now(),
             antialiasing: saved_state.antialiasing,
@@ -2125,6 +2434,9 @@ impl Flowsurface {
                     }
                     Some(dashboard::Event::TradeRequest { window, order }) => {
                         self.start_trade_request(order, window)
+                    }
+                    Some(dashboard::Event::ReplaceRequest { window, request }) => {
+                        self.start_replace_request(request, window)
                     }
                     None => Task::none(),
                 };
@@ -2519,6 +2831,7 @@ impl Flowsurface {
             Message::OrderTicket(msg) => return self.update_order_ticket(msg),
             Message::OrderConfirm(msg) => return self.update_order_confirm(msg),
             Message::OrderSent(summary) => return self.on_order_sent(summary),
+            Message::ReplaceSent(summary) => return self.on_replace_sent(summary),
             Message::AccountPanel(msg) => return self.update_account_panel(msg),
             Message::BulkConfirm(msg) => return self.update_bulk_confirm(msg),
             Message::Account(event) => return self.on_account_event(event),
@@ -3926,6 +4239,7 @@ impl Flowsurface {
                             &gate,
                             self.exchange_accounts.is_deleting(meta.id),
                             self.trading.bulk_running(meta.id),
+                            self.trading.replace_busy(meta.id),
                             self.confirm_open(),
                         );
                         let panel = self

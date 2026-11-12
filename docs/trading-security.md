@@ -891,9 +891,9 @@ d 段最後一段。沒有新的送單路徑、沒有新的權杖來源，`LIVE_
 一個確認涵蓋撤舊與下新；一律先撤後下，撤單被交易所確認後才下新單；中間有裸倉，GUI 要警示。「先下新後撤舊」是 f3b 的每交易所旗標，本段不做。
 
 ### 授權綁定（`ReplaceGrant`）
-- 由**使用者對「撤舊單、下新單」的那一次確認**產生：`TradeClient::replace_grant(token, account, &old_row, &fresh)`（到期時間用 client 自己的時鐘，呼叫端不能傳時間；`ReplaceGrant::new` 只有 crate 內可見）。`token` 必須是 `ConfirmToken::for_replace(&new_preview, &old_row)`，它同時綁新單的 preview 雜湊與舊單的交易所 order id（`Binding::Replace`）。一般下單確認（`for_preview`）與批次確認都不是改單確認（`NotAnOrderConfirmation`），反過來改單確認也不能走 `submit`（`ConfirmationMismatch`）。`replace_grant` 會比對傳入的舊單列與 token 內的 id，不符回 `OldOrderMismatch`。
-- 綁定：帳戶、symbol、舊單的交易所 order id、種類（Stop 或 Target）、side、position side、數量或「全平」，以及新單 preview 雜湊。舊單必須是 `OpenKind::Algo` 且 `role` 為 `Stop` 或 `Target`；追蹤止損、`StopAndTarget`、一般單、現貨一律 `NotReplaceable`；side 或數量讀不到、id 不是純數字則 `OldOrderUnreadable`。範圍：Binance USDⓈ-M 與 OKX 永續（OKX 只限 `conditional` 型）。
-- **撤單由 grant 自己建**（Binance `DELETE /fapi/v1/algoOrder`、OKX `cancel-algos` 單筆），GUI 不傳撤單請求。要撤哪一張由使用者確認綁定的舊單 id 決定：grant 只能撤 token 所指的那一張，傳入別張的 `OpenOrder` 會被 `OldOrderMismatch` 拒絕。（舊版這裡寫「不可能撤到別的單」並不精確：當時舊單 id 不在確認範圍內。）
+- 由**使用者對「撤舊單、下新單」的那一次確認**產生：`TradeClient::replace_grant(token, account, &old_row, &fresh)`（到期時間用 client 自己的時鐘，呼叫端不能傳時間；`ReplaceGrant::new` 只有 crate 內可見）。`token` 必須是 `ConfirmToken::for_replace(&new_preview, &old_row)`，它同時綁新單的 preview 雜湊與舊單列的指紋（交易所 order id、kind、role、side、position side、數量、全平旗標；`Binding::Replace`，f3a2 的 N1 由只綁 id 收緊為整列指紋）。一般下單確認（`for_preview`）與批次確認都不是改單確認（`NotAReplaceConfirmation`），反過來改單確認也不能走 `submit`（`ConfirmationMismatch`）。`replace_grant` 會比對傳入的舊單列與 token 內的 id，不符回 `OldOrderMismatch`。
+- 確認綁定：新單 preview 雜湊與舊單列指紋（見上）；grant 另外依傳入的舊單列檢查新單：種類（Stop 或 Target）、side、position side、數量或「全平」，並綁定帳戶與 symbol。舊單必須是 `OpenKind::Algo` 且 `role` 為 `Stop` 或 `Target`；追蹤止損、`StopAndTarget`、一般單、現貨一律 `NotReplaceable`；side 或數量讀不到、id 不是純數字則 `OldOrderUnreadable`。範圍：Binance USDⓈ-M 與 OKX 永續（OKX 只限 `conditional` 型）。
+- **撤單由 grant 自己建**（Binance `DELETE /fapi/v1/algoOrder`、OKX `cancel-algos` 單筆），GUI 不傳撤單請求。要撤哪一張由使用者確認綁定的舊單 id 決定：grant 只能撤 token 所指的那一張，傳入別張、或同一張但 id 以外欄位（kind、side、position side、數量、全平旗標）讀得不同的 `OpenOrder` 會被 `OldOrderMismatch` 拒絕。（舊版這裡寫「不可能撤到別的單」並不精確：當時舊單 id 不在確認範圍內。）
 - 到期：`REPLACE_GRANT_VALID_MS = 30_000`（確認視窗按下確認後立刻交給 `submit_replace`，半分鐘只容納慢的 gate 或限流）。只在撤單送出**前**檢查；撤單成功後不再因 grant 到期而放棄下新單（那會造成裸倉），新單仍受自己的規則年齡（`valid_until_ms`）限制。
 - 單次使用：`submit_replace` 以值取走 grant（不能 `Clone`，有 `compile_fail` doctest）；送出過程中即使 future 被丟棄也不能再用。
 
@@ -906,7 +906,7 @@ d 段最後一段。沒有新的送單路徑、沒有新的權杖來源，`LIVE_
 ### 拒絕條件與錯誤（`ReplaceError<R>`）
 - `Refused(ReplaceRefusal)`：沒送任何請求，舊單還在。新單雜湊不符（`NewOrderMismatch`）、種類不同（`WrongKind`）、side 不同（`WrongSide`）、position side 不同（`WrongPositionSide`）、不是只減倉（`NotReducing`）、大小改變（`SizeChanged`：全平換成部分、部分換成全平，或數量大於舊單）、沿用舊單 client id（`SameClientId`）、過期（`Expired`）、帳戶或 symbol 不符、撤單被換掉（`CancelMismatch`）、確認的舊單與傳入的舊單列不同（`OldOrderMismatch`）。新單是進場單（加倉）或方向相反的保護單都落在這一類。
 - `NotSent(SubmitError<R>)`：gate、風控、串流、規則過期、帳戶不符等，沒送任何請求，舊單還在。
-- `CancelNotConfirmed(Submitted)`：撤單已送出但沒被確認；沒有新單被送出。若 outcome 是 `Unknown`，舊單可能已不在，GUI 要重讀掛單；撤單沒有 lookup（`pending` 為 `None`）。
+- `CancelNotConfirmed(Submitted)`：撤單已送出但沒被確認；沒有新單被送出。若 outcome 是 `Unknown`，或是 `Accepted` 但回應不含舊單 id（交易所撤掉了某一張單，多半就是舊單），舊單都可能已不在，GUI 要顯示「可能沒有保護」並立即重讀掛單；撤單沒有 lookup（`pending` 為 `None`）。
 - `NewNotPlaced { cancel, new }`：**舊單已撤、新單沒下成**。這是 GUI 必須大聲警示的狀態（裸倉）。`new` 為 `Some` 時帶新單的 outcome，Unknown 時 `new.pending` 交給 `resolve_unknown`；為 `None` 表示新單沒有離開本機（`Locked` 或 `JournalUnavailable`）。
 - 不重試：任何一步都不會自動重送。
 - Debug：`Outcome::Unknown` 的 client id 在 `Debug` 輸出中遮蔽（Display 與邏輯不變），所以 `{:?}` 印 `ReplaceError`／`ReplaceDone`／`Submitted` 不會帶出 client id；GUI 仍不應把它們寫進 log。
@@ -940,3 +940,52 @@ Binance 與 OKX 對「撤單 not found」的實際錯誤碼與時序、撤單成
 
 ### 給 security-review 的重點
 `exchange/src/trade/replace.rs`（全檔）、`gate.rs` 的 `Kind`／`Spent::covers`／`approve` 的 `is_replace` 檢查、`grant.rs` 的 `GrantedAuto.bound`、`client.rs` 的 `submit_auto`、`gate.rs` 的 `Binding::Replace`／`for_replace`／`spend_for_replace`、`outcome.rs` 的手寫 `Debug`、`source_rules_tests.rs` 的新掃描。
+
+## M5 f3a2：在 K 線圖上拖曳止損／止盈線改價（GUI）
+
+### 流程
+拖曳 → 放開 → 重讀該列並檢查 → 組新單 → 一個確認視窗 → 一次 detached task 先撤舊單、再下新單。
+
+1. **可拖的線**：只有保護單的 Stop 與 Target 線（`order_lines::Grab::Yes(交易所 order id)`）。追蹤止損、進場單、Position 線、plain limit 線都不可拖。可拖的線帶交易所 order id，不帶 client id；線仍不寫入 `saved-state.json`，拖曳狀態（`kline::State.order_drag`／`order_hover`）只在 widget 記憶體內，不進 `drawings::Library`。
+2. **停用條件**（`replace_flow::drag_block`，hover 顯示原因，游標為 NotAllowed）：stream 非 Connected、掛單／持倉清單 stale、LIVE 帳戶（live 關閉）、百分比或對數刻度、屬於仍在進行中的 d3 自動 job 的保護單、Binance hedge 部分數量保護單（無 reduceOnly，exchange 會以 `NotReducing` 拒絕）、OKX 非 conditional 單、限價觸發單、非合約產品、讀不出必要欄位的列、同帳戶已有一筆改單在送。
+3. **放開後**（`main::start_replace_request`）：帳戶由 `resolve_pane_account`（f0）決定，不猜；用**最新讀到的**列（依 order id 重讀，不用畫面上那條線）重新判斷停用條件；`replace_flow::plan` 以相同種類、相同 side、相同大小（或全平）組新單，只改觸發價，價格經交易所 `round_trigger_price` 取整，新價（未取整）與原價相同則不動作（靜默）；取整後才與原價相同時，`replace_info` 回錯誤「rounds to the old trigger price」，以 toast 與單據狀態說明，不開確認視窗。Escape 或拖出圖表範圍取消；放開時位移小於 4 px 視為點擊，不改單。
+4. **確認視窗**：列出「撤銷 X（trigger A）→ 新增 Y（trigger B）」，撤單內容來自 `ReplaceGrant::cancel_preview_for`；顯示帳戶、TESTNET／LIVE、來源 "Dragged on the chart"，並警示「先撤後下，中間會短暫沒有保護」（裸倉警示）。新價若會立即觸發（越過現價）另有警示，但不禁止，交易所會拒。沿用 f1 的延遲接受點擊（`DOM_DELAY`，與 DOM 相同）、origin 視窗路由與 `forget_window`。token 為 `ConfirmToken::for_replace(&preview, &old_row)`，只在 `modal/order_confirm.rs` 的 `confirm_replace` 產生。
+5. **送出**（唯一的 GUI 改單送出點：`order_flow::send_replace`／`run_replace`）：確認時再次判斷條件 51 與停用條件（`replace_flow::recheck`，在最新清單上，列已消失、已改變、被擋都不送），再 `client.replace_grant(...)` → `client.submit_replace(...)`。不重送。
+6. **不隨視窗丟棄**：`run_replace` 以 `tokio::spawn` 起一個 detached task；`JoinError` 回 `ReplaceResult::Lost`（視為結果未知，要檢查）。送出中狀態放在 `TradingState.replace`（`ReplaceFlow`），不在 `order_confirm` 內，因此關閉視窗、`discard_order`、`forget_window` 都取消不了它。
+7. **結果處理**（`replace_flow::handle`，`main::on_replace_sent`）：
+   - `Done`：線移到新價；GUI **不**標記清單，由 stream 在 algo 事件時自己標 dirty 並重讀（見 B1）。
+   - `Refused`／`NotSent`：toast，線回原位（沒動）。
+   - `CancelNotConfirmed`：`Rejected` 多半是舊單已觸發或成交；`Accepted`／`Unknown`（N4）可能舊單已不在、也沒有新單，顯示「可能沒有保護，請檢查」，不標記清單（見 B1）。
+   - `NewNotPlaced`：舊單已撤、新單沒下成：d4 紅色橫幅（可 Retry protection 僅限 Stop、可 Flatten）＋ OS 通知；`new.pending` 交給 `resolve_unknown`；只有 `NewLeg::Unresolved` 與 `Lost`（任一 leg 可能已送出）時該 symbol 才維持封鎖並重載 Unknown 紀錄（`replace_flow::keeps_symbol_blocked`）。結果處理結尾與 `on_order_sent` 一樣呼叫 `run_auto_jobs()`。撤單 leg 沒有 pending：撤單請求（Binance DELETE、OKX cancel）的 `request.lookup()` 為 `None`，所以不寫 write-ahead 紀錄、也不產生 `PendingUnknown`，`CancelNotConfirmed` 不需 `resolve_unknown`。
+   - 兩個 leg 的結果記成固定字詞的 `log::info!`（`ReplaceResult::tag()`），並顯示在 toast 與單據狀態；不 `{:?}` 記錄 `ConfirmToken`、`ReplaceError`、client id。
+
+### 掃描與測試
+- GUI 送單點掃描（`order_flow::tests::submit_is_called_from_this_file_only_and_the_automatic_paths_from_auto_flow_only`）新增：`submit_replace(` 與 `replace_grant(` 只能出現在 `order_flow.rs`；token 掃描允許 `for_replace(&self.preview, &info.old)` 只在 `order_confirm.rs`；`start_replace_request` 只開 review（`start_review_of`）。
+- `replace_flow` 內的測試涵蓋各停用條件、hedge 部分數量與 OKX 非 conditional、讀不出的列、相同價不動作、重檢（消失／改變／被擋）、y → 價格 → 十進位、各結果處理、橫幅與通知、每帳戶同時一筆改單。
+- 另有 `order_lines`（Grab、現貨賣單、OKX `ct`）、`layout`（`a_layout_with_a_kline_pane_saves_no_order_line`）與 `order_confirm`（Replace 來源與延遲）的測試。
+
+### 與 f2 的差異（f2 的「線不帶 order id」已改）
+f2 的線不帶 order id；f3a2 起只有可拖的 Stop／Target 線帶**交易所** order id（`Grab::Yes`），仍不帶 client id，仍不序列化。f2 留下的三件事：saved-state 測試新增有 kline pane 的 layout（pane 以 `chart: None` 建立，線無法直接掛上去，所以檢查的是線的內容不會出現在序列化輸出）；OKX 的數量單位在線標籤加上 ` ct`（張）；現貨賣出限價單畫成 **Target**（賣出已持有的資產，等於獲利了結；現貨買入限價單仍是 Entry）。
+
+### 偏離與取捨
+- 風險記錄不能擴充（`data/` 不在授權內），所以兩個 leg 的結果以固定字詞 `log::info!`、toast 與單據狀態記錄，沒有寫入風險記錄。
+- **B1（security-review 必修，已修）**：原本 `on_replace_sent` 在結果後呼叫 `mark_orders_dirty`。stream 只在收到 algo 事件時才重讀，沒有定期重讀；撤單未送出或被拒（不會有事件），或快照早於結果到達（新單沒下成、之後沒有事件）時，dirty 標記永遠不會被清掉，`lists_stale` 一直為真，d5 裸倉監控與紅色橫幅的 Retry protection 都被靜默關閉。修法：**不在 GUI 標記**（刪掉 `mark_orders_dirty` 與 `Handling.reread`）。stream 為 Connected 時，每個 algo 變化都會送事件，事件本身在 `trading.rs` 標 dirty 並安排重讀；非 Connected 時 `lists_stale` 本來就為真。代價：結果與事件之間畫面仍是舊線，這段期間靠再次拖曳時的 `recheck` 與 exchange grant 的舊單列比對把關。測試：`a_finished_replace_never_leaves_the_lists_stale_so_retry_protection_stays_usable`（含掃描 `on_replace_sent` 不得碰 `orders_dirty`）。
+- 沒有 GUI 的「立即重讀掛單」API（見 Live 開放前待辦）；N4 的「立即重讀」目前只靠 stream 的 algo 事件。
+- **S1**：`Lost` 與 `Unresolved` 一樣維持 symbol 封鎖並 `reload_records`。**S3**：`on_replace_sent` 結尾呼叫 `run_auto_jobs()`。
+- **S4**：改單進行中（`TradingState::replace_busy`）時，撤全部／全平不能開始或確認（`bulk_blocked_reason` 新增 `replacing` 參數，帳戶面板按鈕也一併停用），避免留下孤兒的 reduceOnly／closePosition 止損。測試 `a_deleting_account_or_an_open_confirmation_blocks_bulk`。
+- **N1**：`Lost` 後若該帳戶與 symbol 沒有 Unknown 紀錄，alert 改寫為「重啟 app 後才會解除」（沒有紀錄可在 Order ticket 解除）；有紀錄時維持原文。沒有新增手動解除路徑。**N2**：`on_replace_sent` 對 `TradingState` 的處理抽成 `TradingState::on_replace_result`，測試直接呼叫它。
+- **S7**：立即觸發的比較價是 `tickers_table.mark_price`，其值在 Binance、OKX、MEXC 是**最新成交價**（`last_price`），只有 Bybit、Hyperliquid 是真的標記價格。警示文字因此改稱 "ticker price"。
+- 不動 `auto_flow.rs`：改單失敗以合成的 `FailureView` 在 `trading.rs` 併入 `auto_failures`（key 前綴 `replace-`），Retry 只提供給 Stop。
+- `RulesExpired` 不自動重新 review，只顯示 Refused toast，使用者重新拖一次。
+- 限價觸發單（`LimitTrigger`）不可拖：限價與觸發價的關係不是單一價位。
+- `modal/account_panel.rs` 只為 S4 增加 `bulk_blocked_reason` 的 `replacing` 參數。
+
+### Live 開放前待辦
+1. stream「要求立即重讀」API（需要 `exchange` 授權）：GUI 才能在改單結果後主動重讀，完整做到 N4。
+2. 撤單 leg 的 write-ahead journal：detached task 擋得住關閉視窗，擋不住 app 結束；撤單成功、新單送出前結束程式，磁碟上不會留下紀錄。目前也沒有測試實際執行 `run_replace`。
+3. testnet 核對：Binance `DELETE algoOrder` 與 OKX `cancel-algos` 的回應是否帶 `algoId`、not found 的錯誤碼、立即觸發被拒的行為、-4130。
+4. 手動實測 B1：`NewNotPlaced` 出現後，Retry protection 是否可用。
+
+### 需要手動 `cargo run`／testnet 確認
+拖曳手感與 hover 游標（Grab／Grabbing／NotAllowed）、預覽虛線與價格標籤、Escape 取消、拖出圖表取消、百分比／對數刻度的提示、確認視窗版面與裸倉警示、延遲接受點擊、testnet 上改單結果的 toast 與橫幅、macOS OS 通知、重讀後線移到新價。
+

@@ -73,6 +73,8 @@ pub enum Effect {
     /// adds the account and the quantity): the confirmation window sends nothing until the user
     /// confirms.
     TradeRequest(crate::order_flow::PaneOrder),
+    /// A stop or target line dragged on the chart (f3a2); only opens the review.
+    ReplaceRequest(crate::replace_flow::PaneReplace),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1523,6 +1525,7 @@ impl State {
             Some(KlineAction::SharedChartResources(message)) => {
                 Some(Effect::SharedChartResources(message))
             }
+            Some(KlineAction::ReplaceRequest(request)) => Some(Effect::ReplaceRequest(request)),
             Some(KlineAction::RemoveSeries(ticker_info)) => {
                 if let Content::Kline {
                     chart: Some(chart), ..

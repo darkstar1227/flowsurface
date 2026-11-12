@@ -1144,6 +1144,8 @@ mod tests {
             qty: None,
             whole: true,
             stale: false,
+            grab: crate::order_lines::Grab::No,
+            contracts: false,
         };
         let lines = [line("99.75"), line("100.5")];
         // 99.75 groups down to 99.5 on a bid row and up to 100.0 on an ask row.

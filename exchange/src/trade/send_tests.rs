@@ -4970,7 +4970,7 @@ mod replace_protective {
             )
             .map(|_| ())
             .unwrap_err();
-        assert_eq!(e, ReplaceRefusal::NotAnOrderConfirmation);
+        assert_eq!(e, ReplaceRefusal::NotAReplaceConfirmation);
         assert_eq!(deleted_then_posted(&fake), (0, 0));
     }
 
@@ -5420,7 +5420,7 @@ mod replace_protective {
             )
             .map(|_| ())
             .unwrap_err();
-        assert_eq!(e, ReplaceRefusal::NotAnOrderConfirmation);
+        assert_eq!(e, ReplaceRefusal::NotAReplaceConfirmation);
         assert_eq!(deleted_then_posted(&fake), (0, 0));
     }
 
@@ -5446,6 +5446,92 @@ mod replace_protective {
             .unwrap_err();
         assert_eq!(e, ReplaceRefusal::OldOrderMismatch);
         assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_replace_confirmation_is_for_the_old_row_it_saw_and_not_only_its_id() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, false, Some("0.01"));
+        let new = stop(&c, &t, "58000");
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        // The same exchange id, read with another size, side, position side, kind or flag.
+        let mut bigger = old.clone();
+        bigger.qty = bigger
+            .qty
+            .map(|_| crate::trade::Decimal::parse("100").unwrap());
+        let mut other_side = old.clone();
+        other_side.side = other_side.side.map(|s| match s {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        });
+        let mut hedged = old.clone();
+        hedged.position_side = Some(Dir::Long);
+        let mut whole = old.clone();
+        whole.close_position = true;
+        let mut target = old.clone();
+        target.role = Some(ProtectRole::Target);
+        for changed in [bigger, other_side, hedged, whole, target] {
+            let e = c
+                .replace_grant(
+                    ConfirmToken::for_replace(&new.preview(), &old),
+                    c.account(),
+                    &changed,
+                    &fresh,
+                )
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(e, ReplaceRefusal::OldOrderMismatch);
+        }
+        // The row as it was confirmed is accepted.
+        assert!(
+            c.replace_grant(
+                ConfirmToken::for_replace(&new.preview(), &old),
+                c.account(),
+                &old,
+                &fresh,
+            )
+            .is_ok()
+        );
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_replace_confirmation_is_not_a_bulk_confirmation() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let e = c
+            .cancel_all(
+                &OpenGate,
+                &NoRisk,
+                &NoJournal,
+                ConfirmToken::for_replace(&new.preview(), &old),
+                &t,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, crate::trade::BulkError::ConfirmationMismatch));
+        let e = c
+            .flatten(
+                &OpenGate,
+                &NoRisk,
+                &NoJournal,
+                ConfirmToken::for_replace(&new.preview(), &old),
+                &t,
+                MarginMode::Cross,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, crate::trade::BulkError::ConfirmationMismatch));
+        assert_eq!(fake.count("DELETE /fapi/v1/algoOrder"), 0);
+        assert_eq!(fake.count("POST /fapi/v1/algoOrder"), 0);
+        assert_eq!(fake.count("DELETE /fapi/v1/allOpenOrders"), 0);
+        assert_eq!(fake.count("DELETE /fapi/v1/algoOpenOrders"), 0);
+        assert_eq!(fake.count("POST /fapi/v1/order"), 0);
     }
 
     #[tokio::test]

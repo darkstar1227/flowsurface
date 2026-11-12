@@ -8,11 +8,14 @@
 //!
 //! `.submit(` is called in this file only, from [`send`], and only with a token made by the
 //! confirmation (`order_confirm`). Manual orders never use `submit_auto` or `AutoIntent`.
+//! `.submit_replace(` and `.replace_grant(` (the stop / target replace, f3a2) are called in this
+//! file only, from [`send_replace`], with a token made by the confirmation as well.
 
 use crate::protect_attach::{
     self, AttachKind, AttachNote, AttachPlan, Holdings, Resolved, check_against_price, plan_lines,
     preview_has_attachment,
 };
+use crate::replace_flow::{CancelEnd, NewLeg, ReplaceResult, ReplaceSummary};
 use crate::trading::{PairState, account_key};
 use data::config::exchange_accounts::{
     AccountMeta, StoreError, load_credentials, load_credentials_with_identity,
@@ -29,8 +32,9 @@ use exchange::trade::MarginMode;
 use exchange::trade::stream::StreamState;
 use exchange::trade::{
     ConfirmToken, DEFAULT_DEVIATION_BPS, Decimal, Dir, ManualContext, ManualSpec, OpenKind,
-    OrderIntent, OrderPreview, Outcome, ReadError, Resolution, RiskRefusal, SharedRisk,
-    SubmitError, TradeClient, TradeProduct, build_intent, deviation_exceeds,
+    OpenOrder, OrderIntent, OrderPreview, Outcome, ReadError, ReplaceError, ReplaceGrant,
+    ReplaceKind, Resolution, RiskRefusal, SharedRisk, SubmitError, TradeClient, TradeProduct,
+    build_intent, deviation_exceeds,
 };
 use exchange::unit::Price;
 use iced::window;
@@ -330,6 +334,8 @@ pub enum OrderSource {
     Ticket,
     /// A command click on the ladder.
     Dom,
+    /// A stop or target line dragged on the chart (f3a2): cancel the old order, place a new one.
+    Replace,
 }
 
 /// What the user asked for, kept so a preview can be made again (rules expired).
@@ -426,6 +432,26 @@ pub struct Prepared {
     /// The window the review was started in: the confirmation opens there.
     pub origin: window::Id,
     pub source: OrderSource,
+    /// Only for a replace: the old order and the cancel that goes with the new order.
+    pub replace: Option<ReplaceInfo>,
+}
+
+/// What the confirmation of a replace shows besides the new order, read from the old row the
+/// drag started from.
+#[derive(Debug, Clone)]
+pub struct ReplaceInfo {
+    /// The old order's row as it was when the review was made.
+    pub old: OpenOrder,
+    /// The cancel the grant will send, as the grant builds it (`ReplaceGrant::cancel_preview_for`).
+    pub cancel: OrderPreview,
+    pub kind: ReplaceKind,
+    /// The direction of the position the order protects.
+    pub dir: Dir,
+    pub old_trigger: Decimal,
+    /// The new trigger as the builder rounded it.
+    pub new_trigger: Decimal,
+    /// The new trigger would fire at once against the ticker price (`None`: no price to compare).
+    pub immediate: Option<bool>,
 }
 
 pub struct PrepareInput {
@@ -442,6 +468,8 @@ pub struct PrepareInput {
     /// Carried to `Prepared` unchanged.
     pub source: OrderSource,
     pub ref_price: Option<Decimal>,
+    /// The old order of a replace (the latest row); `None` for everything else.
+    pub old: Option<OpenOrder>,
     pub signed: SignedHttp,
     pub proxy: Arc<dyn Fn() -> ProxyState + Send + Sync>,
 }
@@ -484,6 +512,7 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
         origin,
         source,
         ref_price,
+        old,
         signed,
         proxy,
     } = input;
@@ -611,6 +640,18 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
     let takes = entry
         .map(|(dir, _, _)| takes_liquidity(dir, limit_price.as_ref(), ref_price.as_ref()))
         .unwrap_or(false);
+    // A replace: the cancel the grant will send, and what the new trigger became after rounding.
+    let replace = match old {
+        Some(old) => Some(replace_info(
+            old,
+            account,
+            &fresh,
+            &request.spec,
+            &preview,
+            ref_price.as_ref(),
+        )?),
+        None => None,
+    };
     let notes = Notes {
         takes_liquidity: takes,
         deviation: deviation_of(limit_price.as_ref(), ref_price.as_ref()),
@@ -625,6 +666,55 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
         notes,
         origin,
         source,
+        replace,
+    })
+}
+
+/// The new trigger as the builder rounded it, from the preview.
+fn preview_trigger(preview: &OrderPreview) -> Option<Decimal> {
+    ["triggerPrice", "slTriggerPx", "tpTriggerPx"]
+        .iter()
+        .find_map(|name| preview.field(name))
+        .and_then(|v| Decimal::parse(v).ok())
+        .filter(Decimal::is_positive)
+}
+
+/// The cancel preview, kind and triggers of a replace. Refused (nothing is shown) when the old
+/// row cannot be cancelled by the grant, when the rounded trigger is the old one (nothing would
+/// change), or when the new trigger cannot be read back from the preview.
+fn replace_info(
+    old: OpenOrder,
+    account: exchange::account::AccountKey,
+    fresh: &exchange::trade::FreshRules<'_>,
+    spec: &ManualSpec,
+    preview: &OrderPreview,
+    mark: Option<&Decimal>,
+) -> Result<ReplaceInfo, String> {
+    let (kind, dir) = match spec {
+        ManualSpec::Stop { dir, .. } => (ReplaceKind::Stop, *dir),
+        ManualSpec::TakeProfit { dir, .. } => (ReplaceKind::Target, *dir),
+        _ => return Err("This request is not a stop or a take-profit.".to_string()),
+    };
+    let cancel = ReplaceGrant::cancel_preview_for(account, &old, fresh)
+        .map_err(|e| format!("The old order cannot be replaced: {e}."))?;
+    let old_trigger = old
+        .trigger_price
+        .ok_or_else(|| "The old order has no readable trigger price.".to_string())?;
+    let new_trigger = preview_trigger(preview)
+        .ok_or_else(|| "The new trigger price could not be read from the preview.".to_string())?;
+    // The tick rounding can bring a small drag back onto the old price.
+    if new_trigger.checked_cmp(&old_trigger) == Ok(std::cmp::Ordering::Equal) {
+        return Err("The price rounds to the old trigger price. Nothing was changed.".to_string());
+    }
+    let immediate = crate::replace_flow::would_trigger_now(kind, dir, &new_trigger, mark);
+    Ok(ReplaceInfo {
+        old,
+        cancel,
+        kind,
+        dir,
+        old_trigger,
+        new_trigger,
+        immediate,
     })
 }
 
@@ -813,6 +903,195 @@ pub async fn send(input: SendInput) -> SendSummary {
                     summary(result, journal_failed, client_tail)
                 }
             }
+        }
+    }
+}
+
+// ── Send a replace (f3a2) ───────────────────────────────────────────────
+
+pub struct ReplaceSendInput {
+    pub meta: AccountMeta,
+    /// The session entry as it is at the moment of the confirmation.
+    pub session: Option<SessionEntry>,
+    pub symbol: String,
+    pub signed: SignedHttp,
+    pub proxy: Arc<dyn Fn() -> ProxyState + Send + Sync>,
+    pub risk: SharedRisk,
+    pub token: ConfirmToken,
+    /// The new order, from the confirmation's slot.
+    pub intent: OrderIntent,
+    /// The old order **as read at the click**, not the row the review was made from: the grant
+    /// compares it with what the user confirmed.
+    pub old: OpenOrder,
+    pub kind: ReplaceKind,
+    pub dir: Dir,
+    pub old_trigger: Decimal,
+    pub new_trigger: Decimal,
+}
+
+/// The replace on a task of its own. The confirmation window, the review and the ticket own
+/// nothing of it: `tokio::spawn` detaches the send, so closing the window (or dropping the
+/// iced task that waits for the result) cannot cancel it between the cancel and the new order.
+/// If the spawned task itself ends without an answer, nothing is known about either leg and the
+/// result is [`ReplaceResult::Lost`].
+pub async fn run_replace(input: ReplaceSendInput) -> ReplaceSummary {
+    let lost = ReplaceSummary {
+        account: input.meta.id,
+        symbol: input.symbol.clone(),
+        old_id: input.old.id.clone(),
+        kind: input.kind,
+        dir: input.dir,
+        old_trigger: input.old_trigger,
+        new_trigger: input.new_trigger,
+        result: ReplaceResult::Lost,
+        journal_failed: false,
+    };
+    tokio::spawn(send_replace(input)).await.unwrap_or(lost)
+}
+
+fn cancel_end(outcome: &Outcome) -> CancelEnd {
+    match outcome {
+        Outcome::Rejected { code, msg, .. } => CancelEnd::Rejected {
+            code: code.clone(),
+            msg: clip(msg),
+        },
+        Outcome::Unknown { .. } => CancelEnd::Unknown,
+        Outcome::NotSent(_) => CancelEnd::NotSent,
+        // Accepted without naming the old order, or only a part: not a confirmed cancel.
+        Outcome::Accepted { .. } | Outcome::Partial { .. } => CancelEnd::Unconfirmed,
+    }
+}
+
+/// Keychain → client → clock → rules → grant → `submit_replace` (cancel first, the new order
+/// only once the cancel is confirmed). Never resends either leg; an unknown new order is only
+/// looked up.
+async fn send_replace(input: ReplaceSendInput) -> ReplaceSummary {
+    let ReplaceSendInput {
+        meta,
+        session,
+        symbol,
+        signed,
+        proxy,
+        risk,
+        token,
+        intent,
+        old,
+        kind,
+        dir,
+        old_trigger,
+        new_trigger,
+    } = input;
+    let old_id = old.id.clone();
+    let summary = |result: ReplaceResult, journal_failed: bool| ReplaceSummary {
+        account: meta.id,
+        symbol: symbol.clone(),
+        old_id: old_id.clone(),
+        kind,
+        dir,
+        old_trigger,
+        new_trigger,
+        result,
+        journal_failed,
+    };
+    let refused = |why: String| summary(ReplaceResult::Refused(why), false);
+    let Some(market) = trade_market(market_of(meta.venue, meta.product)) else {
+        return refused("This account's market cannot be traded.".to_string());
+    };
+    let loaded = {
+        let meta = meta.clone();
+        tokio::task::spawn_blocking(move || load_credentials_with_identity(&meta)).await
+    };
+    let (creds, identity) = match loaded {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return refused(describe_store_error(&e)),
+        Err(_) => return refused("Keychain access did not complete.".to_string()),
+    };
+    let keychain: Result<_, StoreError> = Ok(identity);
+    let proxy_ok = check_proxy_snapshot(signed.proxy_state(), &proxy()).is_ok();
+    let account = account_key(meta.id);
+    let client = TradeClient::new(
+        signed,
+        meta.venue,
+        meta.env,
+        meta.product,
+        account,
+        creds,
+        proxy,
+    );
+    let _ = client.sync_clock().await;
+    // The grant reads the old row against fresh rules; they are read again, nothing is sent yet.
+    let table = match client.fetch_rules(market.rules).await {
+        Ok(t) => t,
+        Err(e) => return refused(describe_read_error(&e)),
+    };
+    let fresh = match client.fresh(&table, &symbol) {
+        Ok(f) => f,
+        Err(e) => return refused(format!("Trading rules: {e}.")),
+    };
+    let grant = match client.replace_grant(token, account, &old, &fresh) {
+        Ok(g) => g,
+        Err(e) => return refused(format!("{e}.")),
+    };
+    let gate = SessionGate {
+        session: session.as_ref(),
+        keychain: &keychain,
+        saved: &meta,
+        proxy_ok,
+    };
+    let journal = UnknownStore::in_data_dir();
+    match client
+        .submit_replace(&gate, &risk, &journal, grant, intent)
+        .await
+    {
+        Ok(done) => {
+            let journal_failed = done.cancel.journal_failed || done.new.journal_failed;
+            summary(ReplaceResult::Done, journal_failed)
+        }
+        Err(ReplaceError::Refused(r)) => refused(format!("{r}.")),
+        Err(ReplaceError::NotSent(e)) => {
+            let journal_failed = matches!(e, SubmitError::JournalUnavailable);
+            summary(
+                ReplaceResult::Refused(describe_submit_error(&e)),
+                journal_failed,
+            )
+        }
+        Err(ReplaceError::CancelNotConfirmed(sub)) => summary(
+            ReplaceResult::CancelNotConfirmed(cancel_end(&sub.outcome)),
+            sub.journal_failed,
+        ),
+        Err(ReplaceError::NewNotPlaced { cancel, new }) => {
+            let mut journal_failed = cancel.journal_failed;
+            let leg = match new {
+                None => NewLeg::NeverSent,
+                Some(sub) => {
+                    journal_failed |= sub.journal_failed;
+                    match sub.outcome {
+                        Outcome::Rejected { code, msg, .. } => NewLeg::Rejected {
+                            code,
+                            msg: clip(&msg),
+                        },
+                        Outcome::Partial { .. } => NewLeg::Rejected {
+                            code: "partial".to_string(),
+                            msg: String::new(),
+                        },
+                        Outcome::NotSent(_) => NewLeg::NeverSent,
+                        // The new order's lookup only reads; the order is never sent again.
+                        Outcome::Unknown { .. } => match sub.pending {
+                            Some(pending) => {
+                                match client.resolve_unknown(pending, &journal).await {
+                                    Resolution::Found => NewLeg::Found,
+                                    Resolution::NotPlacedPresumed => NewLeg::NotPlacedPresumed,
+                                    Resolution::Unresolved(_) => NewLeg::Unresolved,
+                                }
+                            }
+                            None => NewLeg::Unresolved,
+                        },
+                        // Cannot happen (an accepted new order is `Ok`): never read as a success.
+                        Outcome::Accepted { .. } => NewLeg::Unresolved,
+                    }
+                }
+            };
+            summary(ReplaceResult::NewNotPlaced(leg), journal_failed)
         }
     }
 }
@@ -1621,6 +1900,7 @@ mod tests {
         let mut submit_files = Vec::new();
         let mut auto_files = Vec::new();
         let mut mint_files = Vec::new();
+        let mut replace_files = Vec::new();
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -1652,7 +1932,12 @@ mod tests {
                 }
                 // The grant is made from the confirmed intent, in the confirmation handler only.
                 if code.contains("auto_flow::mint(") {
-                    mint_files.push(name);
+                    mint_files.push(name.clone());
+                }
+                // The replace path (cancel the old protective order, place the new one) is
+                // sent and authorised in this file only (f3a2).
+                if code.contains("submit_replace(") || code.contains("replace_grant(") {
+                    replace_files.push(name);
                 }
                 assert!(
                     !code.contains("block_on("),
@@ -1664,6 +1949,7 @@ mod tests {
         assert_eq!(submit_files, vec!["order_flow.rs".to_string()]);
         assert_eq!(auto_files, AUTO_FILES.map(String::from).to_vec());
         assert_eq!(mint_files, vec!["main.rs".to_string()]);
+        assert_eq!(replace_files, vec!["order_flow.rs".to_string()]);
     }
 
     /// A confirmation opens in the window the request came from, never a fixed main window,
@@ -1697,6 +1983,7 @@ mod tests {
             ("fn open_stop_review(", "self.start_review("),
             ("fn start_stray_cancel(", "self.start_review("),
             ("fn start_trade_request(", "self.start_review("),
+            ("fn start_replace_request(", "self.start_review_of("),
         ] {
             let start = main.find(name).unwrap_or_else(|| panic!("{name} exists"));
             let rest = &main[start..];
@@ -1715,6 +2002,8 @@ mod tests {
                 "submit_auto(",
                 "AutoIntent::new(",
                 "auto_flow::mint(",
+                "run_replace(",
+                "confirm_replace(",
                 "AutoGrant",
                 "for_bulk(",
                 "BulkAction::CancelAll",
