@@ -404,6 +404,12 @@ pub enum ReplaceResult {
     Refused(String),
     CancelNotConfirmed(CancelEnd),
     NewNotPlaced(NewLeg),
+    /// Place first only (f3b): the new order was sent and not accepted. The old order was not
+    /// cancelled and stands. An unresolved or found one means two orders may stand.
+    PlacedFirstFailed(NewLeg),
+    /// Place first only (f3b): the new order was accepted and the old one was not confirmed
+    /// cancelled. Two protective orders may stand; nothing follows the new one automatically.
+    OldNotCancelled(CancelEnd),
     /// The send task itself ended without an answer: nothing is known about either leg.
     Lost,
 }
@@ -425,6 +431,14 @@ impl ReplaceResult {
             }
             Self::NewNotPlaced(NewLeg::Unresolved) => "cancel accepted, new unresolved",
             Self::NewNotPlaced(NewLeg::NeverSent) => "cancel accepted, new not sent",
+            Self::PlacedFirstFailed(NewLeg::Rejected { .. }) => "new rejected, old kept",
+            Self::PlacedFirstFailed(NewLeg::Found) => "new found, old kept",
+            Self::PlacedFirstFailed(NewLeg::NotPlacedPresumed) => {
+                "new presumed not placed, old kept"
+            }
+            Self::PlacedFirstFailed(NewLeg::Unresolved) => "new unresolved, old kept",
+            Self::PlacedFirstFailed(NewLeg::NeverSent) => "new not sent, old kept",
+            Self::OldNotCancelled(_) => "new accepted, old cancel not confirmed",
             Self::Lost => "task ended without an answer",
         }
     }
@@ -606,6 +620,73 @@ pub fn handle(s: &ReplaceSummary) -> Handling {
                 failure,
             }
         }
+        ReplaceResult::PlacedFirstFailed(leg) => {
+            // The old order stands. Only a new order that may exist (found or unknown) is loud.
+            let (level, why, failure) = match leg {
+                NewLeg::Rejected { code, msg } => (
+                    Level::Warn,
+                    format!(
+                        "The exchange refused the new order: {code} {}",
+                        crate::order_flow::clip(msg)
+                    ),
+                    None,
+                ),
+                NewLeg::NotPlacedPresumed => (
+                    Level::Warn,
+                    "The new order had no answer and the exchange never showed it.".to_string(),
+                    None,
+                ),
+                NewLeg::NeverSent => (Level::Warn, "The new order was not sent.".to_string(), None),
+                NewLeg::Found => (
+                    Level::Error,
+                    "The new order had no answer at first; the exchange knows it, so two \
+                     orders now stand. Cancel one of them by hand."
+                        .to_string(),
+                    None,
+                ),
+                NewLeg::Unresolved => (
+                    Level::Error,
+                    "The result of the new order is unknown, so two orders may stand. Nothing \
+                     was resent. Check the open orders."
+                        .to_string(),
+                    Some(FailReason::Unknown),
+                ),
+            };
+            Handling {
+                level,
+                text: format!(
+                    "{}: the {name} was not moved. The old order was not cancelled. {why}",
+                    s.symbol
+                ),
+                notify_os: failure.is_some(),
+                failure,
+            }
+        }
+        ReplaceResult::OldNotCancelled(end) => {
+            let why = match end {
+                CancelEnd::Rejected { code, msg } => format!(
+                    "The exchange refused the cancel of the old order: {code} {}",
+                    crate::order_flow::clip(msg)
+                ),
+                CancelEnd::NotSent => "The cancel of the old order was not sent.".to_string(),
+                CancelEnd::Unknown | CancelEnd::Unconfirmed => {
+                    "The cancel of the old order got no confirmed answer.".to_string()
+                }
+            };
+            // Both stand, so the position is covered; the open orders and the strays list show
+            // the extra one. The old order may also have triggered or filled.
+            Handling {
+                level: Level::Error,
+                text: format!(
+                    "{}: the new {name} ({moved}) was placed first, but the old one is not \
+                     confirmed cancelled. {why} Two protective orders may stand: check the open \
+                     orders and cancel one by hand.",
+                    s.symbol
+                ),
+                failure: None,
+                notify_os: false,
+            }
+        }
         ReplaceResult::Lost => Handling {
             level: Level::Error,
             text: format!(
@@ -625,7 +706,9 @@ pub fn handle(s: &ReplaceSummary) -> Handling {
 pub fn keeps_symbol_blocked(result: &ReplaceResult) -> bool {
     matches!(
         result,
-        ReplaceResult::NewNotPlaced(NewLeg::Unresolved) | ReplaceResult::Lost
+        ReplaceResult::NewNotPlaced(NewLeg::Unresolved)
+            | ReplaceResult::PlacedFirstFailed(NewLeg::Unresolved)
+            | ReplaceResult::Lost
     )
 }
 
@@ -1137,6 +1220,9 @@ pub mod tests {
         assert!(keeps_symbol_blocked(&ReplaceResult::NewNotPlaced(
             NewLeg::Unresolved
         )));
+        assert!(keeps_symbol_blocked(&ReplaceResult::PlacedFirstFailed(
+            NewLeg::Unresolved
+        )));
         for r in [
             ReplaceResult::Done,
             ReplaceResult::NewNotPlaced(NewLeg::Found),
@@ -1144,6 +1230,63 @@ pub mod tests {
             ReplaceResult::CancelNotConfirmed(CancelEnd::Unknown),
         ] {
             assert!(!keeps_symbol_blocked(&r));
+        }
+    }
+
+    #[test]
+    fn a_place_first_failure_keeps_the_old_order_and_is_loud_only_when_two_may_stand() {
+        let quiet = [
+            NewLeg::Rejected {
+                code: "-2021".into(),
+                msg: "x".into(),
+            },
+            NewLeg::NotPlacedPresumed,
+            NewLeg::NeverSent,
+        ];
+        for leg in quiet {
+            let h = handle(&summary(
+                ReplaceKind::Stop,
+                ReplaceResult::PlacedFirstFailed(leg),
+            ));
+            assert_eq!(h.level, Level::Warn);
+            assert!(h.failure.is_none() && !h.notify_os);
+            assert!(h.text.contains("old order was not cancelled"), "{}", h.text);
+        }
+        let h = handle(&summary(
+            ReplaceKind::Stop,
+            ReplaceResult::PlacedFirstFailed(NewLeg::Found),
+        ));
+        assert_eq!(h.level, Level::Error);
+        assert!(h.text.contains("two orders now stand"), "{}", h.text);
+        let h = handle(&summary(
+            ReplaceKind::Stop,
+            ReplaceResult::PlacedFirstFailed(NewLeg::Unresolved),
+        ));
+        assert_eq!(h.level, Level::Error);
+        assert!(h.failure.is_some() && h.notify_os);
+    }
+
+    #[test]
+    fn an_old_order_that_was_not_cancelled_after_a_new_one_says_two_orders_stand() {
+        for end in [
+            CancelEnd::Unknown,
+            CancelEnd::Unconfirmed,
+            CancelEnd::NotSent,
+            CancelEnd::Rejected {
+                code: "-2011".into(),
+                msg: "gone".into(),
+            },
+        ] {
+            let result = ReplaceResult::OldNotCancelled(end);
+            assert!(!keeps_symbol_blocked(&result));
+            let h = handle(&summary(ReplaceKind::Stop, result));
+            assert_eq!(h.level, Level::Error);
+            assert!(
+                h.text.contains("Two protective orders may stand"),
+                "{}",
+                h.text
+            );
+            assert!(h.text.contains("57500"), "{}", h.text);
         }
     }
 

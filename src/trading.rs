@@ -4196,6 +4196,38 @@ mod tests {
     }
 
     #[test]
+    fn a_new_order_left_next_to_its_old_one_after_a_place_first_replace_is_listed() {
+        use exchange::trade::ProtectRole::{Stop, Target};
+        // Place first, cancel failed: the old order is still owned by the session, the new one
+        // is app-shaped and nothing owns it (no replacement proof is made for that case).
+        let long = [held("BTCUSDT", 2)];
+        let got = stray_table(
+            &[
+                algo_row("1", Stop, Some("tOWNEDOWNEDOWNEDOWNE")),
+                algo_row("2", Stop, Some(APP_ID)),
+            ],
+            &long,
+            false,
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "2");
+        assert!(got[0].residual);
+        // A stop of a held position is only told about; the user picks which one to cancel on
+        // the exchange. A take-profit twin is offered for cancelling.
+        assert!(got[0].guards_position && !got[0].can_cancel);
+        let got = stray_table(
+            &[
+                algo_row("1", Target, Some("tOWNEDOWNEDOWNEDOWNE")),
+                algo_row("2", Target, Some(APP_ID)),
+            ],
+            &long,
+            false,
+        );
+        assert_eq!(got.len(), 1);
+        assert!(got[0].residual && got[0].can_cancel);
+    }
+
+    #[test]
     fn a_stop_that_guards_a_held_position_is_not_a_stray_to_cancel() {
         use exchange::trade::ProtectRole::Stop;
         let (mut t, m, key) = running();

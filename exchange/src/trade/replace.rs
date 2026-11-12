@@ -25,6 +25,14 @@
 //! What cannot be predicted (the exchange refusing the new order) leaves the position without
 //! that protection; that is [`ReplaceError::NewNotPlaced`], which the caller must show loudly.
 //!
+//! **Order of the two legs (f3b).** Cancel first is the rule. Place first (the new order goes
+//! out, and the old one is cancelled only once the new one is accepted) exists as a mechanism
+//! behind one code constant per exchange ([`BINANCE_PLACE_FIRST_ALLOWED`],
+//! [`OKX_PLACE_FIRST_ALLOWED`]), both `false`. The exchange side picks the order
+//! ([`ReplaceOrder`]); no caller, setting or saved state can. See the constants for what must be
+//! checked on a testnet before one is turned on. Even with a flag on, only a reduce-only order
+//! with an explicit quantity is eligible: a whole-position order never goes first.
+//!
 //! The new order must be a protective order of the same kind (stop for stop, target for target),
 //! on the same side and position side, closing and not adding, and not larger than the old one.
 //! Only a stop or a target on Binance USDⓈ-M or OKX swap can be replaced; trailing stops,
@@ -62,6 +70,98 @@ pub const REPLACE_GRANT_VALID_MS: i64 = 30_000;
 const BINANCE_ALGO_PATH: &str = "/fapi/v1/algoOrder";
 const OKX_ALGO_PATH: &str = "/api/v5/trade/order-algo";
 const OKX_CANCEL_ALGOS_PATH: &str = "/api/v5/trade/cancel-algos";
+
+/// Whether a replace may place the new order **before** cancelling the old one, on Binance
+/// USDⓈ-M. Off, and a code constant on purpose: not a setting, not in saved state, not
+/// overridable from the GUI. Turn it on only after a testnet run has settled:
+///
+/// - that a second reduce-only stop or take-profit on the same side, with an explicit
+///   quantity, is accepted next to the old one while the position is held (and what it
+///   answers when the two together exceed the position);
+/// - the answer when the new trigger would fire at once while the old order still stands;
+/// - that a cancel of the old order after the new one was accepted names the old algo id
+///   as it does today;
+/// - how the user data stream orders the new order's event and the old order's cancel.
+///
+/// `closePosition` orders never go first whatever this says (the second one on a side was
+/// answered with -4130 in the docs and is not verified).
+const BINANCE_PLACE_FIRST_ALLOWED: bool = false;
+
+/// Same for OKX swap. Before turning it on, a testnet run must settle that a second
+/// reduce-only conditional order with an explicit `sz` is accepted next to the old one, in net
+/// and in hedge mode, and what happens when the two together exceed the position. A
+/// `closeFraction` order never goes first (one per position).
+const OKX_PLACE_FIRST_ALLOWED: bool = false;
+
+/// The two flags as `submit_replace` reads them. Built only from the constants above; the
+/// only other constructor exists in test builds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlaceFirstFlags {
+    binance: bool,
+    okx: bool,
+}
+
+impl PlaceFirstFlags {
+    const BUILD: Self = PlaceFirstFlags {
+        binance: BINANCE_PLACE_FIRST_ALLOWED,
+        okx: OKX_PLACE_FIRST_ALLOWED,
+    };
+
+    #[cfg(test)]
+    pub(crate) fn for_test(binance: bool, okx: bool) -> Self {
+        PlaceFirstFlags { binance, okx }
+    }
+}
+
+/// Which leg of a replace goes out first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceOrder {
+    /// Cancel the old order, then place the new one (a short time without protection).
+    CancelFirst,
+    /// Place the new order, then cancel the old one (a short time with two).
+    PlaceFirst,
+}
+
+impl ReplaceOrder {
+    /// The order a replace with `new` will use in this build. For the confirmation window to
+    /// word its warning; `submit_replace` decides again from the same rule.
+    pub fn of(new: &OrderIntent) -> Self {
+        Self::decide(new, PlaceFirstFlags::BUILD)
+    }
+
+    pub(crate) fn decide(new: &OrderIntent, flags: PlaceFirstFlags) -> Self {
+        let first = match &new.prepared {
+            Prepared::Binance(r) => flags.binance && binance_can_go_first(r),
+            Prepared::Okx(r) => flags.okx && okx_can_go_first(r),
+        };
+        if first {
+            ReplaceOrder::PlaceFirst
+        } else {
+            ReplaceOrder::CancelFirst
+        }
+    }
+}
+
+/// Only a reduce-only order with an explicit, positive quantity can go first: it cannot add to
+/// the position and does not claim the whole position.
+fn binance_can_go_first(r: &BinanceRequest) -> bool {
+    r.param("closePosition") != Some("true")
+        && r.param("reduceOnly") == Some("true")
+        && r.param("quantity")
+            .and_then(|v| Decimal::parse(v).ok())
+            .is_some_and(|q| q.is_positive())
+}
+
+fn okx_can_go_first(r: &OkxRequest) -> bool {
+    r.algo_body().is_some_and(|b| {
+        b.close_fraction.is_none()
+            && b.reduce_only == Some(true)
+            && b.sz
+                .as_deref()
+                .and_then(|v| Decimal::parse(v).ok())
+                .is_some_and(|q| q.is_positive())
+    })
+}
 
 /// Which protective order is replaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +250,19 @@ pub enum ReplaceError<R> {
     NewNotPlaced {
         cancel: Box<Submitted>,
         new: Option<Box<Submitted>>,
+    },
+    /// Place first only: the new order was sent and not accepted (rejected, or unknown). The
+    /// old order was **not** cancelled and stands; a rejection is a refusal. For an `Unknown`
+    /// outcome the new order may exist next to the old one and `pending` resolves it. Never
+    /// made when the cancel goes first.
+    NewNotAccepted(Box<Submitted>),
+    /// Place first only: the new order **was accepted** and the old one was not confirmed
+    /// cancelled (rejected, unknown, or it never left). Two protective orders may stand. Nothing
+    /// is retried and no [`Replacement`] is made: the automatic protection still follows the
+    /// old order. The open orders must be read again.
+    OldNotCancelled {
+        new: Box<Submitted>,
+        cancel: Option<Box<Submitted>>,
     },
 }
 
@@ -559,9 +672,25 @@ impl TradeClient {
         grant: ReplaceGrant,
         new: OrderIntent,
     ) -> Result<ReplaceDone, ReplaceError<G::Refusal>> {
+        self.submit_replace_with(gate, risk, journal, grant, new, PlaceFirstFlags::BUILD)
+            .await
+    }
+
+    /// `submit_replace` with the place-first flags given. Crate-private; only test builds can
+    /// build flags other than the constants.
+    pub(crate) async fn submit_replace_with<G: SendGate>(
+        &self,
+        gate: &G,
+        risk: &dyn RiskHook,
+        journal: &dyn UnknownJournal,
+        grant: ReplaceGrant,
+        new: OrderIntent,
+        flags: PlaceFirstFlags,
+    ) -> Result<ReplaceDone, ReplaceError<G::Refusal>> {
         let now = self.now_ms();
         grant.check(&new, now).map_err(ReplaceError::Refused)?;
         let new_hash = new.preview().hash;
+        let order = ReplaceOrder::decide(&new, flags);
         let replacement = Replacement::of(&grant, &new);
         let ReplaceGrant {
             cancel,
@@ -591,6 +720,11 @@ impl TradeClient {
         )
         .map_err(ReplaceError::NotSent)?;
 
+        if order == ReplaceOrder::PlaceFirst {
+            return self
+                .place_then_cancel(place, cancel, journal, &old_id, replacement)
+                .await;
+        }
         log::info!("replace protective order: cancelling the old order");
         let cancelled = self
             .send_approved(cancel, journal)
@@ -622,6 +756,54 @@ impl TradeClient {
                 cancel: Box::new(cancelled),
                 new: None,
             }),
+        }
+    }
+}
+
+impl TradeClient {
+    /// The place-first path (see [`ReplaceOrder`]): the new order goes out; only an accepted one
+    /// lets the cancel of the old order go. Neither leg is repeated.
+    async fn place_then_cancel<R>(
+        &self,
+        place: ApprovedOrder,
+        cancel: ApprovedOrder,
+        journal: &dyn UnknownJournal,
+        old_id: &str,
+        replacement: Option<Replacement>,
+    ) -> Result<ReplaceDone, ReplaceError<R>> {
+        log::info!("replace protective order: placing the new order first");
+        let placed = self
+            .send_approved(place, journal)
+            .await
+            .map_err(not_sent::<R>)?;
+        if !matches!(placed.outcome, Outcome::Accepted { .. }) {
+            // The old order is untouched.
+            return Err(ReplaceError::NewNotAccepted(Box::new(placed)));
+        }
+        log::info!("replace protective order: cancelling the old order");
+        let cancelled = match self.send_approved(cancel, journal).await {
+            Ok(c) => c,
+            Err(_) => {
+                return Err(ReplaceError::OldNotCancelled {
+                    new: Box::new(placed),
+                    cancel: None,
+                });
+            }
+        };
+        if matches!(
+            &cancelled.outcome,
+            Outcome::Accepted { ids } if ids.iter().any(|i| i == old_id)
+        ) {
+            Ok(ReplaceDone {
+                cancel: cancelled,
+                new: placed,
+                replacement,
+            })
+        } else {
+            Err(ReplaceError::OldNotCancelled {
+                new: Box::new(placed),
+                cancel: Some(Box::new(cancelled)),
+            })
         }
     }
 }

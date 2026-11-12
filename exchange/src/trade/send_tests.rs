@@ -5689,4 +5689,294 @@ mod replace_protective {
         })
         .await;
     }
+
+    /// f3b: the order of the two legs. The flags are constants; only test builds can turn one on.
+    mod place_first {
+        use super::*;
+        use crate::trade::replace::{PlaceFirstFlags, ReplaceDone, ReplaceOrder};
+
+        const ON: fn() -> PlaceFirstFlags = || PlaceFirstFlags::for_test(true, true);
+        const OFF: fn() -> PlaceFirstFlags = || PlaceFirstFlags::for_test(false, false);
+
+        const CANCEL_BINANCE: &str = "DELETE /fapi/v1/algoOrder";
+        const PLACE_BINANCE: &str = "POST /fapi/v1/algoOrder";
+        const CANCEL_OKX: &str = "POST /api/v5/trade/cancel-algos";
+        const PLACE_OKX: &str = "POST /api/v5/trade/order-algo";
+
+        async fn run_with(
+            c: &TradeClient,
+            grant: ReplaceGrant,
+            new: OrderIntent,
+            flags: PlaceFirstFlags,
+        ) -> Result<ReplaceDone, ReplaceError<()>> {
+            c.submit_replace_with(&OpenGate, &NoRisk, &NoJournal, grant, new, flags)
+                .await
+        }
+
+        /// A reduce-only stop with an explicit quantity (the one kind that may go first).
+        fn qty_stop(c: &TradeClient, t: &RulesTable) -> OrderIntent {
+            new_order(
+                c,
+                t,
+                ProtectiveKind::StopMarket,
+                Dir::Long,
+                Size::Qty(d("0.5")),
+                "58000",
+            )
+        }
+
+        fn qty_old() -> OpenOrder {
+            old_row(ProtectRole::Stop, false, Some("1"))
+        }
+
+        fn okx_stop(c: &TradeClient, t: &RulesTable, size: Size) -> (OrderIntent, OpenOrder) {
+            let r = t.lookup("BTC-USDT-SWAP").unwrap();
+            let fresh = t.fresh_lookup("BTC-USDT-SWAP", NOW, AGE).unwrap();
+            let req = okx::place_algo(OkxProtective {
+                rules: r,
+                target: OkxTarget::Swap {
+                    mode: Some(PositionMode::OneWay),
+                    margin: MarginMode::Cross,
+                    action: Action::Close(Dir::Long),
+                },
+                ord_type: OkxAlgoType::Conditional,
+                size,
+                tp_trigger: None,
+                sl_trigger: Some(d("58000")),
+                trigger_type: TriggerPxType::Last,
+                ref_price: d("60000"),
+                client_id: ClientId::generate(Role::StopLoss),
+            })
+            .unwrap();
+            let mut old = old_row(
+                ProtectRole::Stop,
+                matches!(size, Size::ClosePosition),
+                Some("2"),
+            );
+            if matches!(size, Size::ClosePosition) {
+                old.qty = None;
+            }
+            old.symbol = "BTC-USDT-SWAP".to_string();
+            old.kind = OpenKind::Algo(Some(OkxAlgoType::Conditional));
+            (OrderIntent::okx(c.account(), req, &fresh).unwrap(), old)
+        }
+
+        fn okx_grant(
+            c: &TradeClient,
+            t: &RulesTable,
+            old: &OpenOrder,
+            new: &OrderIntent,
+        ) -> ReplaceGrant {
+            let fresh = t.fresh_lookup("BTC-USDT-SWAP", NOW, AGE).unwrap();
+            c.replace_grant(
+                ConfirmToken::for_replace(&new.preview(), old),
+                c.account(),
+                old,
+                &fresh,
+            )
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn with_the_build_flags_both_exchanges_cancel_first() {
+            // The build constants, through the public entry point.
+            let fake = serve(replace_binance);
+            let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+            let t = futures();
+            let old = qty_old();
+            let new = qty_stop(&c, &t);
+            assert_eq!(ReplaceOrder::of(&new), ReplaceOrder::CancelFirst);
+            let grant = grant_for(&c, &t, &old, &new);
+            run(&c, grant, new).await.unwrap();
+            assert_eq!(
+                fake.all(),
+                vec![CANCEL_BINANCE.to_string(), PLACE_BINANCE.to_string()]
+            );
+
+            let fake = serve(replace_okx);
+            let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+            let t = okx_swap_table();
+            let (new, old) = okx_stop(&c, &t, Size::Qty(d("1")));
+            assert_eq!(ReplaceOrder::of(&new), ReplaceOrder::CancelFirst);
+            let grant = okx_grant(&c, &t, &old, &new);
+            run(&c, grant, new).await.unwrap();
+            assert_eq!(
+                fake.all(),
+                vec![CANCEL_OKX.to_string(), PLACE_OKX.to_string()]
+            );
+        }
+
+        #[tokio::test]
+        async fn flags_that_are_off_in_a_test_build_cancel_first_too() {
+            let fake = serve(replace_binance);
+            let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+            let t = futures();
+            let new = qty_stop(&c, &t);
+            assert_eq!(ReplaceOrder::decide(&new, OFF()), ReplaceOrder::CancelFirst);
+            // One exchange on does not turn the other on.
+            assert_eq!(
+                ReplaceOrder::decide(&new, PlaceFirstFlags::for_test(false, true)),
+                ReplaceOrder::CancelFirst
+            );
+            assert_eq!(
+                ReplaceOrder::decide(&new, PlaceFirstFlags::for_test(true, false)),
+                ReplaceOrder::PlaceFirst
+            );
+        }
+
+        #[tokio::test]
+        async fn binance_places_first_when_its_flag_is_on_and_the_order_is_eligible() {
+            let fake = serve(replace_binance);
+            let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+            let t = futures();
+            let old = qty_old();
+            let new = qty_stop(&c, &t);
+            let grant = grant_for(&c, &t, &old, &new);
+            let done = run_with(&c, grant, new, ON()).await.unwrap();
+            assert_eq!(
+                fake.all(),
+                vec![PLACE_BINANCE.to_string(), CANCEL_BINANCE.to_string()]
+            );
+            assert!(matches!(done.cancel.outcome, Outcome::Accepted { .. }));
+            assert!(matches!(done.new.outcome, Outcome::Accepted { .. }));
+            // The automatic protection can take the new order over, as after a cancel-first replace.
+            let r = done.replacement.expect("a completed replace has a proof");
+            assert_eq!(r.old_client_id(), "eOLDSTOP1");
+        }
+
+        #[tokio::test]
+        async fn okx_places_first_when_its_flag_is_on_and_the_order_is_eligible() {
+            let fake = serve(replace_okx);
+            let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+            let t = okx_swap_table();
+            let (new, old) = okx_stop(&c, &t, Size::Qty(d("1")));
+            let grant = okx_grant(&c, &t, &old, &new);
+            run_with(&c, grant, new, ON()).await.unwrap();
+            assert_eq!(
+                fake.all(),
+                vec![PLACE_OKX.to_string(), CANCEL_OKX.to_string()]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_whole_position_order_never_goes_first_even_with_the_flags_on() {
+            // Binance closePosition.
+            let fake = serve(replace_binance);
+            let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+            let t = futures();
+            let old = old_row(ProtectRole::Stop, true, None);
+            let new = stop(&c, &t, "58000");
+            assert_eq!(ReplaceOrder::decide(&new, ON()), ReplaceOrder::CancelFirst);
+            let grant = grant_for(&c, &t, &old, &new);
+            run_with(&c, grant, new, ON()).await.unwrap();
+            assert_eq!(
+                fake.all(),
+                vec![CANCEL_BINANCE.to_string(), PLACE_BINANCE.to_string()]
+            );
+            // OKX closeFraction.
+            let fake = serve(replace_okx);
+            let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+            let t = okx_swap_table();
+            let (new, old) = okx_stop(&c, &t, Size::ClosePosition);
+            assert_eq!(ReplaceOrder::decide(&new, ON()), ReplaceOrder::CancelFirst);
+            let grant = okx_grant(&c, &t, &old, &new);
+            run_with(&c, grant, new, ON()).await.unwrap();
+            assert_eq!(
+                fake.all(),
+                vec![CANCEL_OKX.to_string(), PLACE_OKX.to_string()]
+            );
+        }
+
+        async fn new_fails_first(status: u16, body: serde_json::Value) -> ReplaceError<()> {
+            let fake = serve(move |m, p| {
+                if m == "POST" {
+                    (status, body.to_string())
+                } else {
+                    replace_binance(m, p)
+                }
+            });
+            let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+            let t = futures();
+            let old = qty_old();
+            let new = qty_stop(&c, &t);
+            let grant = grant_for(&c, &t, &old, &new);
+            let e = run_with(&c, grant, new, ON()).await.unwrap_err();
+            // The old order was never cancelled and nothing was repeated.
+            assert_eq!(deleted_then_posted(&fake), (0, 1));
+            e
+        }
+
+        #[tokio::test]
+        async fn a_refused_new_order_leaves_the_old_one_alone() {
+            let e = new_fails_first(
+                400,
+                json!({"code": -2021, "msg": "Order would immediately trigger."}),
+            )
+            .await;
+            let ReplaceError::NewNotAccepted(sub) = e else {
+                panic!("{e:?}");
+            };
+            assert!(matches!(sub.outcome, Outcome::Rejected { .. }));
+        }
+
+        #[tokio::test]
+        async fn a_new_order_of_unknown_fate_does_not_cancel_the_old_one() {
+            let e = new_fails_first(500, json!({"code": -1006, "msg": "Unexpected."})).await;
+            let ReplaceError::NewNotAccepted(sub) = e else {
+                panic!("{e:?}");
+            };
+            assert!(matches!(sub.outcome, Outcome::Unknown { .. }));
+        }
+
+        async fn cancel_fails_after(status: u16, body: serde_json::Value) {
+            let fake = serve(move |m, p| {
+                if m == "DELETE" {
+                    (status, body.to_string())
+                } else {
+                    gen_binance(m, p)
+                }
+            });
+            let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+            let t = futures();
+            let old = qty_old();
+            let new = qty_stop(&c, &t);
+            let grant = grant_for(&c, &t, &old, &new);
+            let e = run_with(&c, grant, new, ON()).await.unwrap_err();
+            let ReplaceError::OldNotCancelled { new, cancel } = e else {
+                panic!("{e:?}");
+            };
+            // Two protective orders may stand: the new one is accepted, the old one is not
+            // confirmed gone. Nothing was repeated.
+            assert!(matches!(new.outcome, Outcome::Accepted { .. }));
+            assert!(!matches!(cancel.unwrap().outcome, Outcome::Accepted { .. }));
+            assert_eq!(deleted_then_posted(&fake), (1, 1));
+        }
+
+        #[tokio::test]
+        async fn a_rejected_cancel_after_the_new_order_was_accepted_says_two_orders_stand() {
+            cancel_fails_after(400, json!({"code": -2011, "msg": "Unknown order sent."})).await;
+        }
+
+        #[tokio::test]
+        async fn an_unknown_cancel_after_the_new_order_was_accepted_says_two_orders_may_stand() {
+            cancel_fails_after(500, json!({"code": -1006, "msg": "Unexpected."})).await;
+        }
+
+        #[tokio::test]
+        async fn both_legs_are_still_approved_before_the_first_one_goes_out() {
+            // A gate that refuses: nothing is sent, in either order.
+            let fake = serve(replace_binance);
+            let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+            let t = futures();
+            let old = qty_old();
+            let new = qty_stop(&c, &t);
+            let grant = grant_for(&c, &t, &old, &new);
+            let e = c
+                .submit_replace_with(&ClosedGate, &NoRisk, &NoJournal, grant, new, ON())
+                .await
+                .unwrap_err();
+            assert!(matches!(e, ReplaceError::NotSent(_)), "{e:?}");
+            assert_eq!(deleted_then_posted(&fake), (0, 0));
+        }
+    }
 }

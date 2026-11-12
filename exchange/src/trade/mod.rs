@@ -61,8 +61,8 @@ pub use protect::{
     protected_status, protecting_orders, residual_auto_orders, stop_guarded_position,
 };
 pub use replace::{
-    REPLACE_GRANT_VALID_MS, ReplaceDone, ReplaceError, ReplaceGrant, ReplaceKind, ReplaceRefusal,
-    Replacement,
+    REPLACE_GRANT_VALID_MS, ReplaceDone, ReplaceError, ReplaceGrant, ReplaceKind, ReplaceOrder,
+    ReplaceRefusal, Replacement,
 };
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
 pub use risk::{
