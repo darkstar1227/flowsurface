@@ -4870,6 +4870,34 @@ mod replace_protective {
     }
 
     #[tokio::test]
+    async fn a_completed_replace_carries_the_proof_for_the_automatic_grant() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let new_id = new.client_ids()[0].to_string();
+        let grant = grant_for(&c, &t, &old, &new);
+        let done = run(&c, grant, new).await.unwrap();
+        let r = done.replacement.expect("a binance replace has a proof");
+        assert_eq!(r.old_client_id(), "eOLDSTOP1");
+        assert_eq!(r.new_client_id(), new_id);
+        assert!(!format!("{r:?}").contains(&new_id));
+    }
+
+    #[tokio::test]
+    async fn a_replace_of_an_order_without_a_client_id_has_no_proof() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let mut old = old_row(ProtectRole::Stop, true, None);
+        old.client_id = None;
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &new);
+        assert!(run(&c, grant, new).await.unwrap().replacement.is_none());
+    }
+
+    #[tokio::test]
     async fn cancels_first_and_places_after_the_cancel_was_confirmed() {
         let fake = serve(replace_binance);
         let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
@@ -5472,7 +5500,13 @@ mod replace_protective {
         whole.close_position = true;
         let mut target = old.clone();
         target.role = Some(ProtectRole::Target);
-        for changed in [bigger, other_side, hedged, whole, target] {
+        // The same exchange id under another client id (a mixed-up row): the adoption would
+        // follow the wrong order.
+        let mut renamed = old.clone();
+        renamed.client_id = Some("sSOMEOTHERORDERIDXXXX".to_string());
+        let mut unnamed = old.clone();
+        unnamed.client_id = None;
+        for changed in [bigger, other_side, hedged, whole, target, renamed, unnamed] {
             let e = c
                 .replace_grant(
                     ConfirmToken::for_replace(&new.preview(), &old),

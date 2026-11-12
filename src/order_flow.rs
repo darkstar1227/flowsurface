@@ -945,6 +945,7 @@ pub async fn run_replace(input: ReplaceSendInput) -> ReplaceSummary {
         new_trigger: input.new_trigger,
         result: ReplaceResult::Lost,
         journal_failed: false,
+        replacement: None,
     };
     tokio::spawn(send_replace(input)).await.unwrap_or(lost)
 }
@@ -983,6 +984,7 @@ async fn send_replace(input: ReplaceSendInput) -> ReplaceSummary {
     } = input;
     let old_id = old.id.clone();
     let summary = |result: ReplaceResult, journal_failed: bool| ReplaceSummary {
+        replacement: None,
         account: meta.id,
         symbol: symbol.clone(),
         old_id: old_id.clone(),
@@ -1045,7 +1047,11 @@ async fn send_replace(input: ReplaceSendInput) -> ReplaceSummary {
     {
         Ok(done) => {
             let journal_failed = done.cancel.journal_failed || done.new.journal_failed;
-            summary(ReplaceResult::Done, journal_failed)
+            // Only a completed replace carries the proof the automatic protection follows.
+            ReplaceSummary {
+                replacement: done.replacement,
+                ..summary(ReplaceResult::Done, journal_failed)
+            }
         }
         Err(ReplaceError::Refused(r)) => refused(format!("{r}.")),
         Err(ReplaceError::NotSent(e)) => {

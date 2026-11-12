@@ -36,8 +36,8 @@ use exchange::signed_http::SignedHttp;
 use exchange::trade::stream::{OrderCategory, OrderStatus, OrderUpdate};
 use exchange::trade::{
     AutoGrant, AutoIntent, AutoPath, ClientId, Decimal, Dir, GrantRoles, IssuedRef, OrderIntent,
-    Outcome, ProtectSpec, RejectKind, Resolution, Role, SharedRisk, Side, Stage, StageInput,
-    TradeClient, build_stage, stage_roles,
+    Outcome, ProtectSpec, RejectKind, Replacement, Resolution, Role, SharedRisk, Side, Stage,
+    StageInput, TradeClient, build_stage, stage_roles,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
@@ -51,6 +51,12 @@ pub const GRANT_VALID_MS: i64 = 24 * 60 * 60 * 1000;
 /// Decimals kept in an average fill price (the tick rounds it afterwards).
 const AVG_SCALE: u32 = 8;
 const MAX_NOTES: usize = 12;
+/// Algo events of an account whose client id the book did not know yet, kept per account for a
+/// replace that completes after its events (f3c). Held in memory only.
+const MAX_UNCLAIMED: usize = 32;
+/// Client ids of orders of entries that left the book, to tell a late replace answer for one of
+/// them from an order the app never placed.
+const MAX_FORGOTTEN: usize = 64;
 /// How long the Keychain, clock and rules steps may take before the job is given up.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -604,6 +610,20 @@ struct AutoEntry {
     notified: bool,
 }
 
+/// What [`AutoBook::adopt_replacement`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adoption {
+    /// The book follows the new order now.
+    Adopted,
+    /// The old order is not one the book placed: nothing to do.
+    NotOurs,
+    /// The old order was one the book placed, but its entry has left the book (it was over as
+    /// far as the book could tell): the new order is not followed.
+    Dropped,
+    /// The book placed the old order but could not follow the new one (a note says so).
+    Refused,
+}
+
 /// What a fill did to the book.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillVerdict {
@@ -625,6 +645,17 @@ pub struct AutoBook {
     /// entry; the panel shows those from the entry, and only the other notes from here.
     notes: VecDeque<(Uuid, String, bool)>,
     finished: Vec<String>,
+    /// Per account, the last algo events (client id, status) of orders the book did not know:
+    /// the events of a replacement that came before the answer of the replace. Bounded, never
+    /// logged, never saved.
+    unclaimed: HashMap<Uuid, VecDeque<(String, OrderStatus)>>,
+    /// Client ids of placed orders of entries that were dropped (bounded, oldest first).
+    forgotten: VecDeque<(Uuid, String)>,
+    /// Old client ids of placed orders whose replace is out (old id → account). Set when the
+    /// replace is sent and cleared when it ends, whatever the result: while an id is here its
+    /// entry is not dropped and a cancel of it is not sent (the replace cancels it, and the
+    /// answer decides what the new order is). One replace runs per account, so it stays small.
+    replacing: HashMap<String, Uuid>,
 }
 
 impl fmt::Debug for AutoBook {
@@ -802,6 +833,168 @@ impl AutoBook {
     /// Is this client id one of an entry of the book, or of an order the book placed?
     pub fn knows_client_id(&self, client_id: &str) -> bool {
         self.entries.contains_key(client_id) || self.by_placed.contains_key(client_id)
+    }
+
+    /// Is an automatic job working on this order right now, so that it must not be replaced
+    /// (f3c)? Only what the job is doing counts, not who placed the order:
+    ///
+    /// - the entry order itself is the job's (it is never a protective order to replace);
+    /// - the entry has a job in flight (`busy`: protective orders going out, or cancels going
+    ///   out), which reads and changes the placed orders;
+    /// - the order is not standing steadily: it is marked to be cancelled, being cancelled, its
+    ///   cancel failed, it triggered or finished, or it was cancelled or refused.
+    ///
+    /// A protective order the book placed that is `Open` while no job runs is stable, and may be
+    /// dragged: [`Self::adopt_replacement`] then hands the new order to the book.
+    pub fn is_working_on(&self, client_id: &str) -> bool {
+        if self.entries.contains_key(client_id) {
+            return true;
+        }
+        let Some(e) = self
+            .by_placed
+            .get(client_id)
+            .and_then(|key| self.entries.get(key))
+        else {
+            return false;
+        };
+        e.busy
+            || e.placed
+                .iter()
+                .find(|p| p.id == client_id)
+                .is_none_or(|p| p.state != Live::Open)
+    }
+
+    /// A confirmed replace of a protective order the book placed completed (the exchange took
+    /// the cancel of the old order and the new order): the entry's record, and the grant that
+    /// builds the sibling cancels, now name the new order, in the old one's role. Everything is
+    /// checked before anything is changed; a refusal leaves book and grant as they were, writes
+    /// a note, and the new order is then an order the app does not follow (the orphan list
+    /// shows it).
+    ///
+    /// The old order is expected `Open` (a stable order), `ToCancel` (a sibling fired during the
+    /// replace: the next job cancels the new order), or `Cancelled` (the exchange's cancel event
+    /// of the replace itself arrived before the answer, and only the grant, which did not
+    /// cancel it, vouches for it). `Cancelling` and the rest are refused: a job is cancelling
+    /// the old id, or the order is over.
+    pub fn adopt_replacement(&mut self, account: Uuid, r: &Replacement) -> Adoption {
+        let Some(entry_id) = self.by_placed.get(r.old_client_id()).cloned() else {
+            return if (self.forgotten.iter()).any(|(a, f)| *a == account && f == r.old_client_id())
+            {
+                Adoption::Dropped
+            } else {
+                Adoption::NotOurs
+            };
+        };
+        let Some(e) = self
+            .entries
+            .get_mut(&entry_id)
+            .filter(|e| e.account == account)
+        else {
+            return Adoption::NotOurs;
+        };
+        let Some(idx) = e.placed.iter().position(|p| p.id == r.old_client_id()) else {
+            return Adoption::NotOurs;
+        };
+        let role = e.placed[idx].role;
+        // Decided now, with the state the events left: the same rule the triggers use.
+        let swept = Self::swept(e, role);
+        let refused = match e.placed[idx].state {
+            Live::Open | Live::ToCancel | Live::Cancelled => {
+                let mut grant = e.grant.lock();
+                // Read first: the grant is changed only when it and the book name the same slot.
+                if grant.issued_ref_of(r.old_client_id()) != Some(e.placed[idx].which) {
+                    Some("the records do not agree".to_string())
+                } else {
+                    match grant.adopt_replacement(r) {
+                        Ok(_) => None,
+                        Err(refusal) => Some(refusal.to_string()),
+                    }
+                }
+            }
+            _ => Some("a job is working on the order".to_string()),
+        };
+        if let Some(why) = refused {
+            let text = format!(
+                "{}: the replaced {} is not followed by the automatic protection ({why}). Check \
+                 the open orders.",
+                e.symbol,
+                role_word(Some(role))
+            );
+            self.note(account, text);
+            return Adoption::Refused;
+        }
+        let p = &mut e.placed[idx];
+        p.id = r.new_client_id().to_string();
+        if swept && matches!(p.state, Live::Open | Live::Cancelled) {
+            // An order that fired while the replace was out took this one with it: the next
+            // poll cancels the new order (its cancel event may have turned the old one to
+            // `Cancelled` before the sweep looked, so the sweep is decided here again).
+            p.state = Live::ToCancel;
+        } else if p.state == Live::Cancelled {
+            // The exchange's cancel of the old order made it `Cancelled`; the new order stands.
+            p.state = Live::Open;
+        }
+        self.by_placed.remove(r.old_client_id());
+        self.by_placed
+            .insert(r.new_client_id().to_string(), entry_id);
+        self.replay_unclaimed(account, r.new_client_id());
+        Adoption::Adopted
+    }
+
+    /// A replace of `old` is about to go out: if the book placed that order, it is not
+    /// cancelled and its entry is not dropped until [`Self::replace_ended`]. The book is keyed
+    /// by the client id, never the exchange id, so the id is taken from the row here (a row
+    /// without one is not recorded: it cannot be a replace the book can claim). Only book
+    /// state changes here; nothing is sent.
+    pub fn replace_begun(&mut self, account: Uuid, old: &exchange::trade::OpenOrder) {
+        let Some(client_id) = old.client_id.as_deref() else {
+            return;
+        };
+        let ours = self
+            .by_placed
+            .get(client_id)
+            .and_then(|k| self.entries.get(k))
+            .is_some_and(|e| e.account == account);
+        if ours {
+            self.replacing.insert(client_id.to_string(), account);
+        }
+    }
+
+    /// The replace of this account ended (any result, or a task that gave no answer): its
+    /// orders are handled by the usual paths again, unless the answer is adopted next. By
+    /// account, so that a result without a client id (or a task that panicked) clears it too;
+    /// one account has at most one replace running.
+    pub fn replace_ended(&mut self, account: Uuid) {
+        self.replacing.retain(|_, a| *a != account);
+    }
+
+    /// Keep an algo event of an order the book does not know (see [`MAX_UNCLAIMED`]). Only
+    /// events that can change a state, and only for ids shaped like the app's.
+    fn hold_unclaimed(&mut self, account: Uuid, id: &str, status: OrderStatus) {
+        if matches!(status, OrderStatus::New | OrderStatus::PartiallyFilled)
+            || !exchange::trade::looks_like_app_id(id)
+        {
+            return;
+        }
+        let held = self.unclaimed.entry(account).or_default();
+        held.push_back((id.to_string(), status));
+        while held.len() > MAX_UNCLAIMED {
+            held.pop_front();
+        }
+    }
+
+    /// The events kept for a replacement the book now follows, in the order they came.
+    fn replay_unclaimed(&mut self, account: Uuid, new_id: &str) {
+        let Some(held) = self.unclaimed.get_mut(&account) else {
+            return;
+        };
+        let (mine, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(held)
+            .into_iter()
+            .partition(|(id, _)| id == new_id);
+        *held = rest;
+        for (id, status) in mine {
+            self.on_algo_update(account, &id, status);
+        }
     }
 
     /// The accounts of entries that have a failure the user has not been told about by a system
@@ -988,6 +1181,10 @@ impl AutoBook {
         if let Some(e) = self.entries.remove(id) {
             for p in e.placed {
                 self.by_placed.remove(&p.id);
+                self.forgotten.push_back((e.account, p.id));
+                while self.forgotten.len() > MAX_FORGOTTEN {
+                    self.forgotten.pop_front();
+                }
             }
             if !e.reported {
                 self.finished.push(id.to_string());
@@ -1006,6 +1203,9 @@ impl AutoBook {
             self.drop_entry(&id);
         }
         self.sending.retain(|(a, _), _| *a != account);
+        self.unclaimed.remove(&account);
+        self.forgotten.retain(|(a, _)| *a != account);
+        self.replacing.retain(|_, a| *a != account);
         self.clear_notes(account);
     }
 
@@ -1138,6 +1338,7 @@ impl AutoBook {
 
     fn on_algo_update(&mut self, account: Uuid, id: &str, status: OrderStatus) {
         let Some(entry_id) = self.by_placed.get(id).cloned() else {
+            self.hold_unclaimed(account, id, status);
             return;
         };
         let Some(e) = self
@@ -1231,14 +1432,10 @@ impl AutoBook {
     /// here. The whole-position stop is never released by this: only [`Self::release_stop`]
     /// does, once the position is known to be gone. Orders leave `Open`, so this runs once.
     fn triggered(e: &mut AutoEntry, idx: usize) {
-        let sweep: &[Role] = match e.placed[idx].role {
-            Role::StopLoss => {
-                e.closed = true;
-                &[Role::TakeProfit, Role::Trailing]
-            }
-            Role::Trailing => &[Role::TakeProfit],
-            Role::TakeProfit | Role::Entry => &[],
-        };
+        if e.placed[idx].role == Role::StopLoss {
+            e.closed = true;
+        }
+        let sweep = Self::sweep_of(e.placed[idx].role);
         for p in e
             .placed
             .iter_mut()
@@ -1246,6 +1443,26 @@ impl AutoBook {
         {
             p.state = Live::ToCancel;
         }
+    }
+
+    /// The roles an order of this role takes with it when it triggers.
+    fn sweep_of(role: Role) -> &'static [Role] {
+        match role {
+            Role::StopLoss => &[Role::TakeProfit, Role::Trailing],
+            Role::Trailing => &[Role::TakeProfit],
+            Role::TakeProfit | Role::Entry => &[],
+        }
+    }
+
+    /// Has an order of the entry that triggered already taken the orders of `role` with it?
+    /// The same table as [`Self::triggered`], asked after the fact (for an order that only now
+    /// joins the book).
+    fn swept(e: &AutoEntry, role: Role) -> bool {
+        (e.closed && Self::sweep_of(Role::StopLoss).contains(&role))
+            || e.placed.iter().any(|q| {
+                matches!(q.state, Live::Triggered | Live::Finished)
+                    && Self::sweep_of(q.role).contains(&role)
+            })
     }
 
     /// Cancel the whole-position stop (and whatever else stands) when an order has finished, the
@@ -1368,15 +1585,26 @@ impl AutoBook {
         let to_cancel: Vec<IssuedRef> = e
             .placed
             .iter()
-            .filter(|p| p.state == Live::ToCancel)
+            .filter(|p| p.state == Live::ToCancel && !self.replacing.contains_key(&p.id))
             .map(|p| p.which)
             .collect();
         if !to_cancel.is_empty() {
-            for p in e.placed.iter_mut().filter(|p| p.state == Live::ToCancel) {
+            for p in e
+                .placed
+                .iter_mut()
+                .filter(|p| p.state == Live::ToCancel && !self.replacing.contains_key(&p.id))
+            {
                 p.state = Live::Cancelling;
             }
             e.busy = true;
             return Some(job(e, Work::Cancel { which: to_cancel }));
+        }
+        // An order held back for a replace still has its cancel to come: no stage is placed
+        // before it (cancel first, then place), so wait for the replace to end.
+        if (e.placed.iter())
+            .any(|p| p.state == Live::ToCancel && self.replacing.contains_key(&p.id))
+        {
+            return None;
         }
         if !e.filled.is_positive() {
             return None;
@@ -1602,10 +1830,12 @@ impl AutoBook {
                 .any(|p| p.state.holds_the_position() || p.state == Live::CancelFailed);
             // An entry with a failure stays until the user has handled it: the failure is the
             // record the panel shows (the notes list holds twelve lines and drops the oldest).
+            let replacing = e.placed.iter().any(|p| self.replacing.contains_key(&p.id));
             if ended
                 && e.complete
                 && !e.busy
                 && !live
+                && !replacing
                 && e.sent == Sent::Stands
                 && e.failures.is_empty()
             {
@@ -2305,6 +2535,540 @@ pub(crate) mod tests {
         assert!(!book.entries.contains_key(&key));
         assert!(polled(&mut book, NOW, true, flat(false)).is_empty());
         assert!(book.notes_for(account()).is_empty());
+    }
+
+    // ── f3c: dragging an order the app placed, and following its replacement ──
+
+    /// What the sender does for a placing job, without the exchange: the same requests, put
+    /// through the entry's grant, so that the grant holds the orders as sent.
+    fn grant_sends(job: AutoJob) {
+        let AutoJob {
+            work: Work::Place { stage, orders },
+            key,
+            grant,
+            spec,
+            dir,
+            mode,
+            filled,
+            ..
+        } = job
+        else {
+            return;
+        };
+        let table = futures_table();
+        let f = fresh(&table, "BTCUSDT", NOW);
+        let price = d("60000");
+        let input = StageInput {
+            rules: f.rules(),
+            mode,
+            dir,
+            avg_price: price,
+            filled,
+            ref_price: price,
+            spec: &spec,
+            stage,
+        };
+        let basis = input.basis(&key.0);
+        let issued: Vec<IssuedRef> = orders.iter().map(|o| o.issued).collect();
+        let ids = orders.into_iter().map(|o| (o.role, o.id)).collect();
+        for (_, (_, request)) in issued.into_iter().zip(build_stage(&input, ids)) {
+            let intent =
+                OrderIntent::binance(account_key(account()), request.unwrap(), &f).unwrap();
+            let auto = AutoIntent::new(AutoPath::AttachProtective, intent)
+                .unwrap()
+                .with_basis(basis.clone());
+            grant
+                .lock()
+                .authorise(auto, NOW)
+                .expect("the grant covers it");
+        }
+    }
+
+    /// [`with_placed`], with the grant holding every order as sent.
+    fn with_sent(spec: ProtectSpec) -> (AutoBook, String, Vec<String>) {
+        let (mut book, key) = booked(spec);
+        fill(&mut book, &key, "0.004");
+        book.on_order(
+            account(),
+            &order(&key, OrderCategory::Plain, OrderStatus::Filled, "0.004"),
+        );
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let job = poll(&mut book).remove(0);
+            ids.extend(place_ids(&job));
+            book.done(ok_all(&job));
+            grant_sends(job);
+        }
+        (book, key, ids)
+    }
+
+    fn replaced(kind: exchange::trade::ReplaceKind, old: &str) -> (Replacement, String) {
+        let new = ClientId::generate(match kind {
+            exchange::trade::ReplaceKind::Stop => Role::StopLoss,
+            exchange::trade::ReplaceKind::Target => Role::TakeProfit,
+        })
+        .as_str()
+        .to_string();
+        let r = Replacement::for_test(account_key(account()), "BTCUSDT", kind, old, &new);
+        (r, new)
+    }
+
+    /// The client ids the cancel job would send a cancel for, built by the grant as the sender
+    /// does.
+    fn cancel_targets(job: &AutoJob) -> Vec<String> {
+        let Work::Cancel { which } = &job.work else {
+            return Vec::new();
+        };
+        let table = futures_table();
+        which
+            .iter()
+            .flat_map(|w| {
+                job.grant
+                    .lock()
+                    .cancel_intent(*w, &fresh(&table, "BTCUSDT", NOW))
+                    .expect("the grant builds the cancel")
+                    .client_ids()
+                    .iter()
+                    .map(|c| (*c).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_order_the_app_placed_is_draggable_while_it_stands_and_no_job_works() {
+        let (mut book, key) = booked(spec(1, false));
+        fill(&mut book, &key, "0.004");
+        let stop = poll(&mut book);
+        let stop_id = place_ids(&stop[0]).remove(0);
+        // The job that places it is still out: not draggable.
+        assert!(book.is_working_on(&stop_id));
+        book.done(ok_all(&stop[0]));
+        // Placed, standing, nothing running: draggable although the book still knows it.
+        assert!(book.knows_client_id(&stop_id));
+        assert!(!book.is_working_on(&stop_id));
+        // The entry order is the job's own, and an id the book does not know is nobody's.
+        assert!(book.is_working_on(&key));
+        assert!(!book.is_working_on("sNOTKNOWNNOTKNOWNNOT"));
+    }
+
+    #[test]
+    fn an_order_that_is_marked_cancelling_or_over_is_not_draggable() {
+        let (mut book, key, ids) = with_placed(spec(1, false));
+        // The stop fires: the take-profit is marked, then a cancel job is out for it.
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::ToCancel);
+        assert!(book.is_working_on(&ids[1]));
+        let _cancel_job = poll(&mut book);
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::Cancelling);
+        assert!(book.is_working_on(&ids[1]));
+        // The order that fired is over.
+        assert!(book.is_working_on(&ids[0]));
+        // A job that runs on the entry holds every order of it, whatever its own state.
+        let (mut book, key, ids) = with_everything_placed();
+        book.entries.get_mut(&key).unwrap().busy = true;
+        assert!(ids.iter().all(|id| book.is_working_on(id)));
+    }
+
+    #[test]
+    fn after_a_replace_a_finished_take_profit_cancels_the_new_stop() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        let (r, new_stop) = replaced(exchange::trade::ReplaceKind::Stop, &ids[0]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        assert_eq!(state_of(&book, &key, &new_stop), Live::Open);
+        assert!(book.knows_client_id(&new_stop));
+        assert!(!book.knows_client_id(&ids[0]), "the old id is gone");
+        assert!(!book.is_working_on(&new_stop));
+        // The exchange's cancel event for the old stop is not the book's any more.
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Canceled));
+        assert_eq!(state_of(&book, &key, &new_stop), Live::Open);
+        // The take-profit fills and the position is gone: exactly one cancel, of the new stop.
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Triggered));
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Finished));
+        let jobs = polled(&mut book, NOW, true, flat(false));
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(cancel_count(&jobs[0]), 1);
+        assert_eq!(cancel_targets(&jobs[0]), vec![new_stop.clone()]);
+        book.done(ok_all(&jobs[0]));
+        assert!(!book.entries.contains_key(&key));
+    }
+
+    #[test]
+    fn after_a_replace_a_fired_stop_cancels_the_new_take_profit_and_the_other_one() {
+        let (mut book, key, ids) = with_sent(spec(2, false));
+        // ids: the stop, then two take-profits. The second one is replaced.
+        let (r, new_tp) = replaced(exchange::trade::ReplaceKind::Target, &ids[2]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        let jobs = poll(&mut book);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(cancel_count(&jobs[0]), 2);
+        let mut got = cancel_targets(&jobs[0]);
+        got.sort();
+        let mut want = vec![ids[1].clone(), new_tp.clone()];
+        want.sort();
+        assert_eq!(got, want);
+        assert!(!got.contains(&ids[2]));
+        assert_eq!(state_of(&book, &key, &new_tp), Live::Cancelling);
+    }
+
+    #[test]
+    fn the_exchanges_cancel_event_that_comes_before_the_answer_does_not_lose_the_order() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        // The stream is faster than the answer of the replace.
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Canceled));
+        assert_eq!(state_of(&book, &key, &ids[0]), Live::Cancelled);
+        let (r, new_stop) = replaced(exchange::trade::ReplaceKind::Stop, &ids[0]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        assert_eq!(state_of(&book, &key, &new_stop), Live::Open);
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Finished));
+        let jobs = polled(&mut book, NOW, true, flat(false));
+        assert_eq!(cancel_targets(&jobs[0]), vec![new_stop]);
+    }
+
+    #[test]
+    fn a_replace_that_was_not_completed_is_not_followed() {
+        // No proof exists then (`ReplaceDone` carries it, an error does not): the old stop is
+        // whatever the exchange's events say. Here the cancel went through and the new order
+        // was not placed.
+        let (mut book, key, ids) = with_placed(spec(1, false));
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Canceled));
+        assert_eq!(state_of(&book, &key, &ids[0]), Live::Cancelled);
+        assert!(
+            book.is_working_on(&ids[0]),
+            "a cancelled order is not draggable"
+        );
+        // A take-profit that finishes cancels nothing: the stop is already gone.
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Finished));
+        assert!(polled(&mut book, NOW, true, flat(false)).is_empty());
+        // And nothing else is adopted: a proof for an order the book never placed is nobody's.
+        let (r, _) = replaced(exchange::trade::ReplaceKind::Stop, "sNOTKNOWNNOTKNOWNNOT");
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::NotOurs);
+    }
+
+    #[test]
+    fn an_adoption_the_book_or_the_grant_cannot_take_changes_nothing() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        // Another account's proof is nobody's.
+        let (r, _) = replaced(exchange::trade::ReplaceKind::Stop, &ids[0]);
+        assert_eq!(
+            book.adopt_replacement(Uuid::from_u128(9), &r),
+            Adoption::NotOurs
+        );
+        // The wrong kind for the order: the grant refuses, a note says so.
+        let (r, new_id) = replaced(exchange::trade::ReplaceKind::Target, &ids[0]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Refused);
+        assert_eq!(state_of(&book, &key, &ids[0]), Live::Open);
+        assert!(!book.knows_client_id(&new_id));
+        assert_eq!(book.notes_for(account()).len(), 1);
+        // A job is cancelling the old stop: refused as well.
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Triggered));
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Finished));
+        let jobs = polled(&mut book, NOW, true, flat(false));
+        assert_eq!(state_of(&book, &key, &ids[0]), Live::Cancelling);
+        let (r, new_id) = replaced(exchange::trade::ReplaceKind::Stop, &ids[0]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Refused);
+        assert!(!book.knows_client_id(&new_id));
+        assert!(book.knows_client_id(&ids[0]));
+        // The grant still builds the cancel for the old id.
+        assert_eq!(cancel_targets(&jobs[0]), vec![ids[0].clone()]);
+    }
+
+    fn replacement_as(kind: exchange::trade::ReplaceKind, old: &str, new: &str) -> Replacement {
+        Replacement::for_test(account_key(account()), "BTCUSDT", kind, old, new)
+    }
+
+    fn new_id(role: Role) -> String {
+        ClientId::generate(role).as_str().to_string()
+    }
+
+    /// The new take-profit of a replaced take-profit, once a stop-loss fired while the replace
+    /// was out: it is marked, and the one job cancels exactly that order.
+    fn assert_new_tp_is_cancelled(book: &mut AutoBook, key: &str, new_tp: &str) {
+        assert_eq!(state_of(book, key, new_tp), Live::ToCancel);
+        let jobs = poll(book);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(cancel_count(&jobs[0]), 1);
+        assert_eq!(cancel_targets(&jobs[0]), vec![new_tp.to_string()]);
+        assert_eq!(state_of(book, key, new_tp), Live::Cancelling);
+    }
+
+    #[test]
+    fn a_stop_that_fires_after_the_cancel_event_of_a_replace_takes_the_new_take_profit() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        // T Canceled (the replace's own cancel), then S Triggered, then the answer.
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Canceled));
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        let (r, new_tp) = replaced(exchange::trade::ReplaceKind::Target, &ids[1]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        assert_new_tp_is_cancelled(&mut book, &key, &new_tp);
+    }
+
+    #[test]
+    fn a_stop_that_fires_before_the_cancel_event_of_a_replace_takes_the_new_take_profit() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        // S Triggered (T is marked), then T Canceled (it overwrites the mark), then the answer.
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::ToCancel);
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Canceled));
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::Cancelled);
+        let (r, new_tp) = replaced(exchange::trade::ReplaceKind::Target, &ids[1]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        assert_new_tp_is_cancelled(&mut book, &key, &new_tp);
+    }
+
+    #[test]
+    fn a_poll_between_the_events_of_a_replace_does_not_lose_the_new_take_profit_order_a() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        book.replace_begun(account(), &row_of(&ids[1]));
+        // T Canceled (the replace's own cancel), a poll, S Triggered, a poll, then the answer.
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Canceled));
+        assert!(poll(&mut book).is_empty());
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        assert!(poll(&mut book).is_empty());
+        assert!(book.entries.contains_key(&key), "the entry is kept");
+        book.replace_ended(account());
+        let (r, new_tp) = replaced(exchange::trade::ReplaceKind::Target, &ids[1]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        assert_new_tp_is_cancelled(&mut book, &key, &new_tp);
+    }
+
+    #[test]
+    fn a_poll_between_the_events_of_a_replace_does_not_cancel_the_old_id_order_b() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        book.replace_begun(account(), &row_of(&ids[1]));
+        // S Triggered, a poll (the old take-profit is not cancelled by id), T Canceled, a poll.
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        assert!(poll(&mut book).is_empty());
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::ToCancel);
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Canceled));
+        assert!(poll(&mut book).is_empty());
+        book.replace_ended(account());
+        let (r, new_tp) = replaced(exchange::trade::ReplaceKind::Target, &ids[1]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        assert_new_tp_is_cancelled(&mut book, &key, &new_tp);
+    }
+
+    #[test]
+    fn a_replace_that_did_not_complete_gives_the_old_order_back_to_the_usual_paths() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        book.replace_begun(account(), &row_of(&ids[1]));
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        assert!(poll(&mut book).is_empty());
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::ToCancel);
+        // The replace ended with no proof: the old id is cancelled as before.
+        book.replace_ended(account());
+        let jobs = poll(&mut book);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(cancel_targets(&jobs[0]), vec![ids[1].clone()]);
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::Cancelling);
+    }
+
+    /// The row the replace is sent for: the exchange id is not the client id.
+    fn row_of(client_id: &str) -> exchange::trade::OpenOrder {
+        use exchange::trade::{OpenKind, ProtectRole, Side};
+        exchange::trade::OpenOrder {
+            symbol: "BTCUSDT".into(),
+            id: "9001".into(),
+            kind: OpenKind::Algo(None),
+            side: Some(Side::Sell),
+            position_side: None,
+            qty: None,
+            trigger_price: None,
+            close_position: true,
+            reduce_only: false,
+            role: Some(ProtectRole::Target),
+            attached: None,
+            client_id: Some(client_id.to_string()),
+            limit: false,
+            limit_price: None,
+            activation_price: None,
+            callback_rate: None,
+            price: None,
+        }
+    }
+
+    #[test]
+    fn a_replace_is_held_back_by_the_client_id_not_the_exchange_id() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        let row = row_of(&ids[1]);
+        assert_ne!(row.id, ids[1]);
+        book.replace_begun(account(), &row);
+        assert_eq!(book.replacing.len(), 1, "recorded while in flight");
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        assert!(poll(&mut book).is_empty(), "the old order is not cancelled");
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::ToCancel);
+        book.on_order(account(), &algo(&ids[1], OrderStatus::Canceled));
+        assert!(poll(&mut book).is_empty());
+        assert!(book.entries.contains_key(&key), "the entry is kept");
+        book.replace_ended(account());
+        assert!(book.replacing.is_empty());
+        let (r, new_tp) = replaced(exchange::trade::ReplaceKind::Target, &ids[1]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        assert_new_tp_is_cancelled(&mut book, &key, &new_tp);
+    }
+
+    #[test]
+    fn a_replace_without_a_client_id_or_of_another_account_is_not_recorded() {
+        let (mut book, _key, ids) = with_sent(spec(1, false));
+        let mut row = row_of(&ids[1]);
+        row.client_id = None;
+        book.replace_begun(account(), &row);
+        assert!(book.replacing.is_empty());
+        book.replace_begun(Uuid::from_u128(77), &row_of(&ids[1]));
+        assert!(book.replacing.is_empty());
+        // The exchange id is never a key.
+        book.replace_begun(account(), &row_of("9001"));
+        assert!(book.replacing.is_empty());
+    }
+
+    #[test]
+    fn the_end_of_a_replace_clears_the_account_whatever_the_result() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        book.replace_begun(account(), &row_of(&ids[1]));
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Triggered));
+        assert!(poll(&mut book).is_empty());
+        // Another account's end does not clear it.
+        book.replace_ended(Uuid::from_u128(77));
+        assert_eq!(book.replacing.len(), 1);
+        // No proof, no client id in the summary: the old order goes back to the usual paths.
+        book.replace_ended(account());
+        let jobs = poll(&mut book);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(cancel_targets(&jobs[0]), vec![ids[1].clone()]);
+        assert_eq!(state_of(&book, &key, &ids[1]), Live::Cancelling);
+    }
+
+    #[test]
+    fn a_held_back_cancel_keeps_the_stages_from_being_placed() {
+        // Only the stop is placed; it is marked for cancel while the take-profit stage is still
+        // to come, and it is held back for a replace: nothing is placed before its cancel.
+        let (mut book, key) = booked(spec(1, false));
+        fill(&mut book, &key, "0.004");
+        book.on_order(
+            account(),
+            &order(&key, OrderCategory::Plain, OrderStatus::Filled, "0.004"),
+        );
+        let stop = poll(&mut book).remove(0);
+        let ids = place_ids(&stop);
+        book.done(ok_all(&stop));
+        grant_sends(stop);
+        book.entries.get_mut(&key).unwrap().placed[0].state = Live::ToCancel;
+        book.replace_begun(account(), &row_of(&ids[0]));
+        assert!(poll(&mut book).is_empty(), "nothing is placed or cancelled");
+        book.replace_ended(account());
+        let jobs = poll(&mut book);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(cancel_targets(&jobs[0]), vec![ids[0].clone()]);
+    }
+
+    #[test]
+    fn a_forgotten_order_is_told_apart_per_account() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        book.drop_entry(&key);
+        let (r, _) = replaced(exchange::trade::ReplaceKind::Stop, &ids[0]);
+        // Another account's replace of the same id is nobody's here.
+        assert_eq!(
+            book.adopt_replacement(Uuid::from_u128(77), &r),
+            Adoption::NotOurs
+        );
+        book.remove_account(account());
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::NotOurs);
+    }
+
+    #[test]
+    fn a_new_order_whose_events_came_before_the_answer_is_handled_once_adopted() {
+        let (mut book, key, ids) = with_sent(spec(2, false));
+        // ids: the stop, then two take-profits. The stop is replaced, and the new stop fires
+        // at once: its events come before the answer of the replace.
+        let new_stop = new_id(Role::StopLoss);
+        book.on_order(account(), &algo(&ids[0], OrderStatus::Canceled));
+        book.on_order(account(), &algo(&new_stop, OrderStatus::Triggered));
+        book.on_order(account(), &algo(&new_stop, OrderStatus::Finished));
+        // Nothing is known of it yet.
+        assert!(poll(&mut book).is_empty());
+        let r = replacement_as(exchange::trade::ReplaceKind::Stop, &ids[0], &new_stop);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        assert_eq!(state_of(&book, &key, &new_stop), Live::Finished);
+        // The take-profits are cancelled with it, the new stop is not cancelled again.
+        let jobs = poll(&mut book);
+        assert_eq!(jobs.len(), 1);
+        let mut got = cancel_targets(&jobs[0]);
+        got.sort();
+        let mut want = vec![ids[1].clone(), ids[2].clone()];
+        want.sort();
+        assert_eq!(got, want);
+        // The replayed events are used once.
+        assert!(book.unclaimed[&account()].is_empty());
+    }
+
+    #[test]
+    fn the_events_kept_for_unknown_orders_are_bounded_and_only_for_app_ids() {
+        let mut book = AutoBook::default();
+        for _ in 0..(MAX_UNCLAIMED * 3) {
+            book.on_order(
+                account(),
+                &algo(&new_id(Role::TakeProfit), OrderStatus::Triggered),
+            );
+        }
+        assert_eq!(book.unclaimed[&account()].len(), MAX_UNCLAIMED);
+        // Another software's id, and events that change no state, are not kept.
+        let before = book.unclaimed[&account()].clone();
+        book.on_order(
+            account(),
+            &algo("someone-elses-order", OrderStatus::Triggered),
+        );
+        book.on_order(account(), &algo(&new_id(Role::StopLoss), OrderStatus::New));
+        assert_eq!(book.unclaimed[&account()], before);
+        book.remove_account(account());
+        assert!(!book.unclaimed.contains_key(&account()));
+    }
+
+    #[test]
+    fn a_grant_slot_that_the_book_names_differently_changes_nothing() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        // The book thinks the stop is the grant's take-profit slot: they disagree.
+        let which = book.entries[&key].placed[1].which;
+        book.entries.get_mut(&key).unwrap().placed[0].which = which;
+        let (r, new_stop) = replaced(exchange::trade::ReplaceKind::Stop, &ids[0]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Refused);
+        assert!(!book.knows_client_id(&new_stop));
+        // The grant still names the old id (a change would have moved it to the new one).
+        let grant = book.entries[&key].grant.clone();
+        assert!(grant.lock().issued_ref_of(&ids[0]).is_some());
+        assert!(grant.lock().issued_ref_of(&new_stop).is_none());
+    }
+
+    #[test]
+    fn an_order_of_an_entry_that_left_the_book_is_told_from_one_never_placed() {
+        let (mut book, key, ids) = with_sent(spec(1, false));
+        book.drop_entry(&key);
+        let (r, _) = replaced(exchange::trade::ReplaceKind::Stop, &ids[0]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Dropped);
+        let (r, _) = replaced(exchange::trade::ReplaceKind::Stop, "sNOTKNOWNNOTKNOWNNOT");
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::NotOurs);
+    }
+
+    #[test]
+    fn an_adoption_never_lets_the_grant_cancel_an_order_it_did_not_send() {
+        let (mut book, key, ids) = with_sent(spec(2, false));
+        let (r, new_stop) = replaced(exchange::trade::ReplaceKind::Stop, &ids[0]);
+        assert_eq!(book.adopt_replacement(account(), &r), Adoption::Adopted);
+        // The cancel of an id the grant did not issue is refused (the old id, which the grant
+        // no longer knows, is covered by the exchange crate's tests: its text cannot be
+        // rebuilt into an id here).
+        let grant = book.entries[&key].grant.clone();
+        let table = futures_table();
+        let f = fresh(&table, "BTCUSDT", NOW);
+        let stranger = ClientId::generate(Role::StopLoss);
+        let req = bf::cancel_algo_order(&exchange::trade::OrderRef::Client(stranger)).unwrap();
+        let intent = OrderIntent::binance(account_key(account()), req, &f).unwrap();
+        let auto = AutoIntent::new(AutoPath::CancelSibling, intent).unwrap();
+        assert!(grant.lock().authorise(auto, NOW).is_err());
+        // The adopted stop is still the one the grant cancels for that slot.
+        let which = book.entries[&key].placed[0].which;
+        let built = grant.lock().cancel_intent(which, &f).unwrap();
+        assert_eq!(built.client_ids(), vec![new_stop.as_str()]);
     }
 
     #[test]

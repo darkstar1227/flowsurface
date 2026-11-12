@@ -38,6 +38,7 @@ use super::decimal::Decimal;
 use super::gate::{AutoIntent, AutoPath, OrderIntent, Prepared};
 use super::preview::PreviewHash;
 use super::protect::{ProtectSpec, SpecFingerprint};
+use super::replace::{ReplaceKind, Replacement};
 use super::request::{BinanceRequest, Exposure, Method};
 use super::rules::FreshRules;
 use super::types::{Dir, OrderRef, TradeError};
@@ -348,6 +349,13 @@ impl AutoGrant {
         Ok((IssuedRef(index), id))
     }
 
+    /// Which slot of the grant carries this client id (read only): lets a caller compare its own
+    /// record with the grant's before it asks for a change.
+    pub fn issued_ref_of(&self, id: &str) -> Option<IssuedRef> {
+        let index = self.index_of(id)?;
+        u8::try_from(index).ok().map(IssuedRef)
+    }
+
     fn index_of(&self, id: &str) -> Option<usize> {
         self.issued.iter().position(|i| i.id == id)
     }
@@ -394,6 +402,51 @@ impl AutoGrant {
         }
         let bound = auto.intent.preview().hash;
         Ok(GrantedAuto { auto, bound })
+    }
+
+    /// Take over a replaced order (f3c). The user replaced a stop or a target this grant sent
+    /// (one confirmation, for the old order and the new one) and the exchange accepted both
+    /// legs; `done` is the proof of that, which only a completed `submit_replace` makes. The
+    /// grant's record of the old order then names the new order instead, so that the cancel of
+    /// the sibling (which this grant builds from the record) reaches the new order, not the old
+    /// one that is gone.
+    ///
+    /// This does not widen what the grant covers: the set of orders it can cancel stays the same
+    /// size, the old id is not coverable afterwards (a second adoption finds no such id), the
+    /// order must be of the same role as the replaced kind, on this account and symbol, one the
+    /// grant sent and has not cancelled, and the new client id must be new to the grant. It
+    /// places nothing and changes no quantity: the replace path already refused a larger new
+    /// order. Nothing is changed when it refuses.
+    pub fn adopt_replacement(&mut self, done: &Replacement) -> Result<IssuedRef, GrantRefusal> {
+        if done.account != self.account {
+            return Err(GrantRefusal::WrongAccount);
+        }
+        if done.symbol != self.symbol {
+            return Err(GrantRefusal::WrongSymbol);
+        }
+        let index = self
+            .index_of(&done.old_client_id)
+            .ok_or(GrantRefusal::UnknownId)?;
+        let role = match done.kind {
+            ReplaceKind::Stop => Role::StopLoss,
+            ReplaceKind::Target => Role::TakeProfit,
+        };
+        match self.issued[index].state {
+            State::Sent => {}
+            State::Cancelled => return Err(GrantRefusal::AlreadyCancelled),
+            State::Issued => return Err(GrantRefusal::IdNotAvailable),
+        }
+        if self.issued[index].role != role {
+            return Err(GrantRefusal::RoleNotListed);
+        }
+        if ClientId::parse(&done.new_client_id).is_err()
+            || self.index_of(&done.new_client_id).is_some()
+        {
+            return Err(GrantRefusal::IdNotAvailable);
+        }
+        let which = u8::try_from(index).map_err(|_| GrantRefusal::UnknownId)?;
+        self.issued[index].id.clone_from(&done.new_client_id);
+        Ok(IssuedRef(which))
     }
 
     fn check(&self, auto: &AutoIntent, now_ms: i64) -> Result<Checked, GrantRefusal> {

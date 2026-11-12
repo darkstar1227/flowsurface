@@ -320,6 +320,8 @@ pub(crate) mod sealed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OldRow {
     id: String,
+    /// The client id the row carries: a confirmed replace follows the order under this id.
+    client_id: Option<String>,
     kind: OpenKind,
     role: Option<ProtectRole>,
     side: Option<Side>,
@@ -337,6 +339,7 @@ impl OldRow {
     fn of(old: &OpenOrder) -> Self {
         OldRow {
             id: old.id.clone(),
+            client_id: old.client_id.clone(),
             kind: old.kind.clone(),
             role: old.role,
             side: old.side,
@@ -581,6 +584,11 @@ impl AutoIntent {
 
     pub fn path(&self) -> AutoPath {
         self.path
+    }
+
+    /// The client ids in the request (read-only; for the tests of dependent crates).
+    pub fn client_ids(&self) -> Vec<&str> {
+        self.intent.client_ids()
     }
 }
 

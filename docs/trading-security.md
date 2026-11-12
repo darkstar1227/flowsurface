@@ -989,3 +989,63 @@ f2 的線不帶 order id；f3a2 起只有可拖的 Stop／Target 線帶**交易�
 ### 需要手動 `cargo run`／testnet 確認
 拖曳手感與 hover 游標（Grab／Grabbing／NotAllowed）、預覽虛線與價格標籤、Escape 取消、拖出圖表取消、百分比／對數刻度的提示、確認視窗版面與裸倉警示、延遲接受點擊、testnet 上改單結果的 toast 與橫幅、macOS OS 通知、重讀後線移到新價。
 
+
+## f3c 補充：自動掛上的止損／止盈也能拖曳（auto 認領替換單）
+
+f3a2 把「book 認得這張單的 client id」當成「auto job 正在處理」，所以 d2／d3 自動掛上的保護單只要還掛著就不能拖；而 app 大多數保護單都是自動掛的。f3c 把停用條件改成「job 正在對這張單動作」，並在改單成功後讓 auto book 與 grant 改認新單。
+
+### 停用條件（`AutoBook::is_working_on`，取代 `knows_client_id` 在拖曳上的用途）
+一張單被視為「job 正在處理」，只要符合任一項：
+- 它是 entry 本身（entry 單不是可改的保護單）。
+- 該 entry 有 job 在途（`busy`：附掛或撤兄弟正在送出，job 會讀寫 placed 紀錄）。
+- 這張單的 state 不是 `Open`：`ToCancel`、`Cancelling`、`CancelFailed`、`Triggered`、`Finished`、`Failed`、`Cancelled`。
+
+由 app 掛上、`Open`、且沒有 job 在途的單視為穩定，可以拖。沒有 client id 的列仍用原本的「該 symbol 有 job 在運作」判斷。`drag_block`、`plan`、`recheck` 仍在確認時再判斷一次（`is_auto_order` 的呼叫端不變）。
+
+### 認領（`AutoBook::adopt_replacement`）
+只有 `ReplaceResult::Done` 帶 `ReplaceSummary.replacement`（`submit_replace` 兩個 leg 都被交易所接受才產生）；`NewNotPlaced`、`CancelNotConfirmed`、`Refused`、`Lost` 都是 `None`，不認領。`on_replace_sent` 在 `on_replace_result` 之後呼叫 `TradingState::adopt_replacement`：
+1. 以舊單 client id 查 `by_placed`，不是 book 掛的單 → `NotOurs`，什麼都不做。
+2. 舊單的 book state 必須是 `Open`、`ToCancel`，或 `Cancelled`（stream 的撤單事件比 HTTP 回應早到，這張單是被這次改單撤掉的）；`Cancelling` 等其他狀態拒絕。
+3. 先唯讀比對：grant 對舊 id 的槽位（`AutoGrant::issued_ref_of`）必須等於 book 記的槽位，不一致就拒絕且 grant 不動；一致才由 grant 認領（失敗就整個不動，並寫一則 note：「被取代的止損／止盈不再由自動保護追蹤，請檢查掛單」，新單由 `orphan_protectives` 顯示）。
+4. 成功後 placed 紀錄換成新 client id（`IssuedRef`、角色不變），`by_placed` 刪舊加新。新單的 state 依 sweep 規則重新判斷（`AutoBook::swept`，與 `triggered` 共用同一張 `sweep_of` 表）：若止損已觸發（或追蹤止損已觸發而新單是止盈），新單為 `ToCancel`，下一次 poll 撤新單（改單在途期間 book 不對舊 id 排撤單、也不移除 entry，見「改單在途的保留」，所以事件之間夾 poll 也成立）；否則 `Cancelled` 還原為 `Open`。這是因為撤單事件（`Cancelled`）可能在止損觸發之前或之後到，兩種順序都會讓舊單的 `ToCancel` 標記被蓋掉或被跳過，所以不能沿用舊單當下的 state。舊單之後的撤單事件不再屬於 book。
+5. 認領成功後，重放暫存的新單事件（見下）。
+
+之後止盈成交（`release_stop`）或止損觸發（`triggered`）撤兄弟時，`cancel_intent` 由 grant 的紀錄建請求，撤的是新單，不是舊 id。測試：`after_a_replace_a_finished_take_profit_cancels_the_new_stop`、`after_a_replace_a_fired_stop_cancels_the_new_take_profit_and_the_other_one`（請求數與 id 斷言）。
+
+### exchange 的最小改動與授權為何沒有放寬
+- `replace.rs`：新增 `Replacement`（`ReplaceDone.replacement: Option<Replacement>`）。欄位全是 `pub(crate)`，只有 `submit_replace` 在**取消被接受且點名舊單、新單被接受**之後才建立，GUI 無法自己組（`for_test` 只在 `test-support` feature）。內容：account、symbol、kind、舊 client id、新 client id。只有 Binance 且舊列有 client id 時才有；OKX 為 `None`（OKX 沒有 auto grant）。`Debug` 遮蔽。它是 `Clone`（`ReplaceSummary` 要 Clone），但它只是「已完成的事實」，不是權限：權限檢查都在 `adopt_replacement`。
+- `grant.rs`：新增 `AutoGrant::adopt_replacement(&Replacement) -> Result<IssuedRef, GrantRefusal>`，把 grant 記錄中那張單的 id 換成新 client id，其餘不動。它檢查：帳戶與 symbol 相同；舊 id 是這個 grant 發出的；該單 state 是 `Sent`（未送出或已撤的拒絕）；角色與改單種類相符（Stop↔StopLoss、Target↔TakeProfit，不能跨角色）；新 id 是合法 client id 且 grant 從未見過。
+- 為何沒有放寬：(1) grant 可撤的單數不變，只是同一個槽位從已不存在的舊單改成使用者確認過的新單；(2) 舊 id 在認領後不再能通過授權（再認領一次、或對舊 id 撤單，都找不到 id）；(3) 新單不會變成「可再下單的空位」，state 是 `Sent`，`AttachProtective` 對它仍回 `IdNotAvailable`；(4) 不改 `reduce_authorised`、不改可下單的角色或數量（改單路徑已拒絕比舊單大的新單）；(5) 憑證只能由完成的、經使用者確認（`for_replace` 綁舊列與新單雜湊）的改單產生，不能由 GUI 偽造；(6) 失敗時 grant 完全不變。`Spent::covers`、`GrantedAuto.bound` 不動：撤單請求仍由 grant 自己建、雜湊綁在該次請求上。
+- `gate.rs`：`AutoIntent::client_ids()` 唯讀存取（測試用，不能組請求）。確認指紋 `OldRow` 現在也含舊列的 `client_id`：交易所 id 相同但 client id 不同的列會被 `OldOrderMismatch` 拒絕，避免認領把另一張單的槽位換掉。
+- `grant.rs`：`AutoGrant::issued_ref_of(&str) -> Option<IssuedRef>` 唯讀，讓 book 在改動 grant 之前先確認兩邊對同一張單的看法一致（「先全檢查、再改」）。
+- exchange 測試：`an_adopted_replacement_is_what_the_cancel_of_the_sibling_names`、`an_adoption_covers_only_the_confirmed_order_and_nothing_else`（反例：其他 id 仍被拒、舊 id 被拒、新 id 不能再下單、重複認領被拒）、`an_adoption_that_does_not_fit_the_grant_is_refused_and_changes_nothing`、`an_order_that_was_issued_but_not_sent_or_already_cancelled_is_not_adopted`；`send_tests` 的 `a_completed_replace_carries_the_proof_for_the_automatic_grant`、`a_replace_of_an_order_without_a_client_id_has_no_proof`。
+
+### 新單事件早於回應（暫存重放）
+`AutoBook` 每個帳戶保留最多 32 筆（`MAX_UNCLAIMED`）client id 不認得、形如 app id、且會改變狀態的 algo 事件（`New`／`PartiallyFilled` 不存）；只在記憶體，不寫 log、不進 saved-state，帳戶移除時清掉。認領成功後依序把 `new_client_id` 的事件重放進 `on_algo_update`，所以新單在回應前就觸發也會正確 sweep 兄弟單。測試：`a_new_order_whose_events_came_before_the_answer_is_handled_once_adopted`、`the_events_kept_for_unknown_orders_are_bounded_and_only_for_app_ids`。
+
+### 改單在途的保留（R1）
+app 在每個 private 事件之後都會 poll，所以改單回應回來之前，book 已經看過每個事件。若不保留，兄弟單（止損）在改單窗口內觸發會有兩種壞結果：舊單被標 `ToCancel` 後 poll 立刻對舊 id 排撤單（順序 B，認領被拒）；或舊單先被撤單事件標成 `Cancelled`，entry 被 `housekeeping` 移除（順序 A，認領回 `Dropped`，新單成為孤兒）。
+
+做法：`AutoBook.replacing`（**舊單的 client id** → 帳戶）。book 的 key 一律是 client id，不是交易所單號（`OpenOrder.id` 與 `OpenOrder.client_id` 是不同欄位）：
+- 開始：`main::confirm_replace` 呼叫 `TradingState::replace_begun(account, &OpenOrder)`，由 `AutoBook::replace_begun` 自己從列上取 `client_id`；列沒有 client id、不是 book 掛的單、或 entry 屬於別的帳戶時不記錄（只改 book 狀態，不新增送單點）。簽名收整列而不是字串，避免日後又傳錯 id。
+- 結束：`on_replace_sent` 一開始、認領之前呼叫 `replace_ended(account)`，**依帳戶**清除（一個帳戶同時最多一個改單，`replace_flow.begin_send` 保證），所以不論結果（`Done`、`Refused`、`Lost`、task panic）、也不需要結果帶 client id，都一定清得掉；`remove_account` 一併清除。
+- 標記存在時：`housekeeping` 不移除含該 id 的 entry；`poll_entry` 對該 id 的 `ToCancel` 不排撤單，維持 `ToCancel`；entry 有這種保留中的 `ToCancel` 時，`poll_entry` 在送出其他（非保留）單的撤單 job 之後直接回傳，不排任何 stage（維持先撤再掛，N5）。
+- 結果是 `Done` 時由 `adopt_replacement` 接手，新單為 `ToCancel`，下一次 poll 撤新單；結果不是 `Done` 時標記已清，照原路徑撤舊 id 或由事件推進。
+
+測試（用 `id = "9001"` 與 client id 不同的 `OpenOrder` 列）：`a_replace_is_held_back_by_the_client_id_not_the_exchange_id`（在途時 `replacing` 非空、不對舊單撤單、`Adopted`、新止盈被撤、ended 後為空）、`the_end_of_a_replace_clears_the_account_whatever_the_result`（非 `Done` 變體，ended 後舊 id 照原路徑被撤）、`a_replace_without_a_client_id_or_of_another_account_is_not_recorded`、`a_held_back_cancel_keeps_the_stages_from_being_placed`（N5）。測試在 `AutoBook` 層，經 `TradingState` 的兩個方法只是一行轉呼叫，`main` 呼叫的就是它們。
+
+### entry 已被移除後的認領（S5）
+標記只在 book 掛的單且 entry 還在時才記。entry 若在改單送出之前就已移除（例如更早就結束），book 記住最近 64 個（`MAX_FORGOTTEN`）被移除 entry 的 (帳戶, 單 id)，認領時回 `Adoption::Dropped`，`on_replace_sent` 跳出警告 toast「新單不再由自動保護追蹤」，並提醒「若倉位已平，請撤掉這張單」（不含 id）。`forgotten` 以帳戶為 key，`remove_account` 一併清除。測試：`an_order_of_an_entry_that_left_the_book_is_told_from_one_never_placed`、`a_forgotten_order_is_told_apart_per_account`。
+
+### GUI 測試（`auto_flow::tests`）
+`an_order_the_app_placed_is_draggable_while_it_stands_and_no_job_works`、`an_order_that_is_marked_cancelling_or_over_is_not_draggable`、`the_exchanges_cancel_event_that_comes_before_the_answer_does_not_lose_the_order`、`a_replace_that_was_not_completed_is_not_followed`、`an_adoption_the_book_or_the_grant_cannot_take_changes_nothing`、`an_adoption_never_lets_the_grant_cancel_an_order_it_did_not_send`；M1：`a_stop_that_fires_after_the_cancel_event_of_a_replace_takes_the_new_take_profit`、`a_stop_that_fires_before_the_cancel_event_of_a_replace_takes_the_new_take_profit`；S4：`a_grant_slot_that_the_book_names_differently_changes_nothing`。
+
+### 已知限制
+- 新單事件暫存只有每帳戶 32 筆；同一帳戶在改單回應前湧入大量其他 algo 事件時，最舊的會被擠掉，新單的事件就漏掉，book 之後一直把新單當成 `Open`、entry 不會被移除，`orphan_protectives` 與 d5 仍會顯示。
+- 改單送出之前，d3 若已對舊單送出撤單（`Cancelling`），認領被拒並寫 note，新單成為孤兒單（reduceOnly／closePosition，不加倉）。改單在途期間不會再新增這種撤單（R1）。
+- 改單送出前 entry 就已被移除時，認領回 `Dropped`：新單不被追蹤；若倉位已被平掉，使用者要自己撤掉這張單（toast 有說）。
+- 改單在途期間，被改單的那張舊單的撤單、entry 的移除與後續 stage 的送出被延後，直到回應或 task 結束（其他兄弟單的撤單照常）。上限：改單路徑遇到 limiter pause（signed 429 最長 3600 秒）**不會等待**，`send_limited_meta` 立刻回 `LocalRateLimited`（`NotSent`），所以限流不會拉長在途時間；真正會等的只有結果不明時的查詢（`DEFAULT_SCHEDULE` 約一分鐘，加上 `recvWindow` 與 `SETTLE_BUFFER_MS`／OKX 60 秒底限的延伸）與每個請求 30 秒 timeout，正常最壞約數分鐘。**刻意沒有在 `send_replace` 外層加整體 timeout**：撤單 leg 沒有 write-ahead 記錄，逾時丟掉 future 會讓已送出的撤單結果消失、留下裸倉而不自知；寧可等結果。
+- `send_tests` 的 Binance 改單測試證明 `ReplaceDone` 帶憑證；`run_replace` 到 `on_replace_sent` 的整段仍需 testnet 確認。
+
+### 需要手動 `cargo run`／testnet 確認
+自動掛上的止損與止盈線可拖（沒有 job 在途時）、拖曳後該線移到新價；之後讓止盈成交，確認新止損被撤而不是留成孤兒單；job 在途時線仍顯示「automatic protection is still working」。

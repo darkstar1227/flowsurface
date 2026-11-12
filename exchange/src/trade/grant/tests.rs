@@ -565,3 +565,145 @@ fn the_take_profit_legs_together_stay_within_what_filled() {
         GrantRefusal::TotalTooLarge
     );
 }
+
+// ── Adopting a replaced order (f3c) ─────────────────────────────────────
+
+fn replacement(
+    account: AccountKey,
+    kind: ReplaceKind,
+    old: &ClientId,
+    new: &ClientId,
+) -> Replacement {
+    Replacement {
+        account,
+        symbol: "BTCUSDT".to_string(),
+        kind,
+        old_client_id: old.as_str().to_string(),
+        new_client_id: new.as_str().to_string(),
+    }
+}
+
+/// A grant that has sent its stop; returns the stop's reference and client id.
+fn with_sent_stop(s: &Setup) -> (AutoGrant, IssuedRef, ClientId) {
+    let mut g = s.grant(ALL);
+    fill(&mut g, d("0.001"));
+    let (which, stop) = g.issue(Role::StopLoss, NOW).unwrap();
+    let a = s
+        .attach(ProtectiveKind::StopMarket, Size::ClosePosition, &stop)
+        .unwrap();
+    g.authorise(a, NOW).unwrap();
+    (g, which, stop)
+}
+
+fn cancel_ids(g: &AutoGrant, s: &Setup, which: IssuedRef) -> Vec<String> {
+    g.cancel_intent(which, &s.fresh())
+        .unwrap()
+        .intent
+        .client_ids()
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+#[test]
+fn an_adopted_replacement_is_what_the_cancel_of_the_sibling_names() {
+    let s = Setup::new();
+    let (mut g, which, old) = with_sent_stop(&s);
+    assert_eq!(cancel_ids(&g, &s, which), vec![old.as_str().to_string()]);
+    let new = ClientId::generate(Role::StopLoss);
+    let r = replacement(key(1), ReplaceKind::Stop, &old, &new);
+    assert_eq!(g.adopt_replacement(&r), Ok(which));
+    assert_eq!(cancel_ids(&g, &s, which), vec![new.as_str().to_string()]);
+    // The cancel of the new order is authorised once; the old id is no longer the grant's.
+    let c = g.cancel_intent(which, &s.fresh()).unwrap();
+    assert!(g.authorise(c, NOW).is_ok());
+    let stale = bf::cancel_algo_order(&OrderRef::Client(dup(&old))).unwrap();
+    let stale = AutoIntent::new(
+        AutoPath::CancelSibling,
+        OrderIntent::binance(key(1), stale, &s.fresh()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        g.authorise(stale, NOW).unwrap_err(),
+        GrantRefusal::UnknownId
+    );
+}
+
+#[test]
+fn an_adoption_covers_only_the_confirmed_order_and_nothing_else() {
+    let s = Setup::new();
+    let (mut g, _, old) = with_sent_stop(&s);
+    let new = ClientId::generate(Role::StopLoss);
+    let other = ClientId::generate(Role::StopLoss);
+    // Another client id is not covered: not before, not after the adoption.
+    let cancel_other = |g: &mut AutoGrant, id: &ClientId| {
+        let r = bf::cancel_algo_order(&OrderRef::Client(dup(id))).unwrap();
+        let i = OrderIntent::binance(key(1), r, &s.fresh()).unwrap();
+        g.authorise(AutoIntent::new(AutoPath::CancelSibling, i).unwrap(), NOW)
+    };
+    assert_eq!(
+        cancel_other(&mut g, &new).unwrap_err(),
+        GrantRefusal::UnknownId
+    );
+    let r = replacement(key(1), ReplaceKind::Stop, &old, &new);
+    g.adopt_replacement(&r).unwrap();
+    assert_eq!(
+        cancel_other(&mut g, &other).unwrap_err(),
+        GrantRefusal::UnknownId
+    );
+    // The adopted order is not a free slot: it cannot be placed again under the grant.
+    let again = s
+        .attach(ProtectiveKind::StopMarket, Size::ClosePosition, &new)
+        .unwrap();
+    assert_eq!(
+        g.authorise(again, NOW).unwrap_err(),
+        GrantRefusal::IdNotAvailable
+    );
+    // Adopting the same replacement twice finds no old id.
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::UnknownId));
+}
+
+#[test]
+fn an_adoption_that_does_not_fit_the_grant_is_refused_and_changes_nothing() {
+    let s = Setup::new();
+    let (mut g, which, old) = with_sent_stop(&s);
+    let new = ClientId::generate(Role::StopLoss);
+    // Another account or symbol.
+    let r = replacement(key(2), ReplaceKind::Stop, &old, &new);
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::WrongAccount));
+    let mut r = replacement(key(1), ReplaceKind::Stop, &old, &new);
+    r.symbol = "ETHUSDT".to_string();
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::WrongSymbol));
+    // An order the grant never sent.
+    let stranger = ClientId::generate(Role::StopLoss);
+    let r = replacement(key(1), ReplaceKind::Stop, &stranger, &new);
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::UnknownId));
+    // A target replaced where the grant's order is a stop.
+    let r = replacement(key(1), ReplaceKind::Target, &old, &new);
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::RoleNotListed));
+    // The new id is one the grant already knows.
+    let r = replacement(key(1), ReplaceKind::Stop, &old, &old);
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::IdNotAvailable));
+    // An id that is not a valid client id.
+    let mut r = replacement(key(1), ReplaceKind::Stop, &old, &new);
+    r.new_client_id = "not valid!".to_string();
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::IdNotAvailable));
+    assert_eq!(cancel_ids(&g, &s, which), vec![old.as_str().to_string()]);
+}
+
+#[test]
+fn an_order_that_was_issued_but_not_sent_or_already_cancelled_is_not_adopted() {
+    let s = Setup::new();
+    let mut g = s.grant(ALL);
+    fill(&mut g, d("0.001"));
+    let (_, issued_only) = g.issue(Role::StopLoss, NOW).unwrap();
+    let new = ClientId::generate(Role::StopLoss);
+    let r = replacement(key(1), ReplaceKind::Stop, &issued_only, &new);
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::IdNotAvailable));
+
+    let (mut g, which, old) = with_sent_stop(&s);
+    let c = g.cancel_intent(which, &s.fresh()).unwrap();
+    g.authorise(c, NOW).unwrap();
+    let r = replacement(key(1), ReplaceKind::Stop, &old, &new);
+    assert_eq!(g.adopt_replacement(&r), Err(GrantRefusal::AlreadyCancelled));
+}

@@ -11,10 +11,10 @@
 use crate::auto_flow::{FailReason, FailureView};
 use exchange::account::{AccountProduct, AccountVenue};
 use exchange::adapter::Exchange;
-use exchange::trade::ReplaceKind;
 use exchange::trade::okx::OkxAlgoType;
 use exchange::trade::stream::StreamState;
 use exchange::trade::{Decimal, Dir, ManualSpec, OpenKind, OpenOrder, ProtectRole, Side, Size};
+use exchange::trade::{ReplaceKind, Replacement};
 use uuid::Uuid;
 
 /// The prefix of the key of a failure made here, so that the panel's buttons find it.
@@ -444,6 +444,9 @@ pub struct ReplaceSummary {
     pub result: ReplaceResult,
     /// A send went out without its write-ahead record: the journal is damaged.
     pub journal_failed: bool,
+    /// Set only with [`ReplaceResult::Done`]: what the automatic protection needs to follow the
+    /// new order (f3c). Names client ids, so it never reaches a log (`Debug` prints the tag).
+    pub replacement: Option<Replacement>,
 }
 
 impl std::fmt::Debug for ReplaceSummary {
@@ -1124,6 +1127,7 @@ pub mod tests {
             new_trigger: d("57500"),
             result,
             journal_failed: false,
+            replacement: None,
         }
     }
 

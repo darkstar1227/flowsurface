@@ -62,6 +62,7 @@ pub use protect::{
 };
 pub use replace::{
     REPLACE_GRANT_VALID_MS, ReplaceDone, ReplaceError, ReplaceGrant, ReplaceKind, ReplaceRefusal,
+    Replacement,
 };
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
 pub use risk::{

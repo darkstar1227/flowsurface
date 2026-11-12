@@ -1880,6 +1880,7 @@ impl Flowsurface {
         // The symbol is in flight like any send: no other order is prepared on it meanwhile.
         self.trading.begin_send(request.account, &request.symbol);
         self.trading.note_sent_ids(&intent.client_ids());
+        self.trading.replace_begun(meta.id, &old);
         let input = order_flow::ReplaceSendInput {
             session: self.trade_session.get(meta.id).cloned(),
             symbol: request.symbol,
@@ -1905,10 +1906,27 @@ impl Flowsurface {
         self.trading
             .replace_flow_mut()
             .finish_send(summary.account, &summary.old_id);
+        // Whatever the result, the hold-back on the old order ends before anything is adopted.
+        self.trading.replace_ended(summary.account);
         // Only a result that stayed unknown after the lookups keeps the symbol blocked: a new
         // order of unknown fate, or a task that ended with no answer (either leg may have gone
         // out), as `Unresolved` does for a plain send.
         let unresolved = self.trading.on_replace_result(&summary);
+        // A completed replace of an order the automatic protection placed: it follows the new
+        // order from now on (a result that is not `Done` carries no proof, and adopts nothing).
+        if let Some(replacement) = &summary.replacement {
+            // An order of an entry that already left the book cannot be followed: say so, the
+            // new order stands on the exchange without the app's automatic protection.
+            if self.trading.adopt_replacement(summary.account, replacement)
+                == crate::auto_flow::Adoption::Dropped
+            {
+                self.notifications.push(Toast::warn(
+                    "The new order is no longer followed by the automatic protection. Check \
+                     the open orders. If the position is already closed, cancel this order."
+                        .to_string(),
+                ));
+            }
+        }
         let handling = replace_flow::handle(&summary);
         // Both legs go to the log, in fixed words (no order id, no exchange text).
         log::info!("replace protective order ended: {}", summary.result.tag());
