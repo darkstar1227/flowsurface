@@ -33,8 +33,8 @@ use exchange::trade::stream::StreamState;
 use exchange::trade::{
     ConfirmToken, DEFAULT_DEVIATION_BPS, Decimal, Dir, ManualContext, ManualSpec, OpenKind,
     OpenOrder, OrderIntent, OrderPreview, Outcome, ReadError, ReplaceError, ReplaceGrant,
-    ReplaceKind, Resolution, RiskRefusal, SharedRisk, SubmitError, TradeClient, TradeProduct,
-    build_intent, deviation_exceeds,
+    ReplaceKind, Resolution, RiskRefusal, SharedRisk, SubmitError, Submitted, TradeClient,
+    TradeProduct, build_intent, deviation_exceeds,
 };
 use exchange::unit::Price;
 use iced::window;
@@ -445,6 +445,9 @@ pub struct ReplaceInfo {
     /// The cancel the grant will send, as the grant builds it (`ReplaceGrant::cancel_preview_for`).
     pub cancel: OrderPreview,
     pub kind: ReplaceKind,
+    /// Which leg goes out first, as `submit_replace` will decide it for this new order (f3b).
+    /// The confirmation words its warning from this, never from a guess.
+    pub order: exchange::trade::ReplaceOrder,
     /// The direction of the position the order protects.
     pub dir: Dir,
     pub old_trigger: Decimal,
@@ -648,6 +651,7 @@ async fn prepare_steps(input: PrepareInput) -> Result<Prepared, String> {
             &fresh,
             &request.spec,
             &preview,
+            exchange::trade::ReplaceOrder::of(&intent),
             ref_price.as_ref(),
         )?),
         None => None,
@@ -688,6 +692,7 @@ fn replace_info(
     fresh: &exchange::trade::FreshRules<'_>,
     spec: &ManualSpec,
     preview: &OrderPreview,
+    order: exchange::trade::ReplaceOrder,
     mark: Option<&Decimal>,
 ) -> Result<ReplaceInfo, String> {
     let (kind, dir) = match spec {
@@ -711,6 +716,7 @@ fn replace_info(
         old,
         cancel,
         kind,
+        order,
         dir,
         old_trigger,
         new_trigger,
@@ -950,6 +956,33 @@ pub async fn run_replace(input: ReplaceSendInput) -> ReplaceSummary {
     tokio::spawn(send_replace(input)).await.unwrap_or(lost)
 }
 
+/// What became of a new order that was sent and not accepted. An unknown one is only looked up,
+/// never sent again.
+async fn new_leg(client: &TradeClient, journal: &UnknownStore, sub: Submitted) -> NewLeg {
+    match sub.outcome {
+        Outcome::Rejected { code, msg, .. } => NewLeg::Rejected {
+            code,
+            msg: clip(&msg),
+        },
+        Outcome::Partial { .. } => NewLeg::Rejected {
+            code: "partial".to_string(),
+            msg: String::new(),
+        },
+        Outcome::NotSent(_) => NewLeg::NeverSent,
+        // The new order's lookup only reads; the order is never sent again.
+        Outcome::Unknown { .. } => match sub.pending {
+            Some(pending) => match client.resolve_unknown(pending, journal).await {
+                Resolution::Found => NewLeg::Found,
+                Resolution::NotPlacedPresumed => NewLeg::NotPlacedPresumed,
+                Resolution::Unresolved(_) => NewLeg::Unresolved,
+            },
+            None => NewLeg::Unresolved,
+        },
+        // Cannot happen (an accepted new order is `Ok`): never read as a success.
+        Outcome::Accepted { .. } => NewLeg::Unresolved,
+    }
+}
+
 fn cancel_end(outcome: &Outcome) -> CancelEnd {
     match outcome {
         Outcome::Rejected { code, msg, .. } => CancelEnd::Rejected {
@@ -1071,33 +1104,28 @@ async fn send_replace(input: ReplaceSendInput) -> ReplaceSummary {
                 None => NewLeg::NeverSent,
                 Some(sub) => {
                     journal_failed |= sub.journal_failed;
-                    match sub.outcome {
-                        Outcome::Rejected { code, msg, .. } => NewLeg::Rejected {
-                            code,
-                            msg: clip(&msg),
-                        },
-                        Outcome::Partial { .. } => NewLeg::Rejected {
-                            code: "partial".to_string(),
-                            msg: String::new(),
-                        },
-                        Outcome::NotSent(_) => NewLeg::NeverSent,
-                        // The new order's lookup only reads; the order is never sent again.
-                        Outcome::Unknown { .. } => match sub.pending {
-                            Some(pending) => {
-                                match client.resolve_unknown(pending, &journal).await {
-                                    Resolution::Found => NewLeg::Found,
-                                    Resolution::NotPlacedPresumed => NewLeg::NotPlacedPresumed,
-                                    Resolution::Unresolved(_) => NewLeg::Unresolved,
-                                }
-                            }
-                            None => NewLeg::Unresolved,
-                        },
-                        // Cannot happen (an accepted new order is `Ok`): never read as a success.
-                        Outcome::Accepted { .. } => NewLeg::Unresolved,
-                    }
+                    new_leg(&client, &journal, *sub).await
                 }
             };
             summary(ReplaceResult::NewNotPlaced(leg), journal_failed)
+        }
+        // Place first only (f3b): the old order was not touched.
+        Err(ReplaceError::NewNotAccepted(sub)) => {
+            let journal_failed = sub.journal_failed;
+            let leg = new_leg(&client, &journal, *sub).await;
+            summary(ReplaceResult::PlacedFirstFailed(leg), journal_failed)
+        }
+        // Place first only (f3b): the new order stands, the old one may too.
+        Err(ReplaceError::OldNotCancelled { new, cancel }) => {
+            let mut journal_failed = new.journal_failed;
+            let end = match cancel {
+                None => CancelEnd::NotSent,
+                Some(sub) => {
+                    journal_failed |= sub.journal_failed;
+                    cancel_end(&sub.outcome)
+                }
+            };
+            summary(ReplaceResult::OldNotCancelled(end), journal_failed)
         }
     }
 }

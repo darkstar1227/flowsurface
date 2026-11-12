@@ -148,30 +148,69 @@ pub fn trigger_basis_line(spec: &exchange::trade::ManualSpec) -> Option<&'static
 /// The lines a replace confirmation adds: the cancel and the new order in words, and what to
 /// watch for. The `bool` is a warning. The cancel's own fields are listed by the view.
 pub fn replace_lines(info: &ReplaceInfo) -> Vec<(String, bool)> {
-    use exchange::trade::ReplaceKind;
-    let name = match info.kind {
+    lines_for(
+        info.order,
+        info.kind,
+        &info.old_trigger,
+        &info.new_trigger,
+        info.immediate,
+    )
+}
+
+fn lines_for(
+    order: exchange::trade::ReplaceOrder,
+    kind: exchange::trade::ReplaceKind,
+    old_trigger: &exchange::trade::Decimal,
+    new_trigger: &exchange::trade::Decimal,
+    immediate: Option<bool>,
+) -> Vec<(String, bool)> {
+    use exchange::trade::{ReplaceKind, ReplaceOrder};
+    let name = match kind {
         ReplaceKind::Stop => "stop-loss",
         ReplaceKind::Target => "take-profit",
     };
-    let mut lines = vec![
-        (
-            format!(
-                "Cancel the old {name} (trigger {}) → add the new {name} (trigger {}).",
-                info.old_trigger.to_plain_string(),
-                info.new_trigger.to_plain_string()
+    let place_first = order == ReplaceOrder::PlaceFirst;
+    let mut lines = if place_first {
+        vec![
+            (
+                format!(
+                    "Add the new {name} (trigger {}) → cancel the old {name} (trigger {}).",
+                    new_trigger.to_plain_string(),
+                    old_trigger.to_plain_string()
+                ),
+                false,
             ),
-            false,
-        ),
-        (
-            format!(
-                "The old order is cancelled first. Until the new one is accepted the position is \
-                 briefly without this {name}. If the new order is refused it stays without it, \
-                 and a red warning says so."
+            (
+                format!(
+                    "The new order is placed first and the old one is cancelled only after it was \
+                     accepted, so for a moment two {name} orders stand. If the new order is \
+                     refused the old one stays. If the cancel then fails both stay, and a red \
+                     warning says so."
+                ),
+                true,
             ),
-            true,
-        ),
-    ];
-    if info.immediate == Some(true) {
+        ]
+    } else {
+        vec![
+            (
+                format!(
+                    "Cancel the old {name} (trigger {}) → add the new {name} (trigger {}).",
+                    old_trigger.to_plain_string(),
+                    new_trigger.to_plain_string()
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "The old order is cancelled first. Until the new one is accepted the position \
+                     is briefly without this {name}. If the new order is refused it stays without \
+                     it, and a red warning says so."
+                ),
+                true,
+            ),
+        ]
+    };
+    if immediate == Some(true) {
         lines.push((
             format!(
                 "The new trigger is at or beyond the ticker price: the {name} may fire at once."
@@ -179,7 +218,7 @@ pub fn replace_lines(info: &ReplaceInfo) -> Vec<(String, bool)> {
             true,
         ));
     }
-    if info.immediate.is_none() {
+    if immediate.is_none() {
         lines.push((
             "No ticker price was available to check whether the new trigger fires at once."
                 .to_string(),
@@ -319,11 +358,19 @@ impl PendingConfirm {
             content = content.push(text(line).size(style::text_size::SMALL));
         }
         if let Some(info) = &self.replace {
-            // The cancel first, then what replaces it; the fields below are the new order's.
+            // The order of the legs as `submit_replace` will use; the fields below are the new
+            // order's.
+            let place_first = info.order == exchange::trade::ReplaceOrder::PlaceFirst;
             let mut block = column![
                 text(format!(
-                    "Cancelled first: {:?} {}",
-                    info.cancel.method, info.cancel.path
+                    "{}: {:?} {}",
+                    if place_first {
+                        "Cancelled after the new order is accepted"
+                    } else {
+                        "Cancelled first"
+                    },
+                    info.cancel.method,
+                    info.cancel.path
                 ))
                 .size(style::text_size::SMALL)
             ]
@@ -333,7 +380,12 @@ impl PendingConfirm {
                     .push(text(format!("   {} {}", f.name, f.value)).size(style::text_size::SMALL));
             }
             block = block.push(
-                text("Then the new order listed above is placed.").size(style::text_size::SMALL),
+                text(if place_first {
+                    "The new order listed above is placed first."
+                } else {
+                    "Then the new order listed above is placed."
+                })
+                .size(style::text_size::SMALL),
             );
             for (line, is_warn) in replace_lines(info) {
                 block = block.push(if is_warn {
@@ -433,6 +485,35 @@ fn warn<'a>(s: String) -> Element<'a, Message> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_replace_warning_follows_the_order_of_the_legs() {
+        use exchange::trade::{Decimal, ReplaceKind, ReplaceOrder};
+        let d = |v: &str| Decimal::parse(v).unwrap();
+        let (old, new) = (d("58000"), d("57500"));
+        let cancel_first = lines_for(
+            ReplaceOrder::CancelFirst,
+            ReplaceKind::Stop,
+            &old,
+            &new,
+            Some(false),
+        );
+        assert!(cancel_first[0].0.starts_with("Cancel the old stop-loss"));
+        assert!(cancel_first[1].0.contains("cancelled first"));
+        assert!(cancel_first[1].0.contains("briefly without"));
+        assert!(cancel_first[1].1, "a warning");
+        let place_first = lines_for(
+            ReplaceOrder::PlaceFirst,
+            ReplaceKind::Target,
+            &old,
+            &new,
+            Some(false),
+        );
+        assert!(place_first[0].0.starts_with("Add the new take-profit"));
+        assert!(place_first[1].0.contains("placed first"));
+        assert!(!place_first[1].0.contains("briefly without"));
+        assert!(place_first[1].1, "a warning");
+    }
+
     use super::*;
 
     fn t0() -> Instant {

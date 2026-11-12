@@ -1049,3 +1049,55 @@ app 在每個 private 事件之後都會 poll，所以改單回應回來之前�
 
 ### 需要手動 `cargo run`／testnet 確認
 自動掛上的止損與止盈線可拖（沒有 job 在途時）、拖曳後該線移到新價；之後讓止盈成交，確認新止損被撤而不是留成孤兒單；job 在途時線仍顯示「automatic protection is still working」。
+
+## M5 f3b：先下新、後撤舊的改單順序（每交易所旗標，預設關閉）
+
+使用者決定：改單預設一律先撤後下（f3a）；「先下新、後撤舊」只做成每交易所的旗標，**兩個旗標都是 `false`**，要等 testnet 核對後才個別開啟。本段只做機制與測試：不提供設定介面、不進 `saved-state.json`、GUI 不能覆寫；不新增送單點；不改 builder 取整、簽章、host 白名單、https_only、redirect、proxy、Keychain；`LIVE_SENDING_ENABLED` 仍為 false；`data/` 沒有改動。
+
+### 旗標（`exchange/src/trade/replace.rs`）
+- `BINANCE_PLACE_FIRST_ALLOWED`、`OKX_PLACE_FIRST_ALLOWED`：模組私有的 `const`，值為 `false`。常數旁的註解寫明開啟前要完成的 testnet 核對。
+- 順序由 exchange 端強制：`submit_replace` 先用 `ReplaceOrder::decide(&new, flags)` 決定順序；GUI 只能用 `ReplaceOrder::of(&new)`（讀同一條規則）來決定確認視窗的文字，不能指定順序。
+- 正式建置為何無法開啟：`submit_replace` 固定傳 `PlaceFirstFlags::BUILD`（由上面兩個常數組成）。`PlaceFirstFlags` 欄位私有、型別是 `pub(crate)`；唯一能組出其他值的建構式是 `#[cfg(test)] for_test`；接受旗標的 `submit_replace_with` 只有 crate 內可見，而 `submit_replace` 是 `pub` 且不接受旗標。所以 GUI、設定與 saved-state 都沒有路徑可以開，要開只能改原始碼的常數。
+- 旗標關閉時行為與 f3a 完全相同（先撤後下）。測試：`with_the_build_flags_both_exchanges_cancel_first`（走正式入口，Binance 與 OKX 都是撤單在前）、`flags_that_are_off_in_a_test_build_cancel_first_too`（一個交易所開啟不影響另一個）。
+
+### 資格：只有帶明確數量的 reduceOnly 單才能先下
+即使旗標開啟，下列永遠先撤後下：
+- OKX 全平類（`closeFraction`，每個持倉只能有一張）；
+- Binance `closePosition`（同方向第二張是否回 -4130 未核對）；
+- 沒有 reduceOnly 的單（例如 OKX 對沖模式靠 position side 平倉的單），或數量讀不到、非正數的單。
+
+規則在 `binance_can_go_first`、`okx_can_go_first`。測試：`a_whole_position_order_never_goes_first_even_with_the_flags_on`（兩個交易所，旗標全開，仍是撤單在前）。f3a 的 `check` 另外保證全平換全平、部分換部分，所以舊單是全平時新單一定也是全平、不會先下。
+
+### 先下後撤的順序與失敗語意（`place_then_cancel`）
+兩個 leg 仍然先全部通過 `approve`，再送出任何請求（與 f3a 相同）。之後：
+1. 送新單。送不出去（`Locked`、`JournalUnavailable`）→ `NotSent`；被拒或結果不明 → `ReplaceError::NewNotAccepted(Submitted)`。**不撤舊單**，舊單不動；被拒等同 Refused。結果不明時新單可能存在，`pending` 交給 `resolve_unknown`（只查詢，不重送）。
+2. 新單被接受才送撤單。撤單被確認（`Accepted` 且 id 含舊單 id）→ `Ok(ReplaceDone)`，並與先撤後下一樣產生 `Replacement`，讓 f3c 的 auto job 認領。
+3. 新單被接受、撤單失敗或結果不明（拒絕、Unknown、未點名舊單、沒送出）→ `ReplaceError::OldNotCancelled { new, cancel }`：**兩張保護單可能同時存在**，不自動重試、**不產生 `Replacement`**（auto job 仍追蹤舊單）。
+
+GUI（`src/order_flow.rs` 的 `send_replace`、`src/replace_flow.rs`）：`NewNotAccepted` → `ReplaceResult::PlacedFirstFailed(NewLeg)`（舊單還在；被拒是黃色提示，新單可能存在的 `Found` 與 `Unresolved` 是紅色，`Unresolved` 與其他不明結果一樣讓該 symbol 維持封鎖並通知系統）；`OldNotCancelled` → `ReplaceResult::OldNotCancelled(CancelEnd)`，紅色訊息「兩張保護單可能同時存在，請檢查掛單並手動撤掉一張」。
+
+d5 是否會抓到多出來的新單：會（Binance）。新單的 client id 是 app 的形狀，而 book 沒有認領它（沒有 `Replacement`），所以 `residual_auto_orders` 把它列為殘留單；舊單仍由 session 持有，不會被列出。止損單因為「持倉還在」只列出、不提供一鍵撤單（`guards_position`），止盈單則可撤；測試 `a_new_order_left_next_to_its_old_one_after_a_place_first_replace_is_listed`。OKX 的 d5 殘留判斷本來就不做（entry 附掛單的 id 與 app 同形），所以 OKX 只靠上面的紅色訊息；這是開啟 OKX 旗標前要接受的限制。
+
+### 確認視窗
+`ReplaceInfo.order` 在準備確認時由 `ReplaceOrder::of(&intent)` 取得，確認視窗依它顯示文字：先撤後下維持原本的「舊單先撤、短暫沒有這張單」警示（旗標全關時永遠是這一種）；先下後撤顯示「新單先下、被接受後才撤舊單，短暫有兩張；撤單失敗兩張都留」。測試：`the_replace_warning_follows_the_order_of_the_legs`。沒有新增送單點，送單點掃描照舊。
+
+### 測試（`send_tests::replace_protective::place_first`）
+`binance_places_first_when_its_flag_is_on_and_the_order_is_eligible`（請求順序為新單在前；`Replacement` 仍產生）、`okx_places_first_when_its_flag_is_on_and_the_order_is_eligible`、`a_refused_new_order_leaves_the_old_one_alone`、`a_new_order_of_unknown_fate_does_not_cancel_the_old_one`（DELETE 為 0 次、POST 1 次）、`a_rejected_cancel_after_the_new_order_was_accepted_says_two_orders_stand`、`an_unknown_cancel_after_the_new_order_was_accepted_says_two_orders_may_stand`（各 1 次、不重送）、`both_legs_are_still_approved_before_the_first_one_goes_out`。GUI：`replace_flow` 的兩個新結果與封鎖測試。
+
+### 開啟任一旗標前的 testnet 核對清單
+Binance USDⓈ-M：
+1. 同方向第二張 reduceOnly 的 STOP_MARKET／TAKE_PROFIT_MARKET（帶明確 `quantity`）在舊單還在時是否被接受；兩張合計超過持倉時的回應。
+2. 新觸發價「會立刻觸發」而舊單還在時的回應（f3a 已列為待核對，先撤後下才是裸倉）。
+3. 新單被接受之後撤舊單，回應是否仍點名舊 algo id。
+4. 使用者資料串流上新單事件與舊單撤單事件的先後（f3c 的認領與暫存重放是以先撤後下的順序設計的，先下後撤時 `Replacement` 在撤單確認後才產生）。
+5. `closePosition` 同方向第二張是否回 -4130（只為了解；它永遠不先下，除非日後另開討論）。
+
+OKX 永續：
+1. 淨倉與對沖模式各自：第二張 reduceOnly 帶 `sz` 的 conditional 是否被接受；合計超過持倉時的行為。
+2. `cancel-algos` 在新單之後是否仍回舊單的 `algoId`。
+3. OKX 沒有 auto grant，先下後撤失敗留下的新單 d5 不判斷（見上），要決定是否接受這個限制。
+
+核對完成後仍要由人手動改常數、走一般 review；本段不提供其他開啟方式。
+
+### 需要手動 `cargo run`
+旗標全關時確認視窗顯示的仍是「先撤後下」警示、文字與 f3a2 相同；先下後撤的文字只在單元測試涵蓋（正式建置開不起來，無法手動看到）。
