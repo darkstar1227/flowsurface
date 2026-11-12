@@ -77,7 +77,7 @@ M5（F7 交易）各段已合併，`LIVE_SENDING_ENABLED` 仍為 false。開放�
 
 ### A. Keychain 儲存
 
-1. service 名稱用 `flowsurface.exchange`，不得與既有的 `flowsurface.proxy`、`flowsurface.server` 共用。
+1. service 名稱用 `flowsurface-fork.exchange`，不得與既有的 `flowsurface-fork.proxy`、`flowsurface-fork.server` 共用，也不得與 upstream 的 `flowsurface.*` 共用。
 2. account 名稱用帳戶的 UUID，格式為 `<venue>:<uuid>`。不得用別名，因為別名可以改名，也可能重複。
 3. 每個帳戶只存一個 Keychain 項目，內容為 JSON，包含 venue、env、key、secret；OKX 另含 passphrase。刪除只需呼叫一次。若拆成多個項目，必須逐一刪除，並把任何失敗回報到 UI。
 4. 環境與交易所寫進 Keychain 項目。載入時與 `saved-state.json` 的 `env`、`venue` 比對，不一致就把帳戶標記為不可用，並在 UI 說明原因。
@@ -167,7 +167,7 @@ M5（F7 交易）各段已合併，`LIVE_SENDING_ENABLED` 仍為 false。開放�
 ## M4 實作位置
 
 - `exchange/src/account.rs`：簽名請求、`Verdict` 判定、`is_usable`、`check_account`；host 白名單 `allowed_hosts` 與 `endpoint_url`。
-- `data/src/config/exchange_accounts.rs`：Keychain 存取（`KEYCHAIN_SERVICE = "flowsurface.exchange"`）、帳戶中繼資料、`sanitized()`。
+- `data/src/config/exchange_accounts.rs`：Keychain 存取（`KEYCHAIN_SERVICE = "flowsurface-fork.exchange"`）、帳戶中繼資料、`sanitized()`。
 - `src/modal/exchange_accounts.rs`：設定頁 modal、表單、Test、Save 與 Delete。
 - `exchange/src/adapter/proxy.rs` 的 `apply_proxy_strict`：簽名用 client 的 proxy fail closed。
 - `exchange/src/signed_http.rs` 的 `SignedHttp`：簽名用 client（`redirect(none)`、`https_only(true)`、嚴格 proxy，proxy 壞掉時不建立）。GUI 在 `src/connector/client.rs` 只負責呼叫 `SignedHttp::build`。

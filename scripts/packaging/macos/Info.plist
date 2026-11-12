@@ -4,15 +4,15 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleName</key><string>Flowsurface</string>
-    <key>CFBundleDisplayName</key><string>Flowsurface</string>
-    <key>CFBundleIdentifier</key><string>com.flowsurface.flowsurface</string>
+    <key>CFBundleName</key><string>Flowsurface Fork</string>
+    <key>CFBundleDisplayName</key><string>Flowsurface Fork</string>
+    <key>CFBundleIdentifier</key><string>io.github.darkstar1227.flowsurface-fork</string>
     <key>CFBundleExecutable</key><string>flowsurface</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
     <key>CFBundleIconFile</key><string>flowsurface.icns</string>
-    <key>CFBundleShortVersionString</key><string>@VERSION@</string>
-    <key>CFBundleVersion</key><string>@VERSION@</string>
+    <key>CFBundleShortVersionString</key><string>@DISPLAY_VERSION@</string>
+    <key>CFBundleVersion</key><string>@BUNDLE_VERSION@</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>

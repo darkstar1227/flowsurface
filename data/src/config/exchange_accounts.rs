@@ -12,7 +12,7 @@ use std::fmt;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-const KEYCHAIN_SERVICE: &str = "flowsurface.exchange";
+const KEYCHAIN_SERVICE: &str = "flowsurface-fork.exchange";
 const PAYLOAD_VERSION: u8 = 1;
 
 /// Non-secret account settings. Venue, environment and product are fixed after creation.

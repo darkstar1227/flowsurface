@@ -180,6 +180,11 @@ pub fn open_url(url: &str) -> Result<(), InternalError> {
     }
 }
 
+/// Data directory name of this fork, kept apart from upstream's `flowsurface/`.
+pub const DATA_DIR_NAME: &str = "flowsurface-fork";
+/// Data directory name used by upstream Flowsurface builds.
+const UPSTREAM_DATA_DIR_NAME: &str = "flowsurface";
+
 pub fn data_path(path_name: Option<&str>) -> PathBuf {
     if let Ok(path) = std::env::var("FLOWSURFACE_DATA_PATH") {
         let root = PathBuf::from(path);
@@ -190,11 +195,47 @@ pub fn data_path(path_name: Option<&str>) -> PathBuf {
     } else {
         let data_dir = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
         if let Some(path_name) = path_name {
-            data_dir.join("flowsurface").join(path_name)
+            data_dir.join(DATA_DIR_NAME).join(path_name)
         } else {
-            data_dir.join("flowsurface")
+            data_dir.join(DATA_DIR_NAME)
         }
     }
+}
+
+/// On the first start of this fork, copy upstream's `saved-state.json` into the fork's own
+/// data directory so layouts carry over. Upstream's files are only read, never changed.
+///
+/// Does nothing when `FLOWSURFACE_DATA_PATH` is set or the fork's data directory already
+/// exists. Must run before anything creates the data directory (the logger does).
+/// Returns the copied file's path when a copy was made.
+pub fn import_upstream_saved_state() -> Result<Option<PathBuf>, std::io::Error> {
+    if std::env::var_os("FLOWSURFACE_DATA_PATH").is_some() {
+        return Ok(None);
+    }
+    let Some(base) = dirs_next::data_dir() else {
+        return Ok(None);
+    };
+    import_saved_state_from(
+        &base.join(UPSTREAM_DATA_DIR_NAME),
+        &base.join(DATA_DIR_NAME),
+    )
+}
+
+fn import_saved_state_from(
+    upstream_dir: &std::path::Path,
+    fork_dir: &std::path::Path,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    if fork_dir.exists() {
+        return Ok(None);
+    }
+    let source = upstream_dir.join(SAVED_STATE_PATH);
+    if !source.is_file() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(fork_dir)?;
+    let target = fork_dir.join(SAVED_STATE_PATH);
+    std::fs::copy(&source, &target)?;
+    Ok(Some(target))
 }
 
 fn cleanup_directory(data_path: &PathBuf) -> usize {
@@ -268,4 +309,66 @@ pub fn cleanup_old_market_data() -> usize {
 
     info!("File cleanup completed. Deleted {} files", total_deleted);
     total_deleted
+}
+
+#[cfg(test)]
+mod fork_data_dir_tests {
+    use super::{SAVED_STATE_PATH, import_saved_state_from};
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "flowsurface-fork-import-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn copies_upstream_state_into_missing_fork_dir() {
+        let root = temp_root("copy");
+        let upstream = root.join("flowsurface");
+        let fork = root.join("flowsurface-fork");
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(upstream.join(SAVED_STATE_PATH), "{\"upstream\":1}").unwrap();
+
+        let copied = import_saved_state_from(&upstream, &fork).unwrap();
+
+        assert_eq!(copied, Some(fork.join(SAVED_STATE_PATH)));
+        assert_eq!(
+            std::fs::read_to_string(fork.join(SAVED_STATE_PATH)).unwrap(),
+            "{\"upstream\":1}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(upstream.join(SAVED_STATE_PATH)).unwrap(),
+            "{\"upstream\":1}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn leaves_existing_fork_dir_alone() {
+        let root = temp_root("existing");
+        let upstream = root.join("flowsurface");
+        let fork = root.join("flowsurface-fork");
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::create_dir_all(&fork).unwrap();
+        std::fs::write(upstream.join(SAVED_STATE_PATH), "{\"upstream\":1}").unwrap();
+
+        assert_eq!(import_saved_state_from(&upstream, &fork).unwrap(), None);
+        assert!(!fork.join(SAVED_STATE_PATH).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn does_nothing_without_upstream_state() {
+        let root = temp_root("none");
+        let upstream = root.join("flowsurface");
+        let fork = root.join("flowsurface-fork");
+
+        assert_eq!(import_saved_state_from(&upstream, &fork).unwrap(), None);
+        assert!(!fork.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }
