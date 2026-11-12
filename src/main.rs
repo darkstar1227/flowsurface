@@ -60,8 +60,17 @@ use std::sync::Arc;
 fn main() {
     logger::install_panic_hook();
 
+    // Before the logger creates the data directory, so a first start can still import.
+    let imported_state = data::import_upstream_saved_state();
+
     if let Err(err) = logger::setup(cfg!(debug_assertions)) {
         logger::report_stderr(&format!("Failed to initialize logger: {err}"));
+    }
+
+    match imported_state {
+        Ok(Some(path)) => log::info!("Imported upstream saved state into {}", path.display()),
+        Ok(None) => {}
+        Err(err) => log::warn!("Could not import upstream saved state: {err}"),
     }
 
     if let Err(error) = data::initialize_indicator_catalog() {
@@ -3185,11 +3194,11 @@ impl Flowsurface {
             .layout_for_window(window)
             .and_then(|id| self.layout_manager.get(id))
         {
-            format!("Flowsurface [{}]", layout.id.name)
+            format!("{} [{}]", version::APP_NAME, layout.id.name)
         } else if let Some(id) = self.layout_manager.active_layout_id() {
-            format!("Flowsurface [{}]", id.name)
+            format!("{} [{}]", version::APP_NAME, id.name)
         } else {
-            "Flowsurface".to_string()
+            version::APP_NAME.to_string()
         }
     }
 
@@ -3943,7 +3952,7 @@ impl Flowsurface {
                                 .padding(0)
                                 .style(style::button::text_link)
                                 .on_press(Message::OpenUrlRequested(Cow::Borrowed(
-                                    version::GITHUB_REPOSITORY_URL,
+                                    version::FORK_REPOSITORY_URL,
                                 )));
 
                         let github_button: Element<'_, Message> = iced::widget::tooltip(

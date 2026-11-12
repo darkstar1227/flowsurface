@@ -40,20 +40,22 @@ bash scripts/build-macos.sh && bash scripts/package-macos.sh
 
 | 模式 | DMG | .app |
 |---|---|---|
-| aarch64 | `target/packaging/flowsurface-aarch64-macos.dmg` | `target/packaging/macos/Flowsurface.app` |
-| universal | `target/packaging/flowsurface-universal-macos.dmg` | 同上 |
+| aarch64 | `target/packaging/flowsurface-fork-<upstream>_<fork>-aarch64-macos.dmg` | `target/packaging/macos/Flowsurface Fork.app` |
+| universal | `target/packaging/flowsurface-fork-<upstream>_<fork>-universal-macos.dmg` | 同上 |
 
 `build-macos.sh aarch64` 另外會產出 `target/packaging/flowsurface-aarch64-macos.tar.gz`，裡面只有執行檔。
 
 ## 4. 驗證後回報
 
 ```bash
-lipo -archs target/packaging/macos/Flowsurface.app/Contents/MacOS/flowsurface
-codesign --verify --strict target/packaging/macos/Flowsurface.app && echo SIGNATURE_OK
+lipo -archs "target/packaging/macos/Flowsurface Fork.app/Contents/MacOS/flowsurface"
+codesign --verify --strict "target/packaging/macos/Flowsurface Fork.app" && echo SIGNATURE_OK
 ls -lh target/packaging/*.dmg
 ```
 
-回報時附上 DMG 的完整路徑、大小、架構與版本號（`Cargo.toml` 的 `workspace.package.version`）。
+回報時附上 DMG 的完整路徑、大小、架構與版本號 `<upstream>_<fork>`（upstream 取自 `Cargo.toml` 的 `workspace.package.version`，fork 取自 `src/version.rs` 的 `FORK_VERSION`）。
+
+這個 fork 和 upstream 完全分開：app 名稱是「Flowsurface Fork」，bundle ID 是 `io.github.darkstar1227.flowsurface-fork`，資料目錄是 `flowsurface-fork/`，Keychain service 是 `flowsurface-fork.*`。因此可以和 upstream 的 `Flowsurface.app` 並存在 `/Applications`，安裝時不要覆蓋 upstream 的 app。
 
 ## 注意事項（要轉告使用者）
 

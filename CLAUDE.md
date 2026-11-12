@@ -94,7 +94,7 @@ Cargo workspace，依賴方向 `flowsurface`（root，GUI）→ `data` → `exch
 1. `Flowsurface::subscription` 呼叫 `Dashboard::market_subscriptions`，從所有 pane 收集 depth／trade／kline 的 stream spec（排序過，subscription identity 才會穩定，見 `3561056`），再對應成 `exchange` 的 WebSocket subscription，結果以 `Message::MarketWsEvent` 傳回。
 2. 頂層 `update` 把事件交給作用中 dashboard 的 `update`，由它分派到對應 pane。擷取到的資料直接在 `Dashboard::update` 內分派，`dashboard::Event` 也就地處理，不再轉發回 main（見 `c276161`）。
 3. 歷史 kline、OI、ticker metadata 一律走交易所 REST。歷史成交依 **Settings → Network** 模式而定：Off／Exchange（只限 Binance，使用 data.binance.vision 封存檔並快取在本機磁碟）／Server（`GET /trades.arrow`，Arrow IPC 格式）。
-4. 狀態持久化：`data::read_from_file` / `write_json_to_file` 讀寫資料目錄下的 `saved-state.json`（`data::config::state::State`）。資料目錄預設為平台資料夾下的 `flowsurface/`，可用 `FLOWSURFACE_DATA_PATH` 覆寫；已安裝指標的目錄可用 `FLOWSURFACE_INDICATORS_PATH` 覆寫。啟動時會先初始化指標 catalog，並在背景清理過期的市場資料快取。
+4. 狀態持久化：`data::read_from_file` / `write_json_to_file` 讀寫資料目錄下的 `saved-state.json`（`data::config::state::State`）。資料目錄預設為平台資料夾下的 `flowsurface-fork/`（和 upstream 的 `flowsurface/` 分開；第一次啟動時若還沒有這個目錄，會從 upstream 複製一份 `saved-state.json`，見 `data::import_upstream_saved_state`），可用 `FLOWSURFACE_DATA_PATH` 覆寫；已安裝指標的目錄可用 `FLOWSURFACE_INDICATORS_PATH` 覆寫。啟動時會先初始化指標 catalog，並在背景清理過期的市場資料快取。
 
 ### 注意事項
 
