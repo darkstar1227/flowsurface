@@ -10,6 +10,7 @@ mod modal;
 mod notify;
 mod notify_os;
 mod order_flow;
+mod order_lines;
 mod protect_attach;
 mod screen;
 mod style;
@@ -347,7 +348,27 @@ impl Flowsurface {
                 .collect(),
             ticket_account: self.order_ticket.account(),
             live_open: data::config::trade_gate::live_sending_enabled(),
+            lines: accounts
+                .iter()
+                .map(|m| dashboard::AccountLines {
+                    account: m.id,
+                    lines: order_lines::lines_of(
+                        self.trading.open_orders(m.id),
+                        self.trading.positions(m.id),
+                        self.trading.lists_stale(m.id),
+                    ),
+                })
+                .filter(|a| !a.lines.is_empty())
+                .collect(),
         };
+        // Each pane compares what it gets and redraws only for a change, so a refresh that
+        // changed nothing costs no redraw.
+        let main_window = self.main_window.id;
+        for id in self.layout_manager.visible_ids() {
+            if let Some(dashboard) = self.layout_manager.mut_dashboard(id) {
+                dashboard.apply_trade_overlay(main_window, &self.trade_overlay);
+            }
+        }
     }
 
     fn account_choice(

@@ -274,6 +274,7 @@ pub struct KlineWidget<'a> {
     version: u64,
     theme: &'a ThemeState,
     should_capture_escape: bool,
+    order_lines: &'a [crate::order_lines::OrderLine],
 }
 
 impl<'a> KlineWidget<'a> {
@@ -318,6 +319,7 @@ impl<'a> KlineWidget<'a> {
             version: 0,
             theme,
             should_capture_escape: false,
+            order_lines: &[],
         }
     }
 
@@ -404,6 +406,13 @@ impl<'a> KlineWidget<'a> {
         self
     }
 
+    /// Read-only order and position lines to draw. They are part of the scene version the
+    /// caller passes (a change bumps it), and never of any saved state.
+    pub fn with_order_lines(mut self, lines: &'a [crate::order_lines::OrderLine]) -> Self {
+        self.order_lines = lines;
+        self
+    }
+
     pub fn with_should_capture_escape(mut self, should_capture_escape: bool) -> Self {
         self.should_capture_escape = should_capture_escape;
         self
@@ -428,6 +437,7 @@ impl<'a> KlineWidget<'a> {
             coordinates: self.coordinates(),
             indicators: self.indicators(),
             drawing: self.drawing_view(scene),
+            order_lines: self.order_lines,
         }
     }
 

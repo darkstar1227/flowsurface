@@ -5,6 +5,7 @@ use super::painting::{self, PaintInputs, PixelGeometry};
 use super::presentation::IndicatorView;
 use super::scene::{ChartCoordinates, Scene, XAxis};
 use super::{CHAR_W, TEXT_SIZE, Y_AXIS_LABEL_LEFT_INSET};
+use crate::order_lines::{LineKind, OrderLine};
 use crate::style;
 use data::chart::Basis;
 use data::config::theme::ACCENT_COUNT;
@@ -74,6 +75,7 @@ pub(super) struct OverlayView<'a> {
     pub(super) coordinates: ChartCoordinates<'a>,
     pub(super) indicators: IndicatorView<'a>,
     pub(super) drawing: DrawingView<'a>,
+    pub(super) order_lines: &'a [OrderLine],
 }
 
 impl OverlayView<'_> {
@@ -189,8 +191,80 @@ impl OverlayView<'_> {
             }
         }
 
+        self.paint_order_lines(frame, scene, palette);
         self.fill_primary_series_end_labels(frame, scene, palette, generated_accents);
         self.fill_unavailable_indicator_messages(frame, scene, palette);
+    }
+
+    /// The account's orders and position as horizontal lines with a label at the right edge of
+    /// the plot (kind, size). Read-only: nothing here can be grabbed. A line whose lists may be
+    /// out of date (condition 51) is dashed and faded and its label says "stale".
+    fn paint_order_lines(&self, frame: &mut PaintInputs, scene: &Scene, palette: &Extended) {
+        let plot = scene.layout.regions.plot;
+        let anchor = scene
+            .primary
+            .series_percent_anchors
+            .first()
+            .copied()
+            .flatten();
+        for line in self.order_lines {
+            let Some(price) = line.price_f32() else {
+                continue;
+            };
+            let y = plot.y + scene.map_primary_plot_with_anchor_f32(price, anchor);
+            if !y.is_finite() || y < plot.y || y > plot.y + plot.height {
+                continue;
+            }
+            let base = match line.kind {
+                LineKind::Stop => palette.danger.base.color,
+                LineKind::Target => palette.success.base.color,
+                LineKind::Trailing => palette.danger.weak.color,
+                LineKind::Entry => palette.primary.base.color,
+                LineKind::Position => palette.secondary.strong.color,
+            };
+            let alpha = if line.stale { 0.45 } else { 0.9 };
+            let segments: &[f32] = if line.stale { &[3.0, 3.0] } else { &[] };
+            let stroke = canvas::Stroke {
+                width: 1.0,
+                line_dash: canvas::LineDash {
+                    segments,
+                    offset: 0,
+                },
+                ..Default::default()
+            }
+            .with_color(base.scale_alpha(alpha));
+            frame.stroke(
+                &canvas::Path::line(Point::new(plot.x, y), Point::new(plot.x + plot.width, y)),
+                stroke,
+            );
+
+            let label = line.label();
+            let height = TEXT_SIZE + 4.0;
+            let width = label.chars().count() as f32 * CHAR_W + 8.0;
+            let rect = Rectangle {
+                x: (plot.x + plot.width - width).max(plot.x),
+                y: (y - height * 0.5).clamp(plot.y, (plot.y + plot.height - height).max(plot.y)),
+                width,
+                height,
+            };
+            let fill = base.scale_alpha(alpha);
+            let text_color = if data::config::theme::is_dark(base) {
+                iced::Color::WHITE
+            } else {
+                iced::Color::BLACK
+            };
+            frame.fill_rectangle(rect.position(), rect.size(), fill);
+            frame.fill_text(canvas::Text {
+                content: label,
+                position: Point::new(rect.x + 4.0, rect.y + height * 0.5),
+                color: text_color,
+                size: TEXT_SIZE.into(),
+                align_x: iced::Alignment::Start.into(),
+                align_y: iced::Alignment::Center.into(),
+                font: style::AZERET_MONO,
+                ..Default::default()
+            });
+        }
     }
 
     pub(super) fn axis_badge_inputs(

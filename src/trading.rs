@@ -302,6 +302,9 @@ pub struct HeldPosition {
     /// The margin mode the snapshot read for the position. `None` is unknown (a position made
     /// by a stream event carries none): never a mismatch.
     pub margin: Option<exchange::trade::MarginMode>,
+    /// The average entry price a position event carried. A snapshot reads none, so it is `None`
+    /// until an event brings one; it is only ever drawn, never used to judge anything.
+    pub entry_price: Option<Decimal>,
 }
 
 struct AccountRuntime {
@@ -444,6 +447,8 @@ impl AccountRuntime {
                 dir: p.dir,
                 qty: p.qty,
                 margin: p.margin,
+                // A zero or negative price is no price (a flat row, a bad field).
+                entry_price: p.entry_price.filter(Decimal::is_positive),
             })
             .collect();
     }
@@ -471,7 +476,13 @@ impl AccountRuntime {
 
     /// A position event: the only thing besides a snapshot that changes the held positions (a
     /// fill never adds to them).
-    fn apply_position_event(&mut self, symbol: &str, side: PositionSide, qty: Decimal) {
+    fn apply_position_event(
+        &mut self,
+        symbol: &str,
+        side: PositionSide,
+        qty: Decimal,
+        entry_price: Option<Decimal>,
+    ) {
         // The margin mode is read from snapshots only: an event keeps what the snapshot said.
         let margin = self
             .positions
@@ -498,6 +509,7 @@ impl AccountRuntime {
             dir,
             qty: abs,
             margin,
+            entry_price,
         });
     }
 
@@ -512,6 +524,7 @@ impl AccountRuntime {
                 hedge_side: p.side != PositionSide::Both,
                 margin: p.margin,
                 leverage: None,
+                entry_price: p.entry_price,
             })
             .collect()
     }
@@ -1698,7 +1711,12 @@ impl TradingState {
                 }
             }
             PrivateEvent::Position(update) => {
-                rt.apply_position_event(&update.symbol, update.position_side, update.qty);
+                rt.apply_position_event(
+                    &update.symbol,
+                    update.position_side,
+                    update.qty,
+                    update.entry_price,
+                );
                 let notionals = position_notionals(&rt.positions);
                 let r = rt.risk.set_positions(now_ms, notionals);
                 rt.note_poisoned(r);
@@ -2218,6 +2236,7 @@ mod tests {
             hedge_side: false,
             margin: None,
             leverage: None,
+            entry_price: None,
         }
     }
 
@@ -3198,6 +3217,7 @@ mod tests {
             limit_price: None,
             activation_price: None,
             callback_rate: None,
+            price: None,
         }
     }
 
@@ -3349,12 +3369,66 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_entry_price_is_held_and_an_event_can_replace_it() {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        let rt = t.accounts.get_mut(&m.id).unwrap();
+        let mut with_px = held("BTCUSDT", 2);
+        with_px.entry_price = Some(Decimal::from_int(60_000));
+        let mut zero_px = held("ETHUSDT", 1);
+        zero_px.entry_price = Some(Decimal::ZERO);
+        rt.apply_snapshot(&[], &[with_px, zero_px, held("SOLUSDT", 1)], |r, n| {
+            r.set_positions(0, n)
+        });
+        let px_of = |rt: &AccountRuntime, s: &str| {
+            rt.positions
+                .iter()
+                .find(|p| p.symbol == s)
+                .unwrap()
+                .entry_price
+        };
+        assert_eq!(px_of(rt, "BTCUSDT"), Some(Decimal::from_int(60_000)));
+        assert_eq!(px_of(rt, "ETHUSDT"), None, "a zero price is none");
+        assert_eq!(px_of(rt, "SOLUSDT"), None);
+        let newer = Decimal::from_int(61_500);
+        rt.apply_position_event(
+            "BTCUSDT",
+            PositionSide::Both,
+            Decimal::from_int(3),
+            Some(newer),
+        );
+        assert_eq!(px_of(rt, "BTCUSDT"), Some(newer));
+        // The risk side still sees the same positions as before.
+        assert_eq!(rt.exchange_positions().len(), 3);
+    }
+
+    /// A position event brings an entry price a snapshot may lack, and a flat event removes
+    /// the position with it.
+    #[test]
+    fn a_position_event_brings_the_entry_price_a_snapshot_lacks() {
+        let (mut t, m, key) = running();
+        connect_with_stop(&mut t, &m, key);
+        let rt = t.accounts.get_mut(&m.id).unwrap();
+        assert!(rt.positions.iter().all(|p| p.entry_price.is_none()));
+        let px = Decimal::from_int(61_000);
+        rt.apply_position_event(
+            "BTCUSDT",
+            PositionSide::Both,
+            Decimal::from_int(2),
+            Some(px),
+        );
+        assert_eq!(rt.positions[0].entry_price, Some(px));
+        rt.apply_position_event("BTCUSDT", PositionSide::Both, Decimal::ZERO, None);
+        assert!(rt.positions.is_empty());
+    }
+
+    #[test]
     fn the_direction_of_a_one_way_position_survives_the_signed_size() {
         let (mut t, m, key) = running();
         connect_with_stop(&mut t, &m, key);
         let rt = t.accounts.get_mut(&m.id).unwrap();
-        rt.apply_position_event("ETHUSDT", PositionSide::Both, Decimal::from_int(-3));
-        rt.apply_position_event("SOLUSDT", PositionSide::Short, Decimal::from_int(1));
+        rt.apply_position_event("ETHUSDT", PositionSide::Both, Decimal::from_int(-3), None);
+        rt.apply_position_event("SOLUSDT", PositionSide::Short, Decimal::from_int(1), None);
         let dir_of = |rt: &AccountRuntime, s: &str| {
             rt.positions.iter().find(|p| p.symbol == s).map(|p| p.dir)
         };
@@ -4092,6 +4166,7 @@ mod tests {
             "BTC-USDT-SWAP",
             PositionSide::Both,
             Decimal::from_int(3),
+            None,
         );
         assert!(t.margin_conflict(m.id, "BTC-USDT-SWAP"));
     }

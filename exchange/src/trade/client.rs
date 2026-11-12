@@ -1125,6 +1125,10 @@ pub struct OpenOrder {
     pub activation_price: Option<Decimal>,
     /// A trailing order's callback, as a percent, when it could be read.
     pub callback_rate: Option<Decimal>,
+    /// The price of a plain resting limit order (Binance `LIMIT` / `LIMIT_MAKER`, OKX `limit` /
+    /// `post_only`); `None` for a market, conditional or unreadable row, and for any value that
+    /// is not a finite positive number.
+    pub price: Option<Decimal>,
 }
 
 // The client id ties a log line to an order: it stays out of `{:?}` output.
@@ -1167,6 +1171,7 @@ impl OpenOrder {
             limit_price: None,
             activation_price: None,
             callback_rate: None,
+            price: None,
         }
     }
 }
@@ -1181,6 +1186,9 @@ pub struct Position {
     pub hedge_side: bool,
     pub margin: Option<MarginMode>,
     pub leverage: Option<u32>,
+    /// The average entry price of a snapshot row (Binance futures `entryPrice`, OKX `avgPx`);
+    /// `None` for spot, for a row without one and for a zero or unreadable value.
+    pub entry_price: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1270,6 +1278,11 @@ fn decimal(v: &Value, key: &str) -> Option<Decimal> {
     Decimal::parse(&text(v, key)?).ok()
 }
 
+/// A decimal that is greater than zero; zero, negative and unreadable values are `None`.
+fn positive_decimal(v: &Value, key: &str) -> Option<Decimal> {
+    decimal(v, key).filter(Decimal::is_positive)
+}
+
 fn parse_row_side(v: &Value) -> Option<Side> {
     match v.get("side")?.as_str()?.to_ascii_lowercase().as_str() {
         "buy" => Some(Side::Buy),
@@ -1331,6 +1344,9 @@ fn fill_protection(o: &mut OpenOrder, row: &Value, wire: Wire, is_algo: bool) {
             o.activation_price =
                 decimal(row, "activatePrice").or_else(|| decimal(row, "activationPrice"));
             o.callback_rate = decimal(row, "callbackRate");
+            if !is_algo && matches!(ty.as_deref(), Some("LIMIT" | "LIMIT_MAKER")) {
+                o.price = positive_decimal(row, "price");
+            }
         }
         Wire::Okx => {
             o.qty = decimal(row, "sz");
@@ -1339,6 +1355,9 @@ fn fill_protection(o: &mut OpenOrder, row: &Value, wire: Wire, is_algo: bool) {
             });
             if !is_algo {
                 o.attached = parse_attached(row);
+                if matches!(text(row, "ordType").as_deref(), Some("limit" | "post_only")) {
+                    o.price = positive_decimal(row, "px");
+                }
             }
             if is_algo {
                 let sl = decimal(row, "slTriggerPx");
@@ -1488,6 +1507,7 @@ fn parse_binance_position(p: &Value) -> Option<Position> {
             .and_then(Value::as_str)
             .and_then(parse_margin),
         leverage: text(p, "leverage").and_then(|s| s.parse().ok()),
+        entry_price: positive_decimal(p, "entryPrice"),
     })
 }
 
@@ -1510,6 +1530,7 @@ fn parse_okx_position(p: &Value) -> Option<Position> {
             .and_then(Value::as_str)
             .and_then(parse_margin),
         leverage: text(p, "lever").and_then(|s| s.parse().ok()),
+        entry_price: positive_decimal(p, "avgPx"),
     })
 }
 
@@ -1738,6 +1759,111 @@ mod open_order_tests {
         assert_eq!(o[0].role, None);
         assert_eq!(o[0].side, Some(Side::Buy));
         assert_eq!(o[0].position_side, Some(Dir::Long));
+    }
+}
+
+#[cfg(test)]
+mod plain_price_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn d(s: &str) -> Decimal {
+        Decimal::parse(s).expect("decimal")
+    }
+
+    #[test]
+    fn binance_futures_plain_limit_rows_carry_their_price() {
+        let rows = vec![
+            json!({"orderId": 1, "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
+                   "price": "59000.5", "origQty": "0.1"}),
+            json!({"orderId": 2, "symbol": "BTCUSDT", "side": "BUY", "type": "MARKET",
+                   "price": "0"}),
+            json!({"orderId": 3, "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT"}),
+            json!({"orderId": 4, "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
+                   "price": "0"}),
+            json!({"orderId": 5, "symbol": "BTCUSDT", "side": "SELL", "type": "STOP",
+                   "price": "58000", "stopPrice": "58100"}),
+        ];
+        let o = parse_open(&rows, "symbol", "orderId", OpenKind::Plain, Wire::Binance);
+        assert_eq!(o.len(), 5, "a bad price never drops the row");
+        assert_eq!(o[0].price, Some(d("59000.5")));
+        assert_eq!(o[1].price, None);
+        assert_eq!(o[2].price, None);
+        assert_eq!(o[3].price, None);
+        assert_eq!(o[4].price, None, "a stop-limit is not a resting limit");
+    }
+
+    #[test]
+    fn binance_spot_plain_limit_rows_carry_their_price() {
+        let rows = vec![
+            json!({"orderId": 1, "symbol": "BTCUSDT", "side": "SELL", "type": "LIMIT_MAKER",
+                   "price": "70000.00000000", "origQty": "0.5"}),
+            json!({"orderId": 2, "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
+                   "price": "abc"}),
+            json!({"orderId": 3, "symbol": "BTCUSDT", "side": "BUY", "type": "MARKET"}),
+        ];
+        let o = parse_open(&rows, "symbol", "orderId", OpenKind::Plain, Wire::Binance);
+        assert_eq!(o.len(), 3);
+        assert_eq!(o[0].price, Some(d("70000")));
+        assert_eq!(o[1].price, None);
+        assert_eq!(o[2].price, None);
+    }
+
+    #[test]
+    fn okx_plain_limit_rows_carry_their_price() {
+        let rows = vec![
+            json!({"instId": "BTC-USDT-SWAP", "ordId": "1", "side": "buy", "ordType": "limit",
+                   "px": "59000", "sz": "1"}),
+            json!({"instId": "BTC-USDT-SWAP", "ordId": "2", "side": "buy",
+                   "ordType": "post_only", "px": "58000", "sz": "1"}),
+            json!({"instId": "BTC-USDT-SWAP", "ordId": "3", "side": "buy", "ordType": "market",
+                   "px": "", "sz": "1"}),
+            json!({"instId": "BTC-USDT-SWAP", "ordId": "4", "side": "buy", "ordType": "limit",
+                   "sz": "1"}),
+            json!({"instId": "BTC-USDT-SWAP", "ordId": "5", "side": "buy", "ordType": "limit",
+                   "px": "-1", "sz": "1"}),
+        ];
+        let o = parse_open(&rows, "instId", "ordId", OpenKind::Plain, Wire::Okx);
+        assert_eq!(o.len(), 5);
+        assert_eq!(o[0].price, Some(d("59000")));
+        assert_eq!(o[1].price, Some(d("58000")));
+        assert_eq!(o[2].price, None);
+        assert_eq!(o[3].price, None);
+        assert_eq!(o[4].price, None);
+    }
+
+    #[test]
+    fn position_snapshots_carry_the_average_entry_price() {
+        let b = parse_binance_position(&json!({"symbol": "BTCUSDT", "positionAmt": "0.5",
+            "entryPrice": "60000.1"}))
+        .unwrap();
+        assert_eq!(b.entry_price, Some(d("60000.1")));
+        for bad in [json!("0.0"), json!("abc"), json!("-5"), json!(null)] {
+            let p = parse_binance_position(&json!({"symbol": "BTCUSDT", "positionAmt": "-1",
+                "entryPrice": bad}))
+            .unwrap();
+            assert_eq!(p.entry_price, None, "a bad entry price never drops the row");
+        }
+        let none = parse_binance_position(&json!({"symbol": "BTCUSDT", "positionAmt": "1"}));
+        assert_eq!(none.unwrap().entry_price, None);
+        let o = parse_okx_position(&json!({"instId": "BTC-USDT-SWAP", "pos": "3",
+            "avgPx": "61000"}))
+        .unwrap();
+        assert_eq!(o.entry_price, Some(d("61000")));
+        for bad in [json!(""), json!("0"), json!("x")] {
+            let p = parse_okx_position(&json!({"instId": "BTC-USDT-SWAP", "pos": "3",
+                "avgPx": bad}))
+            .unwrap();
+            assert_eq!(p.entry_price, None);
+        }
+    }
+
+    #[test]
+    fn debug_of_an_open_order_still_hides_the_client_id() {
+        let rows = vec![json!({"orderId": 1, "symbol": "BTCUSDT", "type": "LIMIT",
+            "price": "1", "clientOrderId": "secret-cid"})];
+        let o = parse_open(&rows, "symbol", "orderId", OpenKind::Plain, Wire::Binance);
+        assert!(!format!("{:?}", o[0]).contains("secret-cid"));
     }
 }
 

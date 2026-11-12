@@ -106,6 +106,8 @@ pub struct KlineChart {
     drawing_sync: Option<data::layout::drawings::Synced>,
     settings_reconfigure_pending: bool,
     render_invalidation: RenderInvalidation,
+    /// The account's orders and position on this chart's symbol (read-only, never saved).
+    order_lines: Vec<crate::order_lines::OrderLine>,
     last_maintenance_at: Instant,
 }
 
@@ -199,6 +201,7 @@ impl KlineChart {
             drawing_sync: None,
             last_maintenance_at: Instant::now(),
             render_invalidation: RenderInvalidation::new(),
+            order_lines: Vec::new(),
             settings_reconfigure_pending: false,
         };
 
@@ -558,7 +561,8 @@ impl KlineChart {
                 .with_drawing_snapshot(drawing_snapshot)
                 .with_candlestick_config(self.options.candlestick)
                 .with_footprint_config(self.options.footprint)
-                .with_trade_data_enabled(trade_data_enabled);
+                .with_trade_data_enabled(trade_data_enabled)
+                .with_order_lines(&self.order_lines);
                 let chart = self
                     .studies
                     .configure_widget(
@@ -802,6 +806,14 @@ impl KlineChart {
 
     pub fn base_ticker_info(&self) -> TickerInfo {
         self.data.base_ticker()
+    }
+
+    /// Takes the lines to draw; the chart is redrawn only when they changed.
+    pub fn set_order_lines(&mut self, lines: Vec<crate::order_lines::OrderLine>) {
+        if self.order_lines != lines {
+            self.order_lines = lines;
+            self.render_invalidation.invalidate();
+        }
     }
 
     pub fn series(&self) -> &[KlineSeries] {

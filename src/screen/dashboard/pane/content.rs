@@ -47,6 +47,26 @@ pub enum Content {
 }
 
 impl Content {
+    /// Hands a chart or an order book the lines of its own symbol (nothing is stored in the
+    /// saved pane settings). Each of them redraws only when the lines changed.
+    pub fn set_order_lines(&mut self, overlay: &crate::screen::dashboard::TradeOverlay) {
+        match self {
+            Self::Kline {
+                chart: Some(chart), ..
+            } => {
+                let ticker = chart.base_ticker_info().ticker;
+                let symbol = ticker.to_full_symbol_and_type().0;
+                chart.set_order_lines(overlay.lines_for(ticker.exchange, &symbol));
+            }
+            Self::Ladder(Some(ladder)) => {
+                let ticker = ladder.ticker();
+                let symbol = ticker.to_full_symbol_and_type().0;
+                ladder.set_order_lines(overlay.lines_for(ticker.exchange, &symbol));
+            }
+            _ => {}
+        }
+    }
+
     pub fn heatmap_indicator_config(
         &self,
     ) -> Option<&data::chart::heatmap::indicators::HeatmapIndicatorConfig> {

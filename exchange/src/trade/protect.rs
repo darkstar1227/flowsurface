@@ -599,6 +599,7 @@ mod tests {
             hedge_side: hedge,
             margin: None,
             leverage: None,
+            entry_price: None,
         }
     }
 
@@ -622,6 +623,7 @@ mod tests {
             limit_price: None,
             activation_price: None,
             callback_rate: None,
+            price: None,
         })
     }
 
