@@ -2,6 +2,77 @@
 
 本文件列出交易所憑證與交易功能必須遵守的安全條件。M4（交易所憑證與設定頁）已依這些條件實作；M5（交易）的每個改動都要對照本文件。條件編號沿用 M4 安全審查時的編號，變更條件時須同步更新本文件。
 
+## Live 開放前總清單
+
+M5（F7 交易）各段已合併，`LIVE_SENDING_ENABLED` 仍為 false。開放前要在 testnet／模擬盤走完 PRD 第 5 節 M5 的驗收，並完成下列各項。每項一行，括號內是細節所在的段落。已在後續輪次修好的項目不列。
+
+### (a) 程式碼必修（開 LIVE 前一定要做）
+- [ ] 每個 symbol 的即時 last／mark 價格串流，並區分 mark 與 last；現在的參考價是側欄 ticker 的最新成交價，沒有時間戳、隱藏時 300 秒才更新，基準為 mark 的規格不檢查過舊（見 d3「參考價新鮮度」、d4 第 5 點、d5）。
+- [ ] 持倉名目價值需要帶時間戳的價格，之後才能取代 `PositionUnknown` 的 fail closed（見 c2b 段「部位估值」）。
+- [ ] 啟動時對帳殘留自動單；互撤狀態只在記憶體（見 d3「仍待 testnet 與後續」）。
+- [ ] `CANCEL_NOT_FOUND` 白名單目前為空，填入 testnet 核對後的 algo 撤單 not found 錯誤碼（見 d3 M1、f3a）。
+- [ ] OKX `OpenOrder` 解析 `tdMode` 並與持倉保證金模式比對（見 d1「d5 待辦」）。
+- [ ] stream「要求立即重讀」API（需要 `exchange` 授權）：改單結果後主動重讀，完整做到 N4（見 f3a2）。
+- [ ] 撤單 leg 的 write-ahead journal：撤單成功、新單送出前 app 結束不會留下紀錄；也沒有測試實際執行 `run_replace`。完成後再評估 `send_replace` 的整體 timeout（見 f3a2、f3c「已知限制」）。
+- [ ] 沒有紀錄的 `Lost` 會鎖住該 symbol 的進場單直到重啟，需要解除路徑，或確認接受（見 f3a2 N1）。
+- [ ] f1：takes-liquidity 除了 ticker 價，也要比對最佳買賣價並在確認時重查；評估 DOM 點價的 post-only 選項（Binance `GTX`、OKX `post_only`）（見 f1 L1）。
+- [ ] f1：ladder 收到該 stream 的 `Disconnected` 時把 `last_depth_at` 設為 `None`；睡眠喚醒後舊深度仍算新鮮的問題一併處理（見 f1 N1）。
+- [ ] f2：`HeldPosition.entry_price` 只用於顯示，持倉事件會以 `None` 覆蓋快照值；任何風控都不得使用它（見 f2「已知限制」）。
+- [ ] f2：開放 LIVE 時，LIVE 帳戶的線要能顯示，但不得因此新增送單入口（見 f2）。
+
+### (b) testnet 核對（Binance 與 OKX 各做一次）
+- [ ] Binance 同方向第二張 `closePosition` 是否回 -4130；`closePosition` 在無持倉時的行為（見 d3、d4 第 11 點、d5 第 7 點）。
+- [ ] algo 撤單「不存在」的實際錯誤碼與時序，之後填入 `CANCEL_NOT_FOUND`（見 d3、f3a）。
+- [ ] 止損 `TRIGGERED` → `CANCELED` 的序列是否真的會發生；`TRIGGERING`／`TRIGGERED`／`FINISHED` 語意（見 d3「仍待 testnet」、d4 第 11 點）。
+- [ ] 撤單回應是否帶 `algoId`，且與 `openAlgoOrders` 的值相同：Binance `DELETE algoOrder`、OKX `cancel-algos`；不帶時每次改單都會撤舊單、不下新單（見 f3a1、f3a2）。
+- [ ] 撤單成功後，新單因「立即觸發」被拒的實際行為（見 f3a）。
+- [ ] `ALGO_UPDATE`（舊單 CANCELED、新單 NEW／TRIGGERED／FINISHED）與 HTTP 回應的先後；暫存重放的路徑是否真的走到（見 f3c）。
+- [ ] 同一張單在 REST 列表與 WS 事件的 `client_id` 是否一致，不一致時 `recheck` 會拒絕改單（見 f3c）。
+- [ ] resync 期間成交時，snapshot、被扣住的事件與 `State(Connected)` 的實際到達順序（見 d3 N1）。
+- [ ] hedge 模式全平與撤全部後的重新讀取（見 c2b3）。
+- [ ] 側欄隱藏時報價過舊的實際行為，以及 330 秒是否合適（見 d4）。
+- [ ] 重試的手動止損以 MARK_PRICE 為基準，與帳戶預設可能不同；確認視窗的欄位是否清楚（見 d4）。
+- [ ] `openAlgoOrders`／`orders-algo-pending`／`orders-pending` 的 client id、限價型止損與追蹤單的欄位名稱（`activatePrice`／`activationPrice`、`callbackRate`、OKX `slOrdPx`／`tpOrdPx`／`activePx`／`callbackRatio`）（見 d5）。
+- [ ] OKX 保證金模式與槓桿的讀取（`leverage-info`，net 與 hedge）對實際帳戶是否正確（見 c2b、d5）。
+- [ ] OKX 追蹤止損的撤單端點核對與實測；核對前不開放（見「M5 使用者決定」第 4 點）。
+- [ ] Binance 現貨私有流的 HMAC 是否可用；核對前現貨交易停用（見「M5 使用者決定」第 3 點）。
+
+### (c) 手動 `cargo run` 走查
+- [ ] DOM Cmd／Ctrl＋點價：主視窗與 popout 各一次；單擊、Shift、右鍵不下單；按住 Cmd 時 Cmd+Tab 切出再切回；非作用中 popout 的第一下點擊（見 f1）。
+- [ ] 關閉有確認視窗的 popout、切換 layout、合併 popout：不留下看不見的確認，之後「Add a stop-loss」仍可用（見 f1）。
+- [ ] 雙擊 pane 價格：按鈕顯示 "Confirm (wait…)"，400 ms 內按不下；系統雙擊速度調慢時的情況（見 f1 S0、N2）。
+- [ ] 深度斷線或空簿時 Cmd＋點沒有反應；確認視窗的 "Takes liquidity"、"From the order book (DOM)"、帳戶名稱與 TESTNET／LIVE（見 f1）。
+- [ ] 訂單線：Stop／Target／Trailing／Entry／Position 顏色與標籤、OKX 的 ` ct` 單位、stale 時的虛線與 `· stale`、Ladder 的色條與標記（見 f2）。
+- [ ] 拖曳改價：Grab／Grabbing／NotAllowed 游標、預覽虛線與價格標籤、Escape 取消、拖出圖表取消、小於 4 px 視為點擊、百分比與對數刻度的提示（見 f3a2）。
+- [ ] 改單確認文字：「先撤後下」的裸倉警示、新價會立即觸發的警示、延遲接受點擊（見 f3a2、f3b）。
+- [ ] testnet 改單結果：Done 後線移到新價；`NewNotPlaced` 出現後 Retry protection 仍可用；改單進行中按撤全部／全平會被擋（見 f3a2）。
+- [ ] 自動掛上的止損與止盈在沒有 job 在途時可拖；止盈成交後新止損被撤；改單進行中止損觸發，新止盈被撤；job 在途時仍顯示 "automatic protection is still working"（見 f3c）。
+- [ ] 限價進場 → 關閉 app → 成交 → 重開：裸倉橫幅在 15 秒寬限後出現、macOS 通知一次；主視窗與 popout 各驗一次（見 d5）。
+- [ ] 孤兒「Cancel」確認視窗與 LIVE 延遲；OKX isolated 持倉被拒的文案（見 d5）。
+- [ ] macOS 通知在權限關閉與勿擾模式下的表現；OS 通知是否是唯一能讓使用者知道的管道（見 d4 第 7 點、d4 第 11 點）。
+- [ ] 持倉在 `PairState::InFlight` 期間顯示的提示文字是否清楚（見 c2b）。
+- [ ] 旗標全關時，拖曳止損線的確認視窗仍是「先撤後下」警示，文字與 f3a2 相同（見 f3b）。
+
+### (d) 開啟 place-first 旗標前
+- [ ] 完成 f3b「開啟任一旗標前的 testnet 核對清單」（Binance 與 OKX 各自）；核對後由人手動改常數、走一般 review（見 f3b）。
+- [ ] 實測兩個競態：新單在撤舊單前觸發、舊單在撤單前觸發；確認 f3c 的認領、重放與 d5 殘留單列出符合預期；補一個 GUI 整合測試：`replace_begun` → 舊單成交事件 → `OldNotCancelled` → `replace_ended` → `run_auto_jobs`（見 f3b）。
+- [ ] stream 斷線時發生 `OldNotCancelled`，清單不會被標記；要有其他重讀機制，或在 handler 主動重讀（見 f3b）。
+- [ ] OKX 的 `OldNotCancelled` 與 `PlacedFirstFailed(Found)` 目前只有 Error toast；至少讓 OKX 的 `OldNotCancelled` 發 OS 通知（見 f3b）。
+- [ ] 決定是否接受 OKX 沒有 d5 殘留判斷（entry 附掛單的 id 與 app 同形），先下後撤失敗留下的新單只靠紅色訊息（見 f3b）。
+- [ ] 撤單結果不明（`OldNotCancelled { cancel: Some(Unknown) }`）時，評估暫時封鎖 symbol 或觸發重讀；補「OKX 撤單回 sCode 0 但沒有 id」的測試（見 f3b）。
+
+### (e) 已接受的限制
+- `ticker price` 在 Binance、OKX、MEXC 是最新成交價，不是標記價；只有 Bybit、Hyperliquid 是標記價。立即觸發與穿價警示因此稱為 "ticker price"（見 f3a2 S7）。
+- 改單的新單事件暫存只有每帳戶 32 筆；被擠掉時新單會被當成 `Open`，由 d5 殘留單顯示（見 f3c「已知限制」）。
+- 改單送出前 d3 已對舊單送出撤單、或 entry 已被移除時，新單不被追蹤，成為孤兒單，使用者自行撤掉（見 f3c）。
+- 改單在途期間被延後的撤單與 stage，上限由結果不明時的查詢與每個請求 30 秒 timeout 決定；送出前若等待 Keychain 授權，延後時間包含使用者回應的時間（見 f3c）。
+- 現貨沒有持倉均價與持倉，不畫 Position 線；同價位的多條線互相覆蓋；`RulesExpired` 不自動重新 review（見 f2、f3a2）。
+- 只有 Binance 有 auto grant 認領；OKX 的 `Replacement` 為 `None`（見 f3c）。
+- 「既有問題（未修）」與「其他後續項目」兩節列出的 M4 遺留項目，開放前要逐項決定修或接受。
+
+### 最後一項
+- [ ] 以上 (a)–(d) 完成、(e) 已逐項接受後，才由使用者決定移除 `LIVE_SENDING_ENABLED`；本清單不代為決定。
+
 ## 條件 1–37
 
 ### A. Keychain 儲存
@@ -1029,7 +1100,7 @@ app 在每個 private 事件之後都會 poll，所以改單回應回來之前�
 做法：`AutoBook.replacing`（**舊單的 client id** → 帳戶）。book 的 key 一律是 client id，不是交易所單號（`OpenOrder.id` 與 `OpenOrder.client_id` 是不同欄位）：
 - 開始：`main::confirm_replace` 呼叫 `TradingState::replace_begun(account, &OpenOrder)`，由 `AutoBook::replace_begun` 自己從列上取 `client_id`；列沒有 client id、不是 book 掛的單、或 entry 屬於別的帳戶時不記錄（只改 book 狀態，不新增送單點）。簽名收整列而不是字串，避免日後又傳錯 id。
 - 結束：`on_replace_sent` 一開始、認領之前呼叫 `replace_ended(account)`，**依帳戶**清除（一個帳戶同時最多一個改單，`replace_flow.begin_send` 保證），所以不論結果（`Done`、`Refused`、`Lost`、task panic）、也不需要結果帶 client id，都一定清得掉；`remove_account` 一併清除。
-- 標記存在時：`housekeeping` 不移除含該 id 的 entry；`poll_entry` 對該 id 的 `ToCancel` 不排撤單，維持 `ToCancel`；entry 有這種保留中的 `ToCancel` 時，`poll_entry` 在送出其他（非保留）單的撤單 job 之後直接回傳，不排任何 stage（維持先撤再掛，N5）。
+- 標記存在時：`housekeeping` 不移除含該 id 的 entry；`poll_entry` 對該 id 的 `ToCancel` 不排撤單，維持 `ToCancel`；entry 有這種保留中的 `ToCancel` 時，`poll_entry` 對 entry 另有非保留單要撤時，回傳那個撤單 job（不排 stage）；沒有時才因保留而回傳 `None`（維持先撤再掛，N5）。
 - 結果是 `Done` 時由 `adopt_replacement` 接手，新單為 `ToCancel`，下一次 poll 撤新單；結果不是 `Done` 時標記已清，照原路徑撤舊 id 或由事件推進。
 
 測試（用 `id = "9001"` 與 client id 不同的 `OpenOrder` 列）：`a_replace_is_held_back_by_the_client_id_not_the_exchange_id`（在途時 `replacing` 非空、不對舊單撤單、`Adopted`、新止盈被撤、ended 後為空）、`the_end_of_a_replace_clears_the_account_whatever_the_result`（非 `Done` 變體，ended 後舊 id 照原路徑被撤）、`a_replace_without_a_client_id_or_of_another_account_is_not_recorded`、`a_held_back_cancel_keeps_the_stages_from_being_placed`（N5）。測試在 `AutoBook` 層，經 `TradingState` 的兩個方法只是一行轉呼叫，`main` 呼叫的就是它們。
@@ -1044,7 +1115,7 @@ app 在每個 private 事件之後都會 poll，所以改單回應回來之前�
 - 新單事件暫存只有每帳戶 32 筆；同一帳戶在改單回應前湧入大量其他 algo 事件時，最舊的會被擠掉，新單的事件就漏掉，book 之後一直把新單當成 `Open`、entry 不會被移除，`orphan_protectives` 與 d5 仍會顯示。
 - 改單送出之前，d3 若已對舊單送出撤單（`Cancelling`），認領被拒並寫 note，新單成為孤兒單（reduceOnly／closePosition，不加倉）。改單在途期間不會再新增這種撤單（R1）。
 - 改單送出前 entry 就已被移除時，認領回 `Dropped`：新單不被追蹤；若倉位已被平掉，使用者要自己撤掉這張單（toast 有說）。
-- 改單在途期間，被改單的那張舊單的撤單、entry 的移除與後續 stage 的送出被延後，直到回應或 task 結束（其他兄弟單的撤單照常）。上限：改單路徑遇到 limiter pause（signed 429 最長 3600 秒）**不會等待**，`send_limited_meta` 立刻回 `LocalRateLimited`（`NotSent`），所以限流不會拉長在途時間；真正會等的只有結果不明時的查詢（`DEFAULT_SCHEDULE` 約一分鐘，加上 `recvWindow` 與 `SETTLE_BUFFER_MS`／OKX 60 秒底限的延伸）與每個請求 30 秒 timeout，正常最壞約數分鐘。**刻意沒有在 `send_replace` 外層加整體 timeout**：撤單 leg 沒有 write-ahead 記錄，逾時丟掉 future 會讓已送出的撤單結果消失、留下裸倉而不自知；寧可等結果。
+- 改單在途期間，被改單的那張舊單的撤單、entry 的移除與後續 stage 的送出被延後，直到回應或 task 結束（其他兄弟單的撤單照常）。上限：改單路徑遇到 limiter pause（signed 429 最長 3600 秒）**不會等待**，`send_limited_meta` 立刻回 `LocalRateLimited`（`NotSent`），所以限流不會拉長在途時間；真正會等的只有結果不明時的查詢（`DEFAULT_SCHEDULE` 約一分鐘，加上 `recvWindow` 與 `SETTLE_BUFFER_MS`／OKX 60 秒底限的延伸）與每個請求 30 秒 timeout，正常最壞約數分鐘。**刻意沒有在 `send_replace` 外層加整體 timeout**：撤單 leg 沒有 write-ahead 記錄，逾時丟掉 future 會讓已送出的撤單結果消失、留下裸倉而不自知；寧可等結果。送出前若等待 macOS Keychain 授權（task 內讀取憑證，系統可能跳出授權提示），延後時間包含使用者回應的時間；此時還沒有任何 leg 送出，舊單仍掛著。
 - `send_tests` 的 Binance 改單測試證明 `ReplaceDone` 帶憑證；`run_replace` 到 `on_replace_sent` 的整段仍需 testnet 確認。
 
 ### 需要手動 `cargo run`／testnet 確認
