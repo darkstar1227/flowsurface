@@ -29,6 +29,7 @@
 //! async fn go(c: &TradeClient, a: ApprovedOrder) { let _ = c.send_approved(a).await; }
 //! ```
 
+use super::client::OpenOrder;
 use super::preview::{OrderPreview, PreviewHash};
 use super::request::{BinanceRequest, Exposure, Method, OkxRequest};
 use super::rules::{FreshRules, SymbolRules, TradeProduct};
@@ -312,10 +313,14 @@ pub(crate) mod sealed {
 }
 
 /// What a confirmation covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Binding {
     /// One request, by the hash of its preview.
     Order(PreviewHash),
+    /// A replace of a protective order: the new request by the hash of its preview, and the
+    /// exchange id of the old order the user saw being cancelled. Not an order confirmation
+    /// and not accepted by `submit`, and an order confirmation is not accepted for a replace.
+    Replace { new: PreviewHash, old_id: String },
     /// A cancel-all or a close-all of one account: the requests are built from the account's
     /// open orders and positions when it runs, so there is no single request to preview.
     Bulk(AccountKey, BulkAction),
@@ -348,6 +353,16 @@ impl ConfirmToken {
         ConfirmToken(Binding::Order(preview.hash))
     }
 
+    /// The user confirmed replacing `old` (cancel it) by the order shown in `new`. The token
+    /// keeps the new request's hash and the old order's exchange id; it is accepted only by
+    /// [`ReplaceGrant`](super::ReplaceGrant) for that old order, and not by `submit`.
+    pub fn for_replace(new: &OrderPreview, old: &OpenOrder) -> Self {
+        ConfirmToken(Binding::Replace {
+            new: new.hash,
+            old_id: old.id.clone(),
+        })
+    }
+
     /// The user confirmed `action` for `account`. The token is refused for any other account
     /// or the other bulk action.
     pub fn for_bulk(account: AccountKey, action: BulkAction) -> Self {
@@ -358,7 +373,16 @@ impl ConfirmToken {
     pub(crate) fn spend_order(self) -> Result<Spent, ConfirmationMismatch> {
         match self.0 {
             Binding::Order(h) => Ok(Spent(Kind::Order(h))),
-            Binding::Bulk(..) => Err(ConfirmationMismatch),
+            Binding::Bulk(..) | Binding::Replace { .. } => Err(ConfirmationMismatch),
+        }
+    }
+
+    /// For a [`ReplaceGrant`](super::ReplaceGrant): only a replace confirmation counts, and
+    /// what it keeps is the hash of the new request and the id of the old order the user saw.
+    pub(crate) fn spend_for_replace(self) -> Result<(PreviewHash, String), ConfirmationMismatch> {
+        match self.0 {
+            Binding::Replace { new, old_id } => Ok((new, old_id)),
+            Binding::Order(_) | Binding::Bulk(..) => Err(ConfirmationMismatch),
         }
     }
 
@@ -371,7 +395,9 @@ impl ConfirmToken {
     ) -> Result<Spent, ConfirmationMismatch> {
         match self.0 {
             Binding::Bulk(a, act) if a == account && act == action => Ok(Spent(Kind::Bulk)),
-            Binding::Bulk(..) | Binding::Order(_) => Err(ConfirmationMismatch),
+            Binding::Bulk(..) | Binding::Order(_) | Binding::Replace { .. } => {
+                Err(ConfirmationMismatch)
+            }
         }
     }
 }
@@ -384,31 +410,81 @@ pub(crate) struct ConfirmationMismatch;
 enum Kind {
     Order(PreviewHash),
     Bulk,
-    Auto,
+    /// A request the grant authorised (`AttachProtective`, `CancelSibling`): only that path's
+    /// class of request, and only the request whose hash the grant saw.
+    Granted(AutoPath, PreviewHash),
+    /// The risk-control close, which has no grant: anything that does not add exposure.
+    Unbound,
+    /// One leg of a protective-order replace (f3a): the cancel of the old order or the new
+    /// order, each bound to the hash the grant holds for it.
+    Replace(ReplaceLeg, PreviewHash),
+}
+
+/// The two legs of a protective-order replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplaceLeg {
+    /// Cancels the old order (neutral).
+    Cancel,
+    /// Places the new order (reducing).
+    Place,
 }
 
 /// A confirmation that has been used up. Only [`ConfirmToken::spend_order`] /
-/// [`ConfirmToken::spend_bulk`] (a user confirmation) or [`Spent::pre_authorised`] (an
-/// automatic path) makes one. `Clone` so one confirmation can cover the several requests of a
-/// cancel-all or close-all.
+/// [`ConfirmToken::spend_bulk`] (a user confirmation), [`Spent::granted`] (a grant), the
+/// replace grant or [`Spent::unbound`] (the risk close) makes one. `Clone` so one confirmation
+/// can cover the several requests of a cancel-all or close-all.
 #[derive(Debug, Clone)]
 pub(crate) struct Spent(Kind);
 
 impl Spent {
-    /// For the three automatic paths, which `AutoIntent` already restricts to reducing.
-    pub(crate) fn pre_authorised() -> Self {
-        Spent(Kind::Auto)
+    /// For a request an [`AutoGrant`](super::AutoGrant) authorised; `bound` is the hash of that
+    /// request, taken when the grant authorised it.
+    pub(crate) fn granted(path: AutoPath, bound: PreviewHash) -> Self {
+        Spent(Kind::Granted(path, bound))
+    }
+
+    /// For the risk-control close, which `AutoIntent` already restricts to not adding.
+    pub(crate) fn unbound() -> Self {
+        Spent(Kind::Unbound)
+    }
+
+    /// For one leg of a replace, bound to the hash the replace grant holds for that leg.
+    pub(crate) fn replace(leg: ReplaceLeg, bound: PreviewHash) -> Self {
+        Spent(Kind::Replace(leg, bound))
     }
 
     /// Does this confirmation cover `intent`? An order confirmation covers only the request it
-    /// was made for.
+    /// was made for; an automatic one covers only the class of request of its path (and, with a
+    /// grant, only the request the grant saw), never one that adds exposure.
     fn covers(&self, intent: &OrderIntent) -> bool {
+        let exposure = intent.exposure();
         match self.0 {
             Kind::Order(h) => h == intent.preview().hash,
             // A bulk confirmation never covers a request that adds exposure.
-            Kind::Bulk => !matches!(intent.exposure(), Exposure::Adds { .. }),
-            Kind::Auto => true,
+            Kind::Bulk | Kind::Unbound => !matches!(exposure, Exposure::Adds { .. }),
+            Kind::Granted(path, h) => {
+                let shape = match path {
+                    AutoPath::AttachProtective => matches!(exposure, Exposure::Reduces),
+                    AutoPath::CancelSibling => matches!(exposure, Exposure::Neutral),
+                    // Not a path a grant authorises.
+                    AutoPath::RiskClose => false,
+                };
+                shape && h == intent.preview().hash
+            }
+            Kind::Replace(leg, h) => {
+                let shape = match leg {
+                    ReplaceLeg::Cancel => matches!(exposure, Exposure::Neutral),
+                    ReplaceLeg::Place => matches!(exposure, Exposure::Reduces),
+                };
+                shape && h == intent.preview().hash
+            }
         }
+    }
+
+    /// A replace drags a protective order: condition 51 refuses it unless the stream is
+    /// synchronised, for the cancel as well as for the new order.
+    fn is_replace(&self) -> bool {
+        matches!(self.0, Kind::Replace(..))
     }
 }
 
@@ -534,6 +610,11 @@ pub(crate) fn approve<G: SendGate>(
     if class == GateClass::Entry && !allows(stream, TradeAction::NewEntry) {
         return Err(SubmitError::StreamNotReady(stream));
     }
+    // A replace of a protective order is a drag (cancel and place again): both legs need a
+    // synchronised stream, which `DragModify` says, though neither leg is an entry.
+    if confirmation.is_replace() && !allows(stream, TradeAction::DragModify) {
+        return Err(SubmitError::StreamNotReady(stream));
+    }
     // Condition 57: a refused login or key voids the account's trade session, and it does so
     // for every order, closes included (the credentials are not usable, and a stale `Usable`
     // verdict must not outlive the failure). This reads the stream's own entry, so it holds
@@ -565,4 +646,130 @@ pub(crate) fn approve<G: SendGate>(
         Exposure::Reduces | Exposure::Neutral => Priority::Protective,
     };
     Ok(ApprovedOrder { intent, priority })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::PositionMode;
+    use crate::trade::binance_futures as bf;
+    use crate::trade::client_id::{ClientId, Role};
+    use crate::trade::rules::fixtures::{d, futures};
+    use crate::trade::types::{
+        Action, Dir, Exec, OrderRef, Protective, ProtectiveKind, Size, TimeInForce, WorkingType,
+    };
+
+    const NOW: i64 = 2_000;
+
+    fn key() -> AccountKey {
+        AccountKey::from_bytes([7; 16])
+    }
+
+    /// An entry (adds), a protective order (reduces) and a cancel (neutral).
+    fn intents() -> (OrderIntent, OrderIntent, OrderIntent) {
+        let t = futures();
+        let r = t.lookup("BTCUSDT").unwrap();
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, 60_000).unwrap();
+        let entry = bf::new_order(bf::FuturesEntry {
+            rules: r,
+            mode: Some(PositionMode::OneWay),
+            action: Action::Open(Dir::Long),
+            qty: d("0.002"),
+            exec: Exec::Limit {
+                price: d("60000"),
+                tif: TimeInForce::Gtc,
+            },
+            ref_price: Some(d("60000")),
+            client_id: ClientId::generate(Role::Entry),
+        })
+        .unwrap();
+        let protective = bf::new_algo_order(
+            r,
+            Some(PositionMode::OneWay),
+            Protective {
+                kind: ProtectiveKind::StopMarket,
+                dir: Dir::Long,
+                size: Size::ClosePosition,
+                trigger_price: Some(d("59000")),
+                limit_price: None,
+                tif: TimeInForce::Gtc,
+                working_type: WorkingType::MarkPrice,
+                trailing: None,
+                ref_price: d("60000"),
+                client_id: ClientId::generate(Role::StopLoss),
+            },
+        )
+        .unwrap();
+        let cancel = bf::cancel_algo_order(&OrderRef::exchange("777").unwrap()).unwrap();
+        let make = |r| OrderIntent::binance(key(), r, &fresh).unwrap();
+        (make(entry), make(protective), make(cancel))
+    }
+
+    fn covers(spent: Spent, intent: &OrderIntent) -> bool {
+        spent.covers(intent)
+    }
+
+    #[test]
+    fn a_granted_confirmation_covers_only_its_path_and_its_request() {
+        let (entry, protective, cancel) = intents();
+        let (_, other_protective, _) = intents();
+        let attach = |h| Spent::granted(AutoPath::AttachProtective, h);
+        let sibling = |h| Spent::granted(AutoPath::CancelSibling, h);
+        // Its own request on its own path.
+        assert!(covers(attach(protective.preview().hash), &protective));
+        assert!(covers(sibling(cancel.preview().hash), &cancel));
+        // Not another request (another client id, so another hash).
+        assert!(!covers(
+            attach(protective.preview().hash),
+            &other_protective
+        ));
+        // Not a request of the other path's class, even with a matching hash.
+        assert!(!covers(attach(cancel.preview().hash), &cancel));
+        assert!(!covers(sibling(protective.preview().hash), &protective));
+        // Never an entry.
+        assert!(!covers(attach(entry.preview().hash), &entry));
+        assert!(!covers(sibling(entry.preview().hash), &entry));
+        // The risk-close path is not one a grant authorises.
+        assert!(!covers(
+            Spent::granted(AutoPath::RiskClose, protective.preview().hash),
+            &protective
+        ));
+    }
+
+    #[test]
+    fn the_unbound_and_bulk_confirmations_never_cover_an_entry() {
+        let (entry, protective, cancel) = intents();
+        for spent in [Spent::unbound(), Spent(Kind::Bulk)] {
+            assert!(covers(spent.clone(), &protective));
+            assert!(covers(spent.clone(), &cancel));
+            assert!(!covers(spent, &entry));
+        }
+    }
+
+    #[test]
+    fn a_replace_leg_covers_only_its_own_request() {
+        let (entry, protective, cancel) = intents();
+        let place = |h| Spent::replace(ReplaceLeg::Place, h);
+        let cancel_leg = |h| Spent::replace(ReplaceLeg::Cancel, h);
+        assert!(covers(place(protective.preview().hash), &protective));
+        assert!(covers(cancel_leg(cancel.preview().hash), &cancel));
+        // The legs are not interchangeable, even with the other's hash.
+        assert!(!covers(place(cancel.preview().hash), &cancel));
+        assert!(!covers(cancel_leg(protective.preview().hash), &protective));
+        // A hash that is not the request's.
+        assert!(!covers(place(cancel.preview().hash), &protective));
+        assert!(!covers(place(entry.preview().hash), &entry));
+        assert!(Spent::replace(ReplaceLeg::Place, entry.preview().hash).is_replace());
+        assert!(!Spent::unbound().is_replace());
+    }
+
+    #[test]
+    fn an_order_confirmation_still_covers_exactly_its_request() {
+        let (entry, protective, _) = intents();
+        assert!(covers(Spent(Kind::Order(entry.preview().hash)), &entry));
+        assert!(!covers(
+            Spent(Kind::Order(entry.preview().hash)),
+            &protective
+        ));
+    }
 }

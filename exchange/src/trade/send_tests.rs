@@ -4743,3 +4743,830 @@ mod auto_grant {
         assert!(grant.cancel_intent(stop[0], &fresh).is_ok());
     }
 }
+
+// ── Replacing a protective order: one confirmation, cancel then place (f3a) ──
+
+mod replace_protective {
+    use super::*;
+    use crate::trade::client::OpenOrder;
+    use crate::trade::protect::ProtectRole;
+    use crate::trade::replace::{
+        REPLACE_GRANT_VALID_MS, ReplaceError, ReplaceGrant, ReplaceKind, ReplaceRefusal,
+    };
+    use crate::trade::stream::StreamState;
+
+    fn old_row(role: ProtectRole, close_position: bool, qty: Option<&str>) -> OpenOrder {
+        OpenOrder {
+            symbol: "BTCUSDT".to_string(),
+            id: "777".to_string(),
+            kind: OpenKind::Algo(None),
+            side: Some(Side::Sell),
+            position_side: None,
+            qty: qty.map(d),
+            trigger_price: Some(d("59000")),
+            close_position,
+            reduce_only: !close_position,
+            role: Some(role),
+            attached: None,
+            client_id: Some("eOLDSTOP1".to_string()),
+            limit: false,
+            limit_price: None,
+            activation_price: None,
+            callback_rate: None,
+            price: None,
+        }
+    }
+
+    fn new_order(
+        c: &TradeClient,
+        t: &RulesTable,
+        kind: ProtectiveKind,
+        dir: Dir,
+        size: Size,
+        trigger: &str,
+    ) -> OrderIntent {
+        let r = t.lookup("BTCUSDT").unwrap();
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let p = Protective {
+            kind,
+            dir,
+            size,
+            trigger_price: Some(d(trigger)),
+            limit_price: None,
+            tif: TimeInForce::Gtc,
+            working_type: WorkingType::MarkPrice,
+            trailing: None,
+            ref_price: d("60000"),
+            client_id: ClientId::generate(Role::StopLoss),
+        };
+        let req = bf::new_algo_order(r, Some(PositionMode::OneWay), p).unwrap();
+        OrderIntent::binance(c.account(), req, &fresh).unwrap()
+    }
+
+    fn stop(c: &TradeClient, t: &RulesTable, trigger: &str) -> OrderIntent {
+        new_order(
+            c,
+            t,
+            ProtectiveKind::StopMarket,
+            Dir::Long,
+            Size::ClosePosition,
+            trigger,
+        )
+    }
+
+    fn grant_for(
+        c: &TradeClient,
+        t: &RulesTable,
+        old: &OpenOrder,
+        new: &OrderIntent,
+    ) -> ReplaceGrant {
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        c.replace_grant(
+            ConfirmToken::for_replace(&new.preview(), old),
+            c.account(),
+            old,
+            &fresh,
+        )
+        .unwrap()
+    }
+
+    async fn run(
+        c: &TradeClient,
+        grant: ReplaceGrant,
+        new: OrderIntent,
+    ) -> Result<crate::trade::replace::ReplaceDone, ReplaceError<()>> {
+        c.submit_replace(&OpenGate, &NoRisk, &NoJournal, grant, new)
+            .await
+    }
+
+    /// The cancel names the old order (id 777), as the exchange does for a cancel it took.
+    fn replace_binance(m: &str, p: &str) -> (u16, String) {
+        if m == "DELETE" {
+            (200, json!({"algoId": 777, "clientAlgoId": "x"}).to_string())
+        } else {
+            gen_binance(m, p)
+        }
+    }
+
+    fn replace_okx(m: &str, p: &str) -> (u16, String) {
+        if p.contains("cancel-algos") {
+            (
+                200,
+                json!({"code": "0", "msg": "", "data": [
+                    {"sCode": "0", "sMsg": "", "algoId": "777"}
+                ]})
+                .to_string(),
+            )
+        } else {
+            gen_okx(m, p)
+        }
+    }
+
+    fn deleted_then_posted(fake: &Fake) -> (usize, usize) {
+        (
+            fake.count("DELETE /fapi/v1/algoOrder"),
+            fake.count("POST /fapi/v1/algoOrder"),
+        )
+    }
+
+    #[tokio::test]
+    async fn cancels_first_and_places_after_the_cancel_was_confirmed() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &new);
+        assert_eq!(grant.kind(), ReplaceKind::Stop);
+        let done = run(&c, grant, new).await.unwrap();
+        assert!(matches!(done.cancel.outcome, Outcome::Accepted { .. }));
+        assert!(matches!(done.new.outcome, Outcome::Accepted { .. }));
+        // The cancel is on the wire first, for the old id, then the new order.
+        let log = fake.all();
+        assert_eq!(
+            log,
+            vec![
+                "DELETE /fapi/v1/algoOrder".to_string(),
+                "POST /fapi/v1/algoOrder".to_string()
+            ]
+        );
+        let raw = fake.raw();
+        let cancel = if raw[0].2.is_empty() {
+            &raw[0].1
+        } else {
+            &raw[0].2
+        };
+        assert!(cancel.contains("algoId=777"), "{cancel}");
+    }
+
+    #[tokio::test]
+    async fn a_new_order_that_is_not_the_confirmed_one_is_refused_before_anything_is_sent() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let confirmed = stop(&c, &t, "58000");
+        let other = stop(&c, &t, "57000");
+        let grant = grant_for(&c, &t, &old, &confirmed);
+        let e = run(&c, grant, other).await.unwrap_err();
+        assert!(matches!(
+            e,
+            ReplaceError::Refused(ReplaceRefusal::NewOrderMismatch)
+        ));
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_old_order_must_be_a_readable_stop_or_target() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let new = stop(&c, &t, "58000");
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let make = |old: &OpenOrder| {
+            c.replace_grant(
+                ConfirmToken::for_replace(&new.preview(), old),
+                c.account(),
+                old,
+                &fresh,
+            )
+            .map(|_| ())
+            .unwrap_err()
+        };
+        // A trailing stop, an order with both legs and a plain order are not replaced.
+        assert_eq!(
+            make(&old_row(ProtectRole::Trailing, true, None)),
+            ReplaceRefusal::NotReplaceable
+        );
+        assert_eq!(
+            make(&old_row(ProtectRole::StopAndTarget, true, None)),
+            ReplaceRefusal::NotReplaceable
+        );
+        let mut plain = old_row(ProtectRole::Stop, true, None);
+        plain.kind = OpenKind::Plain;
+        assert_eq!(make(&plain), ReplaceRefusal::NotReplaceable);
+        // An id that is not a number, a missing side, a missing size.
+        let mut bad_id = old_row(ProtectRole::Stop, true, None);
+        bad_id.id = "12a".to_string();
+        assert_eq!(make(&bad_id), ReplaceRefusal::OldOrderUnreadable);
+        let mut no_side = old_row(ProtectRole::Stop, true, None);
+        no_side.side = None;
+        assert_eq!(make(&no_side), ReplaceRefusal::OldOrderUnreadable);
+        assert_eq!(
+            make(&old_row(ProtectRole::Stop, false, None)),
+            ReplaceRefusal::OldOrderUnreadable
+        );
+        let mut other_symbol = old_row(ProtectRole::Stop, true, None);
+        other_symbol.symbol = "ETHUSDT".to_string();
+        assert_eq!(make(&other_symbol), ReplaceRefusal::WrongSymbol);
+        // A bulk confirmation is not an order confirmation.
+        let bulk = ConfirmToken::for_bulk(c.account(), BulkAction::CancelAll);
+        let e = c
+            .replace_grant(
+                bulk,
+                c.account(),
+                &old_row(ProtectRole::Stop, true, None),
+                &fresh,
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(e, ReplaceRefusal::NotAnOrderConfirmation);
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    async fn cancel_fails(handler: fn(&str, &str) -> (u16, String)) {
+        let fake = serve(handler);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &new);
+        let e = run(&c, grant, new).await.unwrap_err();
+        let ReplaceError::CancelNotConfirmed(sub) = e else {
+            panic!("{e:?}");
+        };
+        assert!(!matches!(sub.outcome, Outcome::Accepted { .. }));
+        // The cancel went out once; the new order never did.
+        assert_eq!(deleted_then_posted(&fake), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_found_no_order_voids_the_grant() {
+        // The old order already triggered or filled: the exchange has no such order.
+        cancel_fails(|m, p| {
+            if m == "DELETE" {
+                (
+                    400,
+                    json!({"code": -2011, "msg": "Unknown order sent."}).to_string(),
+                )
+            } else {
+                gen_binance(m, p)
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_whose_result_is_unknown_voids_the_grant() {
+        cancel_fails(|m, p| {
+            if m == "DELETE" {
+                (
+                    500,
+                    json!({"code": -1006, "msg": "Unexpected response."}).to_string(),
+                )
+            } else {
+                gen_binance(m, p)
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_is_rejected_voids_the_grant() {
+        cancel_fails(|m, p| {
+            if m == "DELETE" {
+                (400, json!({"code": -4130, "msg": "refused"}).to_string())
+            } else {
+                gen_binance(m, p)
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_never_left_voids_the_grant() {
+        // 200 without an id: the result is unknown, not a confirmation.
+        cancel_fails(|m, p| {
+            if m == "DELETE" {
+                (200, json!({}).to_string())
+            } else {
+                gen_binance(m, p)
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_cancel_with_a_refused_new_order_says_the_old_one_is_gone() {
+        let fake = serve(|m, p| {
+            if m == "POST" {
+                (
+                    400,
+                    json!({"code": -2021, "msg": "Order would immediately trigger."}).to_string(),
+                )
+            } else {
+                replace_binance(m, p)
+            }
+        });
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &new);
+        let e = run(&c, grant, new).await.unwrap_err();
+        let ReplaceError::NewNotPlaced { cancel, new } = e else {
+            panic!("{e:?}");
+        };
+        assert!(matches!(cancel.outcome, Outcome::Accepted { .. }));
+        assert!(matches!(
+            new.unwrap().outcome,
+            Outcome::Rejected {
+                kind: RejectKind::Exchange,
+                ..
+            }
+        ));
+        // Not repeated.
+        assert_eq!(deleted_then_posted(&fake), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_second_grant_for_the_same_old_order_cannot_place_a_second_new_order() {
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&cancels);
+        let fake = serve(move |m, p| {
+            if m == "DELETE" && seen.fetch_add(1, Ordering::SeqCst) > 0 {
+                (
+                    400,
+                    json!({"code": -2011, "msg": "Unknown order sent."}).to_string(),
+                )
+            } else {
+                replace_binance(m, p)
+            }
+        });
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let first = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &first);
+        run(&c, grant, first).await.unwrap();
+        // The same drag confirmed again: the old order is gone, so no new order follows.
+        let second = stop(&c, &t, "57000");
+        let grant = grant_for(&c, &t, &old, &second);
+        let e = run(&c, grant, second).await.unwrap_err();
+        assert!(matches!(e, ReplaceError::CancelNotConfirmed(_)), "{e:?}");
+        assert_eq!(deleted_then_posted(&fake), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn an_expired_grant_sends_nothing() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        // Made so long ago that it ran out one millisecond ago.
+        let grant = grant_for(&c, &t, &old, &new);
+        c.test_elapsed_ms
+            .fetch_add(REPLACE_GRANT_VALID_MS + 1, Ordering::Relaxed);
+        let e = run(&c, grant, new).await.unwrap_err();
+        assert!(matches!(e, ReplaceError::Refused(ReplaceRefusal::Expired)));
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+        // At the last moment it is still good (a client of its own: its clock starts again).
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &new);
+        c.test_elapsed_ms
+            .fetch_add(REPLACE_GRANT_VALID_MS, Ordering::Relaxed);
+        assert!(run(&c, grant, new).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_is_not_connected_refuses_both_legs() {
+        for st in [
+            StreamState::Reconnecting,
+            StreamState::Resyncing,
+            StreamState::Unavailable,
+        ] {
+            let fake = serve(replace_binance);
+            let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+            let t = futures();
+            let old = old_row(ProtectRole::Stop, true, None);
+            let new = stop(&c, &t, "58000");
+            let grant = grant_for(&c, &t, &old, &new);
+            set_stream(&c, st);
+            let e = run(&c, grant, new).await.unwrap_err();
+            assert!(
+                matches!(e, ReplaceError::NotSent(SubmitError::StreamNotReady(s)) if s == st),
+                "{st:?}: {e:?}"
+            );
+            // Not even the cancel: a plain cancel of the same order is still allowed.
+            assert_eq!(deleted_then_posted(&fake), (0, 0), "{st:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_sends_nothing_not_even_the_cancel() {
+        // The F2 gate refuses a Live account while LIVE sending is off (its own table test in
+        // `data::config::trade_gate` covers `Reduce` with the switch off); here the client is a
+        // Live one and the gate says no.
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &new);
+        let e = c
+            .submit_replace(&ClosedGate, &NoRisk, &NoJournal, grant, new)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            e,
+            ReplaceError::NotSent(SubmitError::Gate("closed"))
+        ));
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    /// Refuses its second question, the new order's.
+    struct RefusesSecond(AtomicUsize);
+    impl SendGate for RefusesSecond {
+        type Refusal = &'static str;
+        fn check(&self, _: GateRequest) -> Result<(), &'static str> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err("second")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_of_the_new_order_comes_before_the_cancel_is_sent() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &new);
+        let gate = RefusesSecond(AtomicUsize::new(0));
+        let e = c
+            .submit_replace(&gate, &NoRisk, &NoJournal, grant, new)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            e,
+            ReplaceError::NotSent(SubmitError::Gate("second"))
+        ));
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_new_order_must_be_the_same_kind_side_and_size_and_may_not_add() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let stop_row = old_row(ProtectRole::Stop, true, None);
+        let part_row = old_row(ProtectRole::Stop, false, Some("0.002"));
+        let cases: Vec<(&OpenOrder, OrderIntent, ReplaceRefusal)> = vec![
+            // A take-profit for a stop.
+            (
+                &stop_row,
+                new_order(
+                    &c,
+                    &t,
+                    ProtectiveKind::TakeProfitMarket,
+                    Dir::Long,
+                    Size::ClosePosition,
+                    "61000",
+                ),
+                ReplaceRefusal::WrongKind,
+            ),
+            // The other side (a protective order for a short, which buys): a reversal.
+            (
+                &stop_row,
+                new_order(
+                    &c,
+                    &t,
+                    ProtectiveKind::StopMarket,
+                    Dir::Short,
+                    Size::ClosePosition,
+                    "61000",
+                ),
+                ReplaceRefusal::WrongSide,
+            ),
+            // More than the old order covered.
+            (
+                &part_row,
+                new_order(
+                    &c,
+                    &t,
+                    ProtectiveKind::StopMarket,
+                    Dir::Long,
+                    Size::Qty(d("0.003")),
+                    "58000",
+                ),
+                ReplaceRefusal::SizeChanged,
+            ),
+            // A whole-position order for a partial one.
+            (
+                &part_row,
+                stop(&c, &t, "58000"),
+                ReplaceRefusal::SizeChanged,
+            ),
+        ];
+        for (old, new, want) in cases {
+            let grant = grant_for(&c, &t, old, &new);
+            let e = run(&c, grant, new).await.unwrap_err();
+            assert!(
+                matches!(&e, ReplaceError::Refused(r) if *r == want),
+                "{want:?}: {e:?}"
+            );
+        }
+        // A request that adds exposure (a limit entry) is not a replacement.
+        let r = t.lookup("BTCUSDT").unwrap();
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let entry = OrderIntent::binance(
+            c.account(),
+            futures_limit(r, &ClientId::generate(Role::Entry), Action::Open(Dir::Long)),
+            &fresh,
+        )
+        .unwrap();
+        let grant = grant_for(&c, &t, &stop_row, &entry);
+        let e = run(&c, grant, entry).await.unwrap_err();
+        assert!(matches!(
+            e,
+            ReplaceError::Refused(ReplaceRefusal::NotReducing)
+        ));
+        // A position side that the old order did not have.
+        let mut hedged = old_row(ProtectRole::Stop, true, None);
+        hedged.position_side = Some(Dir::Long);
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &hedged, &new);
+        let e = run(&c, grant, new).await.unwrap_err();
+        assert!(matches!(
+            e,
+            ReplaceError::Refused(ReplaceRefusal::WrongPositionSide)
+        ));
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_grant_belongs_to_one_account() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let other = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&other, &t, "58000");
+        // The grant was made for `other`, the client that sends is `c`.
+        let grant = grant_for(&other, &t, &old, &new);
+        let e = run(&c, grant, new).await.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ReplaceError::NotSent(SubmitError::AccountMismatch)
+                    | ReplaceError::Refused(ReplaceRefusal::WrongAccount)
+            ),
+            "{e:?}"
+        );
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn an_okx_swap_stop_is_replaced_by_cancel_algos_then_order_algo() {
+        let fake = serve(replace_okx);
+        let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+        let t = okx_swap_table();
+        let r = t.lookup("BTC-USDT-SWAP").unwrap();
+        let fresh = t.fresh_lookup("BTC-USDT-SWAP", NOW, AGE).unwrap();
+        let place = |trigger: &str| {
+            let req = okx::place_algo(OkxProtective {
+                rules: r,
+                target: OkxTarget::Swap {
+                    mode: Some(PositionMode::OneWay),
+                    margin: MarginMode::Cross,
+                    action: Action::Close(Dir::Long),
+                },
+                ord_type: OkxAlgoType::Conditional,
+                size: Size::ClosePosition,
+                tp_trigger: None,
+                sl_trigger: Some(d(trigger)),
+                trigger_type: TriggerPxType::Last,
+                ref_price: d("60000"),
+                client_id: ClientId::generate(Role::StopLoss),
+            })
+            .unwrap();
+            OrderIntent::okx(c.account(), req, &fresh).unwrap()
+        };
+        let mut old = old_row(ProtectRole::Stop, true, None);
+        old.symbol = "BTC-USDT-SWAP".to_string();
+        old.kind = OpenKind::Algo(Some(OkxAlgoType::Conditional));
+        let new = place("58000");
+        let grant = c
+            .replace_grant(
+                ConfirmToken::for_replace(&new.preview(), &old),
+                c.account(),
+                &old,
+                &fresh,
+            )
+            .unwrap();
+        run(&c, grant, new).await.unwrap();
+        assert_eq!(
+            fake.all(),
+            vec![
+                "POST /api/v5/trade/cancel-algos".to_string(),
+                "POST /api/v5/trade/order-algo".to_string()
+            ]
+        );
+        // A take-profit for the stop is refused before anything is sent.
+        let tp = okx::place_algo(OkxProtective {
+            rules: r,
+            target: OkxTarget::Swap {
+                mode: Some(PositionMode::OneWay),
+                margin: MarginMode::Cross,
+                action: Action::Close(Dir::Long),
+            },
+            ord_type: OkxAlgoType::Conditional,
+            size: Size::ClosePosition,
+            tp_trigger: Some(d("61000")),
+            sl_trigger: None,
+            trigger_type: TriggerPxType::Last,
+            ref_price: d("60000"),
+            client_id: ClientId::generate(Role::TakeProfit),
+        })
+        .unwrap();
+        let tp = OrderIntent::okx(c.account(), tp, &fresh).unwrap();
+        let grant = c
+            .replace_grant(
+                ConfirmToken::for_replace(&tp.preview(), &old),
+                c.account(),
+                &old,
+                &fresh,
+            )
+            .unwrap();
+        let e = run(&c, grant, tp).await.unwrap_err();
+        assert!(matches!(
+            e,
+            ReplaceError::Refused(ReplaceRefusal::WrongKind)
+        ));
+        assert_eq!(fake.all().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_order_confirmation_is_not_a_replace_confirmation() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        // The confirmation of "add this stop" cannot make a grant that cancels another one.
+        let e = c
+            .replace_grant(
+                ConfirmToken::for_preview(&new.preview()),
+                c.account(),
+                &old,
+                &fresh,
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(e, ReplaceRefusal::NotAnOrderConfirmation);
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_replace_confirmation_names_one_old_order() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let mut other = old_row(ProtectRole::Stop, true, None);
+        other.id = "778".to_string();
+        let new = stop(&c, &t, "58000");
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        // Confirmed for 777, offered 778: another order of the same position and side.
+        let e = c
+            .replace_grant(
+                ConfirmToken::for_replace(&new.preview(), &old),
+                c.account(),
+                &other,
+                &fresh,
+            )
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(e, ReplaceRefusal::OldOrderMismatch);
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_replace_confirmation_does_not_send_a_plain_order() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let token = ConfirmToken::for_replace(&new.preview(), &old);
+        let e = c
+            .submit(&OpenGate, &NoRisk, &NoJournal, token, new)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, SubmitError::ConfirmationMismatch));
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_cancel_can_be_previewed_before_the_confirmation() {
+        let fake = serve(replace_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let fresh = t.fresh_lookup("BTCUSDT", NOW, AGE).unwrap();
+        let before = ReplaceGrant::cancel_preview_for(c.account(), &old, &fresh).unwrap();
+        let grant = grant_for(&c, &t, &old, &new);
+        assert_eq!(before.hash, grant.cancel_preview().hash);
+        let mut plain = old_row(ProtectRole::Trailing, true, None);
+        plain.id = "1".to_string();
+        assert_eq!(
+            ReplaceGrant::cancel_preview_for(c.account(), &plain, &fresh).map(|_| ()),
+            Err(ReplaceRefusal::NotReplaceable)
+        );
+        assert_eq!(deleted_then_posted(&fake), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_accepted_without_the_old_id_is_not_a_confirmed_cancel() {
+        // Binance answers for another order id: not a confirmed cancel of the old order.
+        let fake = serve(gen_binance);
+        let c = client(AccountVenue::Binance, AccountProduct::UsdM, &fake);
+        let t = futures();
+        let old = old_row(ProtectRole::Stop, true, None);
+        let new = stop(&c, &t, "58000");
+        let grant = grant_for(&c, &t, &old, &new);
+        let e = run(&c, grant, new).await.unwrap_err();
+        assert!(matches!(e, ReplaceError::CancelNotConfirmed(_)), "{e:?}");
+        assert_eq!(deleted_then_posted(&fake), (1, 0));
+    }
+
+    async fn okx_cancel_fails(handler: fn(&str, &str) -> (u16, String)) {
+        let fake = serve(handler);
+        let c = client(AccountVenue::Okx, AccountProduct::UsdM, &fake);
+        let t = okx_swap_table();
+        let r = t.lookup("BTC-USDT-SWAP").unwrap();
+        let fresh = t.fresh_lookup("BTC-USDT-SWAP", NOW, AGE).unwrap();
+        let req = okx::place_algo(OkxProtective {
+            rules: r,
+            target: OkxTarget::Swap {
+                mode: Some(PositionMode::OneWay),
+                margin: MarginMode::Cross,
+                action: Action::Close(Dir::Long),
+            },
+            ord_type: OkxAlgoType::Conditional,
+            size: Size::ClosePosition,
+            tp_trigger: None,
+            sl_trigger: Some(d("58000")),
+            trigger_type: TriggerPxType::Last,
+            ref_price: d("60000"),
+            client_id: ClientId::generate(Role::StopLoss),
+        })
+        .unwrap();
+        let new = OrderIntent::okx(c.account(), req, &fresh).unwrap();
+        let mut old = old_row(ProtectRole::Stop, true, None);
+        old.symbol = "BTC-USDT-SWAP".to_string();
+        old.kind = OpenKind::Algo(Some(OkxAlgoType::Conditional));
+        let grant = c
+            .replace_grant(
+                ConfirmToken::for_replace(&new.preview(), &old),
+                c.account(),
+                &old,
+                &fresh,
+            )
+            .unwrap();
+        let e = run(&c, grant, new).await.unwrap_err();
+        let ReplaceError::CancelNotConfirmed(sub) = e else {
+            panic!("{e:?}");
+        };
+        assert!(!matches!(sub.outcome, Outcome::Accepted { ids } if ids.contains(&"777".into())));
+        // The cancel went out once; the new order never did.
+        assert_eq!(
+            fake.all(),
+            vec!["POST /api/v5/trade/cancel-algos".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_okx_cancel_of_an_order_that_is_gone_voids_the_grant() {
+        okx_cancel_fails(|_, _| {
+            (
+                200,
+                json!({"code": "1", "msg": "", "data": [
+                    {"sCode": "51603", "sMsg": "Order does not exist", "algoId": "777"}
+                ]})
+                .to_string(),
+            )
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_okx_cancel_without_an_algo_id_voids_the_grant() {
+        // `sCode 0` and no id: not a confirmed cancel of the old order.
+        okx_cancel_fails(|_, _| {
+            (
+                200,
+                json!({"code": "0", "msg": "", "data": [{"sCode": "0", "sMsg": ""}]}).to_string(),
+            )
+        })
+        .await;
+    }
+}

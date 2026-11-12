@@ -26,6 +26,7 @@ pub mod outcome;
 pub mod preview;
 pub mod protect;
 pub mod queries;
+pub mod replace;
 pub mod request;
 pub mod risk;
 pub mod rules;
@@ -58,6 +59,9 @@ pub use protect::{
     Protection, Rounding, SpecFingerprint, TargetLeg, TargetSpec, TrailingSpec, TriggerBasis,
     bare_positions, cancellable_by_id, describe_protective, orphan_protectives, plan,
     protected_status, protecting_orders, residual_auto_orders, stop_guarded_position,
+};
+pub use replace::{
+    REPLACE_GRANT_VALID_MS, ReplaceDone, ReplaceError, ReplaceGrant, ReplaceKind, ReplaceRefusal,
 };
 pub use request::{BinanceRequest, Exposure, LookupKind, Method, OkxRequest};
 pub use risk::{

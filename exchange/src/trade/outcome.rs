@@ -6,6 +6,7 @@
 
 use crate::account::{AccountError, Delivery};
 use serde_json::Value;
+use std::fmt;
 
 /// Longest exchange `msg` kept (characters, not bytes; never `String::truncate`).
 const MAX_MSG_CHARS: usize = 120;
@@ -42,7 +43,7 @@ pub struct ItemRejection {
     pub msg: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// The exchange took the request; `ids` are the exchange-assigned ids.
     Accepted { ids: Vec<String> },
@@ -64,6 +65,34 @@ pub enum Outcome {
     },
     /// The request never left this process.
     NotSent(AccountError),
+}
+
+/// `Debug` hides the client id of an `Unknown` outcome, so that a `{:?}` of a `Submitted`, a
+/// `ReplaceError` or a `ReplaceDone` cannot put it into a log. Everything else prints as the
+/// derive would.
+impl fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Outcome::Accepted { ids } => f.debug_struct("Accepted").field("ids", ids).finish(),
+            Outcome::Rejected { kind, code, msg } => f
+                .debug_struct("Rejected")
+                .field("kind", kind)
+                .field("code", code)
+                .field("msg", msg)
+                .finish(),
+            Outcome::Unknown { http_status, .. } => f
+                .debug_struct("Unknown")
+                .field("client_id", &"<redacted>")
+                .field("http_status", http_status)
+                .finish(),
+            Outcome::Partial { accepted, rejected } => f
+                .debug_struct("Partial")
+                .field("accepted", accepted)
+                .field("rejected", rejected)
+                .finish(),
+            Outcome::NotSent(e) => f.debug_tuple("NotSent").field(e).finish(),
+        }
+    }
 }
 
 /// `[-0-9A-Za-z]`, at most 16 characters; anything else is replaced (condition 77).

@@ -210,7 +210,7 @@ impl TradeClient {
         table.fresh_lookup(symbol, self.now_ms(), MAX_RULES_AGE_MS)
     }
 
-    fn target(&self) -> Target {
+    pub(super) fn target(&self) -> Target {
         Target {
             account: self.account,
             venue: self.venue,
@@ -482,7 +482,10 @@ impl TradeClient {
         journal: &dyn UnknownJournal,
         granted: GrantedAuto,
     ) -> Result<Submitted, SubmitError<G::Refusal>> {
-        self.submit_auto_unbound(gate, risk, journal, granted.auto)
+        log::info!("auto order path {:?}", granted.auto.path);
+        // The confirmation covers the request the grant saw, on its own path only.
+        let spent = Spent::granted(granted.auto.path, granted.bound);
+        self.submit_spent(gate, risk, journal, spent, granted.auto.intent)
             .await
     }
 
@@ -496,7 +499,7 @@ impl TradeClient {
         auto: AutoIntent,
     ) -> Result<Submitted, SubmitError<G::Refusal>> {
         log::info!("auto order path {:?}", auto.path);
-        self.submit_spent(gate, risk, journal, Spent::pre_authorised(), auto.intent)
+        self.submit_spent(gate, risk, journal, Spent::unbound(), auto.intent)
             .await
     }
 
