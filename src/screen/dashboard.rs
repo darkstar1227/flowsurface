@@ -89,7 +89,18 @@ pub enum Event {
         command: presets::Command,
     },
     IndicatorCatalog(manifest::Message),
+    /// A pane asked for an order. `window` is where its confirmation opens: the pane's own
+    /// window (main, popout or detached layout).
+    TradeRequest {
+        window: window::Id,
+        request: Box<crate::order_flow::PrepareRequest>,
+    },
 }
+
+/// What the panes draw of the account's orders and positions (a view model, rebuilt on every
+/// view). It is never saved and never serialized. Empty until the panes draw anything.
+#[derive(Debug, Clone, Default)]
+pub struct TradeOverlay {}
 
 impl Dashboard {
     pub fn from_config(
@@ -594,6 +605,7 @@ impl Dashboard {
         pixel_ratio: PixelRatio,
         theme: &'a ThemeState,
         chart_resources: &'a SharedChartResources,
+        _overlay: &'a TradeOverlay,
     ) -> Element<'a, Message> {
         let pane_grid: Element<_> = PaneGrid::new(&self.panes, |id, pane, maximized| {
             let is_focused = self.focus == Some((main_window.id, id));
@@ -631,6 +643,7 @@ impl Dashboard {
         pixel_ratio: PixelRatio,
         theme: &'a ThemeState,
         chart_resources: &'a SharedChartResources,
+        _overlay: &'a TradeOverlay,
     ) -> Element<'a, Message> {
         if let Some((state, _)) = self.popout.get(&window) {
             let content = container(
@@ -1382,6 +1395,9 @@ impl Dashboard {
                     (Task::none(), Some(Event::IndicatorCatalog(message)))
                 }
             },
+            Some(pane::Effect::TradeRequest(request)) => {
+                (Task::none(), Some(Event::TradeRequest { window, request }))
+            }
             None => (Task::none(), None),
         }
     }

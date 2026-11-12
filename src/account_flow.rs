@@ -96,7 +96,8 @@ fn now_ms() -> i64 {
 #[derive(Debug, Clone)]
 pub enum Event {
     /// The reads before a bulk confirmation came back (the number tells which request).
-    BulkPrepared(u64, Result<Box<BulkPreview>, String>),
+    /// The window the confirmation opens in comes along with the answer.
+    BulkPrepared(u64, iced::window::Id, Result<Box<BulkPreview>, String>),
     BulkDone(Box<BulkSummary>),
     /// The saved unresolved sends, read from the file.
     RecordsLoaded(Result<Vec<UnknownRecord>, String>),
