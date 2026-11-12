@@ -903,11 +903,13 @@ impl TradingState {
         })
     }
 
-    /// An automatic protection job of the app works on this order (d3). The order is known by its
-    /// client id; a row that carries none is judged by the symbol having a job at work.
+    /// An automatic protection job of the app works on this order (d3): see
+    /// [`AutoBook::is_working_on`] (a protective order the app placed that stands steadily with
+    /// no job running is not one, f3c). The order is known by its client id; a row that carries
+    /// none is judged by the symbol having a job at work.
     pub fn is_auto_order(&self, id: Uuid, row: &OpenOrder) -> bool {
         match row.client_id.as_deref() {
-            Some(client_id) => self.auto.knows_client_id(client_id),
+            Some(client_id) => self.auto.is_working_on(client_id),
             None => self.auto.is_active(id, &row.symbol),
         }
     }
@@ -1298,6 +1300,27 @@ impl TradingState {
             self.set_journal_failed();
         }
         unresolved
+    }
+
+    /// A replace of an order is about to be sent: the automatic protection holds back its own
+    /// cancel of that order (book state only).
+    pub fn replace_begun(&mut self, account: Uuid, old: &OpenOrder) {
+        self.auto.replace_begun(account, old);
+    }
+
+    /// The replace ended, with any result: the hold-back ends.
+    pub fn replace_ended(&mut self, account: Uuid) {
+        self.auto.replace_ended(account);
+    }
+
+    /// A confirmed replace completed: the automatic protection follows the new order, if the old
+    /// one was its own (f3c).
+    pub fn adopt_replacement(
+        &mut self,
+        account: Uuid,
+        replacement: &exchange::trade::Replacement,
+    ) -> crate::auto_flow::Adoption {
+        self.auto.adopt_replacement(account, replacement)
     }
 
     /// The closer of the account's running stream, for deleting the account.

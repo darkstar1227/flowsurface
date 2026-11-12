@@ -158,6 +158,81 @@ pub enum ReplaceError<R> {
 pub struct ReplaceDone {
     pub cancel: Submitted,
     pub new: Submitted,
+    /// What the automatic protection of the app needs to take the new order over from the old
+    /// one (f3c). `None` when the replace is not one an automatic grant can follow (OKX).
+    pub replacement: Option<Replacement>,
+}
+
+/// The proof that a confirmed replace of a stop or a target **completed**: the exchange
+/// accepted the cancel of the old order (naming it) and accepted the new order. Only
+/// [`TradeClient::submit_replace`] makes one, and only on that path, so it cannot be built by a
+/// caller; its fields are private. [`AutoGrant::adopt_replacement`](super::grant::AutoGrant)
+/// takes it to let an automatic grant that issued the old order cancel the new one instead.
+///
+/// It is a record of a completed fact, not a permission: it is `Clone` (so a summary that
+/// carries it can be), and adopting twice is refused because the old id is gone after the
+/// first time. It names client ids, so `Debug` prints nothing of them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Replacement {
+    pub(crate) account: AccountKey,
+    pub(crate) symbol: String,
+    pub(crate) kind: ReplaceKind,
+    pub(crate) old_client_id: String,
+    pub(crate) new_client_id: String,
+}
+
+impl fmt::Debug for Replacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Replacement(<redacted>)")
+    }
+}
+
+impl Replacement {
+    /// The client id of the old order, to find the entry that placed it.
+    pub fn old_client_id(&self) -> &str {
+        &self.old_client_id
+    }
+
+    pub fn new_client_id(&self) -> &str {
+        &self.new_client_id
+    }
+
+    /// From the grant and the new request, before either is spent. Binance only (an automatic
+    /// grant exists only there), with one client id on each side.
+    fn of(grant: &ReplaceGrant, new: &OrderIntent) -> Option<Self> {
+        let Prepared::Binance(r) = &new.prepared else {
+            return None;
+        };
+        let ids = r.client_ids();
+        let [new_client_id] = ids.as_slice() else {
+            return None;
+        };
+        Some(Replacement {
+            account: grant.account,
+            symbol: grant.symbol.clone(),
+            kind: grant.kind,
+            old_client_id: grant.old_client_id.clone()?,
+            new_client_id: (*new_client_id).to_string(),
+        })
+    }
+
+    /// For the tests of crates that depend on this one.
+    #[cfg(feature = "test-support")]
+    pub fn for_test(
+        account: AccountKey,
+        symbol: &str,
+        kind: ReplaceKind,
+        old_client_id: &str,
+        new_client_id: &str,
+    ) -> Self {
+        Replacement {
+            account,
+            symbol: symbol.to_string(),
+            kind,
+            old_client_id: old_client_id.to_string(),
+            new_client_id: new_client_id.to_string(),
+        }
+    }
 }
 
 /// The one confirmation of a replace. Not `Clone`, taken by value by `submit_replace`.
@@ -487,6 +562,7 @@ impl TradeClient {
         let now = self.now_ms();
         grant.check(&new, now).map_err(ReplaceError::Refused)?;
         let new_hash = new.preview().hash;
+        let replacement = Replacement::of(&grant, &new);
         let ReplaceGrant {
             cancel,
             cancel_hash,
@@ -536,6 +612,7 @@ impl TradeClient {
             Ok(sub) if matches!(sub.outcome, Outcome::Accepted { .. }) => Ok(ReplaceDone {
                 cancel: cancelled,
                 new: sub,
+                replacement,
             }),
             Ok(sub) => Err(ReplaceError::NewNotPlaced {
                 cancel: Box::new(cancelled),
@@ -625,6 +702,7 @@ mod tests {
         let done = ReplaceDone {
             cancel: unknown(),
             new: unknown(),
+            replacement: None,
         };
         for text in [format!("{e:?}"), format!("{n:?}"), format!("{done:?}")] {
             assert!(!text.contains("eSECRETID1"), "{text}");
