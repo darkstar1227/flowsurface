@@ -29,12 +29,14 @@
 //! async fn go(c: &TradeClient, a: ApprovedOrder) { let _ = c.send_approved(a).await; }
 //! ```
 
-use super::client::OpenOrder;
+use super::client::{OpenKind, OpenOrder};
+use super::decimal::Decimal;
 use super::preview::{OrderPreview, PreviewHash};
+use super::protect::ProtectRole;
 use super::request::{BinanceRequest, Exposure, Method, OkxRequest};
 use super::rules::{FreshRules, SymbolRules, TradeProduct};
 use super::stream::{StreamState, TradeAction, allows, stream_state_for};
-use super::types::TradeError;
+use super::types::{Dir, Side, TradeError};
 use crate::account::{AccountEnv, AccountKey, AccountProduct, AccountVenue};
 use crate::rate_limit::Priority;
 use std::fmt;
@@ -312,15 +314,49 @@ pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
+/// The old order's row as the user saw it when confirming a replace: the exchange id, and the
+/// fields the grant checks the new order against. A grant made from a row that differs in any
+/// of them is refused, so the confirmation covers the whole row and not only its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OldRow {
+    id: String,
+    kind: OpenKind,
+    role: Option<ProtectRole>,
+    side: Option<Side>,
+    position_side: Option<Dir>,
+    qty: Option<Decimal>,
+    close_position: bool,
+}
+
+impl OldRow {
+    /// `old` is the row this fingerprint was made from.
+    pub(crate) fn matches(&self, old: &OpenOrder) -> bool {
+        *self == OldRow::of(old)
+    }
+
+    fn of(old: &OpenOrder) -> Self {
+        OldRow {
+            id: old.id.clone(),
+            kind: old.kind.clone(),
+            role: old.role,
+            side: old.side,
+            position_side: old.position_side,
+            qty: old.qty,
+            close_position: old.close_position,
+        }
+    }
+}
+
 /// What a confirmation covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Binding {
     /// One request, by the hash of its preview.
     Order(PreviewHash),
     /// A replace of a protective order: the new request by the hash of its preview, and the
-    /// exchange id of the old order the user saw being cancelled. Not an order confirmation
-    /// and not accepted by `submit`, and an order confirmation is not accepted for a replace.
-    Replace { new: PreviewHash, old_id: String },
+    /// old order's row (id, kind, side, position side, size) the user saw being cancelled. Not an
+    /// order confirmation and not accepted by `submit`, and an order confirmation is not
+    /// accepted for a replace.
+    Replace { new: PreviewHash, old: OldRow },
     /// A cancel-all or a close-all of one account: the requests are built from the account's
     /// open orders and positions when it runs, so there is no single request to preview.
     Bulk(AccountKey, BulkAction),
@@ -354,12 +390,13 @@ impl ConfirmToken {
     }
 
     /// The user confirmed replacing `old` (cancel it) by the order shown in `new`. The token
-    /// keeps the new request's hash and the old order's exchange id; it is accepted only by
+    /// keeps the new request's hash and a fingerprint of the old order's row (id, kind, side,
+    /// position side, size, whole-position flag); it is accepted only by
     /// [`ReplaceGrant`](super::ReplaceGrant) for that old order, and not by `submit`.
     pub fn for_replace(new: &OrderPreview, old: &OpenOrder) -> Self {
         ConfirmToken(Binding::Replace {
             new: new.hash,
-            old_id: old.id.clone(),
+            old: OldRow::of(old),
         })
     }
 
@@ -378,10 +415,10 @@ impl ConfirmToken {
     }
 
     /// For a [`ReplaceGrant`](super::ReplaceGrant): only a replace confirmation counts, and
-    /// what it keeps is the hash of the new request and the id of the old order the user saw.
-    pub(crate) fn spend_for_replace(self) -> Result<(PreviewHash, String), ConfirmationMismatch> {
+    /// what it keeps is the hash of the new request and the old order's row the user saw.
+    pub(crate) fn spend_for_replace(self) -> Result<(PreviewHash, OldRow), ConfirmationMismatch> {
         match self.0 {
-            Binding::Replace { new, old_id } => Ok((new, old_id)),
+            Binding::Replace { new, old } => Ok((new, old)),
             Binding::Order(_) | Binding::Bulk(..) => Err(ConfirmationMismatch),
         }
     }

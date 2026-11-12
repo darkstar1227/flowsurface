@@ -122,6 +122,7 @@ pub fn bulk_blocked_reason(
     gate: &Gate,
     deleting: bool,
     running: bool,
+    replacing: bool,
     confirm_open: bool,
 ) -> Option<&'static str> {
     if deleting {
@@ -129,6 +130,12 @@ pub fn bulk_blocked_reason(
     }
     if running {
         return Some("A cancel all or close all of this account is running.");
+    }
+    // A replace of a protective order of this account is cancelling and placing orders: a bulk
+    // run now could leave the new stop behind (f3a2). The bulk calls see no symbol, so the pair
+    // lock does not stop it.
+    if replacing {
+        return Some("A protective order of this account is being replaced. Wait for it to end.");
     }
     if confirm_open {
         return Some("Another confirmation is open. Finish or cancel it first.");
@@ -1121,10 +1128,10 @@ mod tests {
     #[test]
     fn a_deleting_account_or_an_open_confirmation_blocks_bulk() {
         let g = Gate::default();
-        assert!(bulk_blocked_reason(&g, true, false, false).is_some_and(|s| s.contains("deleted")));
-        assert!(bulk_blocked_reason(&g, false, true, false).is_some_and(|s| s.contains("running")));
-        assert!(
-            bulk_blocked_reason(&g, false, false, true).is_some_and(|s| s.contains("confirmation"))
-        );
+        let why = |d, r, p, c| bulk_blocked_reason(&g, d, r, p, c);
+        assert!(why(true, false, false, false).is_some_and(|s| s.contains("deleted")));
+        assert!(why(false, true, false, false).is_some_and(|s| s.contains("running")));
+        assert!(why(false, false, true, false).is_some_and(|s| s.contains("replaced")));
+        assert!(why(false, false, false, true).is_some_and(|s| s.contains("confirmation")));
     }
 }

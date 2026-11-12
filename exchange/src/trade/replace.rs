@@ -5,11 +5,12 @@
 //! covers both legs, through a [`ReplaceGrant`]:
 //!
 //! - the grant is made from that confirmation ([`ConfirmToken::for_replace`], spent in
-//!   [`TradeClient::replace_grant`]) and from the old order's row, and is bound to the account,
-//!   the symbol, the old order's id, kind (stop or target), side, position side and size, and
-//!   to the hash of the new request's preview. The confirmation names the new request **and**
-//!   the old order's exchange id, and the grant refuses an old row with another id; an order
-//!   confirmation (`for_preview`) is not a replace confirmation, and the reverse;
+//!   [`TradeClient::replace_grant`]) and from the old order's row. The confirmation binds the
+//!   hash of the new request's preview and a fingerprint of the old order's row (exchange id,
+//!   kind, side, position side, size, whole-position flag); the grant refuses an old row that
+//!   differs in any of them. The grant then checks the new request against that row (kind
+//!   stop or target, side, position side, size) and is bound to the account and the symbol.
+//!   An order confirmation (`for_preview`) is not a replace confirmation, and the reverse;
 //! - the cancel is built **by the grant** from the old id, so the grant cannot cancel anything
 //!   but the order the user confirmed;
 //! - [`TradeClient::submit_replace`] takes the grant by value (single use), approves **both**
@@ -72,8 +73,8 @@ pub enum ReplaceKind {
 /// Why a replace was not made or not sent. Nothing was sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplaceRefusal {
-    /// The confirmation is not an order confirmation.
-    NotAnOrderConfirmation,
+    /// The confirmation is not a replace confirmation.
+    NotAReplaceConfirmation,
     /// Not a stop or a take-profit on Binance USDⓈ-M or OKX swap (a trailing stop, an order
     /// with both legs, a plain order or a spot order).
     NotReplaceable,
@@ -98,14 +99,15 @@ pub enum ReplaceRefusal {
     SameClientId,
     /// The cancel request is not the one the grant built.
     CancelMismatch,
-    /// The confirmation was for replacing another order than the old order row given.
+    /// The confirmation was for another old order, or for the same order as its row read
+    /// then (id, kind, side, position side, size), than the old order row given.
     OldOrderMismatch,
 }
 
 impl fmt::Display for ReplaceRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            ReplaceRefusal::NotAnOrderConfirmation => "the confirmation is not for an order",
+            ReplaceRefusal::NotAReplaceConfirmation => "the confirmation is not for a replace",
             ReplaceRefusal::NotReplaceable => "this order cannot be replaced",
             ReplaceRefusal::OldOrderUnreadable => "the old order could not be read completely",
             ReplaceRefusal::WrongAccount => "the grant belongs to another account",
@@ -119,13 +121,15 @@ impl fmt::Display for ReplaceRefusal {
             ReplaceRefusal::SizeChanged => "the new order covers another size",
             ReplaceRefusal::SameClientId => "the new order reuses the old client id",
             ReplaceRefusal::CancelMismatch => "the cancel is not the one the grant built",
-            ReplaceRefusal::OldOrderMismatch => "the confirmation was for another old order",
+            ReplaceRefusal::OldOrderMismatch => "the confirmation was for another old order row",
         })
     }
 }
 
 /// Why `submit_replace` did not complete. Which variant it is says what is on the exchange:
-/// only [`ReplaceError::NewNotPlaced`] means the old order is gone.
+/// [`ReplaceError::NewNotPlaced`] means the old order is gone; [`ReplaceError::CancelNotConfirmed`]
+/// with an `Accepted` or an `Unknown` outcome means it may be gone, and the open orders must be
+/// read again.
 #[derive(Debug)]
 pub enum ReplaceError<R> {
     /// The grant or the requests did not fit. Nothing was sent; the old order stands.
@@ -133,10 +137,12 @@ pub enum ReplaceError<R> {
     /// The gate, risk, stream or rules check refused a leg before anything was sent. Nothing
     /// was sent; the old order stands.
     NotSent(SubmitError<R>),
-    /// The cancel was sent and the exchange did not confirm it (rejected, which includes
-    /// "no such order" after a trigger or fill; unknown; partial; or it never left). The grant
-    /// is void and no new order was sent. For `Unknown` the old order may or may not be gone:
-    /// read the open orders again.
+    /// The cancel was sent and the exchange did not confirm it for the old order (rejected,
+    /// which includes "no such order" after a trigger or fill; unknown; partial; accepted
+    /// without the old order's id in the answer; or it never left). The grant is void and no
+    /// new order was sent. For `Unknown`, and for `Accepted` (the exchange cancelled some
+    /// order, most likely the old one), the old order may be gone: read the open orders again
+    /// and treat the position as possibly unprotected.
     CancelNotConfirmed(Box<Submitted>),
     /// The old order **was cancelled** and the new one was not placed (rejected, unknown,
     /// or it never left). The position lacks this protection until the user acts; for an
@@ -197,9 +203,9 @@ impl ReplaceGrant {
         let rules = fresh.rules();
         let (new_hash, confirmed_old) = token
             .spend_for_replace()
-            .map_err(|_| ReplaceRefusal::NotAnOrderConfirmation)?;
-        // The user confirmed cancelling this order and no other.
-        if confirmed_old != old.id {
+            .map_err(|_| ReplaceRefusal::NotAReplaceConfirmation)?;
+        // The user confirmed cancelling this order, as this row showed it, and no other.
+        if !confirmed_old.matches(old) {
             return Err(ReplaceRefusal::OldOrderMismatch);
         }
         let cancel_hash = intent.preview().hash;

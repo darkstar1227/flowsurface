@@ -524,4 +524,81 @@ mod tests {
         assert!(!is_missing_file(denied.as_ref()));
         assert!(!is_missing_file(parse.as_ref()));
     }
+
+    /// Condition 78 (f3a2): a layout with a kline pane saves no order line, order id or drag
+    /// while lines are alive. The pane state has no place for them: the lines are built per
+    /// frame from the account lists and handed to the widget by reference. The pane is made
+    /// without a chart (`chart: None`), so lines cannot be attached to it here; the check is
+    /// that nothing the lines are made of reaches the serialized layout.
+    #[test]
+    fn a_layout_with_a_kline_pane_saves_no_order_line() {
+        use crate::order_lines::{Ctx, Grab, lines_with};
+        use data::stream::PersistStreamKind;
+        use exchange::adapter::Exchange;
+        use exchange::trade::{Decimal, OpenKind, OpenOrder, ProtectRole, Side};
+        use exchange::{Ticker, Timeframe};
+
+        let ticker = Ticker::new("BTCUSDT", Exchange::BinanceLinear);
+        let pane = pane::State::from_config(
+            pane::Content::Kline {
+                chart: None,
+                layout: Some(Box::default()),
+            },
+            vec![PersistStreamKind::Kline {
+                ticker,
+                timeframe: Timeframe::M5,
+            }],
+            Default::default(),
+            None,
+        );
+        let order = OpenOrder {
+            symbol: "BTCUSDT".into(),
+            id: "ORDER-ID-4417".into(),
+            kind: OpenKind::Algo(None),
+            side: Some(Side::Sell),
+            position_side: None,
+            qty: Some(Decimal::parse("0.5").unwrap()),
+            trigger_price: Some(Decimal::parse("58123.5").unwrap()),
+            close_position: false,
+            reduce_only: true,
+            role: Some(ProtectRole::Stop),
+            attached: None,
+            client_id: None,
+            limit: false,
+            limit_price: None,
+            activation_price: None,
+            callback_rate: None,
+            price: None,
+        };
+        let grab = |o: &exchange::trade::OpenOrder| Grab::Yes(o.id.clone());
+        let lines = lines_with(
+            &[order],
+            &[],
+            false,
+            &Ctx {
+                spot: false,
+                contracts: false,
+                grab: &grab,
+            },
+        );
+        assert_eq!(lines.len(), 1);
+
+        let mut state = data::State::default();
+        let layout = data::Layout {
+            name: "lines".into(),
+            dashboard: data::layout::Dashboard {
+                pane: data::Pane::from(&pane),
+                popout: vec![],
+                chart_settings: Default::default(),
+            },
+            detached: None,
+        };
+        state.layout_manager.layouts = vec![layout];
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("BTCUSDT"), "the pane itself is saved");
+        for needle in ["ORDER-ID-4417", "58123.5", "SL 0.5", "Grab", "drag"] {
+            assert!(!json.contains(needle), "the saved layout names {needle}");
+        }
+        assert_eq!(lines.len(), 1, "the lines were alive while saving");
+    }
 }

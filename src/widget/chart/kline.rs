@@ -9,6 +9,7 @@ pub mod drawing;
 mod footprint;
 mod interaction;
 mod layout;
+mod order_drag;
 mod overlay;
 mod painting;
 mod presentation;
@@ -150,6 +151,10 @@ struct State {
     drawing: WidgetDrawingState,
     y_axis_gutter_width: f32,
     gutter_cache_key: Option<GutterCacheKey>,
+    /// A stop or target line being dragged (memory only, never saved).
+    order_drag: Option<order_drag::OrderDrag>,
+    /// The order line under the pointer, as an index into the widget's order lines.
+    order_hover: Option<usize>,
 }
 
 impl Default for State {
@@ -168,6 +173,8 @@ impl Default for State {
             y_axis_gutter_width: Y_AXIS_GUTTER,
             gutter_cache_key: None,
             scene_cache: SceneCache::default(),
+            order_drag: None,
+            order_hover: None,
         }
     }
 }
@@ -241,6 +248,12 @@ pub enum KlineWidgetEvent {
     IndicatorRemove(PanelValueId),
     XAxisDoubleClick,
     DeletePressed,
+    /// A stop or target line was dragged to `price` and released (f3a2). Only asks for a
+    /// review: the order is read again and checked before anything is built.
+    OrderLineMoved {
+        order_id: String,
+        price: f32,
+    },
 }
 
 impl From<KlineWidgetDrawingEvent> for KlineWidgetEvent {
@@ -652,6 +665,14 @@ impl<'a> KlineWidget<'a> {
                         accents,
                         root_pixels,
                         drawing_magnet,
+                    );
+                    order_drag::paint(
+                        &mut inputs,
+                        scene,
+                        palette,
+                        self.order_lines,
+                        state.order_hover,
+                        state.order_drag.as_ref(),
                     );
                     self.study_objects.paint(
                         LayerPaintPhase::Overlay,
@@ -1361,6 +1382,106 @@ impl<'a> KlineWidget<'a> {
             })
     }
 
+    /// Dragging a stop or target line. Returns true when the event is consumed. A press on a
+    /// grabbable line starts the drag; moving previews it; releasing publishes the move (a
+    /// release that barely moved is a click and is ignored); leaving the plot or the widget
+    /// cancels it. Nothing here is saved.
+    fn order_drag_event<M: From<KlineWidgetEvent>>(
+        &self,
+        state: &mut State,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        event: &mouse::Event,
+        shell: &mut Shell<'_, M>,
+    ) -> bool {
+        if self.order_lines.is_empty() && state.order_drag.is_none() {
+            if state.order_hover.take().is_some() {
+                state.scheduler.request(RenderRequest::Interaction);
+            }
+            return false;
+        }
+        let local = cursor.position_in(layout.bounds());
+
+        if let Some(mut drag) = state.order_drag.take() {
+            let scene = self.cached_scene(state, layout, cursor);
+            let price = local
+                .zip(scene.as_ref())
+                .and_then(|(local, scene)| order_drag::price_at(scene, local));
+            state.scheduler.request(RenderRequest::Interaction);
+            match event {
+                mouse::Event::CursorMoved { .. } => {
+                    // Out of the plot (or the widget) cancels the drag.
+                    if let (Some(local), Some(price)) = (local, price) {
+                        drag.y = local.y;
+                        drag.price = price;
+                        state.order_drag = Some(drag);
+                    }
+                }
+                mouse::Event::ButtonReleased(mouse::Button::Left) => {
+                    if let Some(price) = price
+                        && let Some(local) = local
+                        && (local.y - drag.start_y).abs() >= order_drag::CLICK_SLOP
+                    {
+                        shell.publish(M::from(KlineWidgetEvent::OrderLineMoved {
+                            order_id: drag.order_id,
+                            price,
+                        }));
+                    }
+                }
+                _ => state.order_drag = Some(drag),
+            }
+            shell.capture_event();
+            return true;
+        }
+
+        match event {
+            mouse::Event::CursorMoved { .. } => {
+                let hover = local.and_then(|local| {
+                    let scene = self.cached_scene(state, layout, cursor)?;
+                    order_drag::hit(self.order_lines, &scene, local)
+                });
+                if hover != state.order_hover {
+                    state.order_hover = hover;
+                    state.scheduler.request(RenderRequest::Interaction);
+                }
+                false
+            }
+            mouse::Event::ButtonPressed(mouse::Button::Left)
+                if self.drawing_snapshot.allows_panning()
+                    && self.drawing_snapshot.drawing_draft.is_none() =>
+            {
+                let Some(local) = local else {
+                    return false;
+                };
+                let Some(scene) = self.cached_scene(state, layout, cursor) else {
+                    return false;
+                };
+                let Some(line) = order_drag::hit(self.order_lines, &scene, local)
+                    .and_then(|i| self.order_lines.get(i))
+                else {
+                    return false;
+                };
+                let crate::order_lines::Grab::Yes(order_id) = order_drag::grab_of(line, &scene)
+                else {
+                    return false;
+                };
+                let price = order_drag::price_at(&scene, local)
+                    .or_else(|| line.price_f32())
+                    .unwrap_or_default();
+                state.order_drag = Some(order_drag::OrderDrag {
+                    order_id,
+                    start_y: local.y,
+                    y: local.y,
+                    price,
+                });
+                state.scheduler.request(RenderRequest::Interaction);
+                shell.capture_event();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn cached_scene(
         &self,
         state: &State,
@@ -1920,6 +2041,14 @@ where
                 state.interaction.set_modifiers(*modifiers);
                 state.scheduler.request(RenderRequest::Interaction);
 
+                if state.order_drag.is_some()
+                    && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
+                {
+                    state.order_drag = None;
+                    shell.capture_event();
+                    return;
+                }
+
                 if self.should_capture_escape
                     && cursor.is_over(layout.bounds())
                     && matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
@@ -1975,6 +2104,9 @@ where
                 )));
             }
             Event::Mouse(mouse_event) => {
+                if self.order_drag_event(state, layout, cursor, mouse_event, shell) {
+                    return;
+                }
                 if matches!(mouse_event, mouse::Event::WheelScrolled { .. })
                     && matches!(
                         state.interaction.drag_action(),
@@ -2566,6 +2698,23 @@ where
         _renderer: &Renderer,
     ) -> advanced::mouse::Interaction {
         let state = tree.state.downcast_ref::<State>();
+
+        if state.order_drag.is_some() {
+            return advanced::mouse::Interaction::Grabbing;
+        }
+        if cursor.is_over(layout.bounds())
+            && state.interaction.motion().is_none()
+            && let Some(line) = state.order_hover.and_then(|i| self.order_lines.get(i))
+            && let Some(scene) = self.cached_scene(state, layout, cursor)
+        {
+            match order_drag::grab_of(line, &scene) {
+                crate::order_lines::Grab::Yes(_) => return advanced::mouse::Interaction::Grab,
+                crate::order_lines::Grab::Blocked(_) => {
+                    return advanced::mouse::Interaction::NotAllowed;
+                }
+                crate::order_lines::Grab::No => {}
+            }
+        }
 
         if let Some(appearance) = state
             .interaction
